@@ -179,6 +179,3 @@ The GUI provides:
 - If the LLM is unavailable during an LLM-required flow, the tool aborts instead of silently skipping that stage.
 - Runtime project data is stored under `workspace/`.
 
-## License
-
-Add your project license here if you plan to publish the repository.
