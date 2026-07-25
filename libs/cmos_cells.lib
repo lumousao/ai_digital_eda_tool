@@ -1,0 +1,101 @@
+// CMOS Standard Cell Library - ABC Compatible
+// Based on typical 0.35um CMOS parameters
+// Includes wire load model for timing estimation
+library(demo) {
+  time_unit : "1ns";
+  capacitive_load_unit (1, pf);
+  voltage_map(VDD, 3.3);
+  voltage_map(VSS, 0.0);
+
+  // Wire load model (reference: OpenSTA wire load concepts)
+  wire_load_model(wire_load) {
+    wire_load_from_area(0);
+    slope : 0.15;
+  }
+  default_wire_load : wire_load;
+  default_wire_load_mode : top;
+  default_connection_factor : 1.0;
+
+  // ==================== BUF ====================
+  cell(BUF) {
+    area: 6;
+    pin(A) { direction: input; capacitance: 0.05; }
+    pin(Y) { direction: output; function: "A"; }
+  }
+
+  // ==================== NOT ====================
+  cell(NOT) {
+    area: 3;
+    pin(A) { direction: input; capacitance: 0.04; }
+    pin(Y) { direction: output; function: "A'"; }
+  }
+
+  // ==================== NAND ====================
+  cell(NAND) {
+    area: 4;
+    pin(A) { direction: input; capacitance: 0.04; }
+    pin(B) { direction: input; capacitance: 0.04; }
+    pin(Y) { direction: output; function: "(A*B)'"; }
+  }
+
+  // ==================== NOR ====================
+  cell(NOR) {
+    area: 4;
+    pin(A) { direction: input; capacitance: 0.04; }
+    pin(B) { direction: input; capacitance: 0.04; }
+    pin(Y) { direction: output; function: "(A+B)'"; }
+  }
+
+  // ==================== AND ====================
+  cell(AND) {
+    area: 6;
+    pin(A) { direction: input; capacitance: 0.05; }
+    pin(B) { direction: input; capacitance: 0.05; }
+    pin(Y) { direction: output; function: "A*B"; }
+  }
+
+  // ==================== OR ====================
+  cell(OR) {
+    area: 6;
+    pin(A) { direction: input; capacitance: 0.05; }
+    pin(B) { direction: input; capacitance: 0.05; }
+    pin(Y) { direction: output; function: "A+B"; }
+  }
+
+  // ==================== XOR ====================
+  cell(XOR) {
+    area: 8;
+    pin(A) { direction: input; capacitance: 0.06; }
+    pin(B) { direction: input; capacitance: 0.06; }
+    pin(Y) { direction: output; function: "A^B"; }
+  }
+
+  // ==================== MUX ====================
+  cell(MUX) {
+    area: 8;
+    pin(A) { direction: input; capacitance: 0.05; }
+    pin(B) { direction: input; capacitance: 0.05; }
+    pin(S) { direction: input; capacitance: 0.06; }
+    pin(Y) { direction: output; function: "S ? B : A"; }
+  }
+
+  // ==================== DFF ====================
+  cell(DFF) {
+    area: 18;
+    ff(IQ, IQN) { clocked_on: C; next_state: D; }
+    pin(C) { direction: input; clock: true; capacitance: 0.06; }
+    pin(D) { direction: input; capacitance: 0.05; }
+    pin(Q) { direction: output; function: "IQ"; }
+  }
+
+  // ==================== DFFSR ====================
+  cell(DFFSR) {
+    area: 18;
+    ff(IQ, IQN) { clocked_on: C; next_state: D; preset: S; clear: R; }
+    pin(C) { direction: input; clock: true; capacitance: 0.06; }
+    pin(D) { direction: input; capacitance: 0.05; }
+    pin(Q) { direction: output; function: "IQ"; }
+    pin(S) { direction: input; capacitance: 0.04; }
+    pin(R) { direction: input; capacitance: 0.04; }
+  }
+}

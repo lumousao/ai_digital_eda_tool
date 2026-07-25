@@ -1,0 +1,16 @@
+/target/
+/workspace/
+/versions/
+/libs/ics*
+
+config.yaml
+gui_debug.log
+*.log
+*.vcd
+*.ps
+
+GAP_ANALYSIS.md
+GUI_ARCHITECTURE.md
+GUI_TEST_GUIDE.txt
+and_gate_synth_gate.v
+&1

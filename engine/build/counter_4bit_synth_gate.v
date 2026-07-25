@@ -1,0 +1,63 @@
+/* Gate-level netlist by ai_digital synthesis */
+/* Module: counter_4bit Cells: 12 */
+
+module counter_4bit (clk, rst_n, en, q);
+  input clk;
+  input rst_n;
+  input en;
+  output[3:0] q;
+  wire _ab20;
+  wire _ab31;
+  wire _ab42;
+  wire _axb10;
+  wire _axb15;
+  wire _axb26;
+  wire _axb37;
+  wire[3:0] _bin8;
+  wire _bin8[0];
+  wire _bin8[1];
+  wire _bin8[2];
+  wire _bin8[3];
+  wire _cab22;
+  wire _cab33;
+  wire _cab44;
+  wire _carry013;
+  wire _carry24;
+  wire _carry35;
+  wire _carry46;
+  wire[3:0] _const2;
+  wire _const2[0];
+  wire _const2[1];
+  wire _const2[2];
+  wire _const2[3];
+  wire[3:0] _const7;
+  wire _const7[0];
+  wire _const7[1];
+  wire _const7[2];
+  wire _const7[3];
+  wire _sumb17;
+  wire _sumb28;
+  wire _sumb39;
+  wire _unary0;
+  wire clk;
+  wire en;
+  wire[3:0] q;
+  wire q[0];
+  wire q[1];
+  wire q[2];
+  wire q[3];
+  wire rst_n;
+
+  DFFPOSX1 _dff3 (.D(_axb10), .C(clk), .Q(q[0]));
+  DFFPOSX1 _dff4 (.D(_axb15), .C(clk), .Q(q[1]));
+  DFFPOSX1 _dff5 (.D(_axb26), .C(clk), .Q(q[2]));
+  DFFPOSX1 _dff6 (.D(_axb37), .C(clk), .Q(q[3]));
+  XOR2X1 _c11 (.A(q[0]), .B(_const7[0]), .Y(_axb10));
+  XOR2X1 _c16 (.A(q[1]), .B(_const7[1]), .Y(_axb15));
+  XOR2X1 _c27 (.A(q[2]), .B(_const7[2]), .Y(_axb26));
+  XOR2X1 _c38 (.A(q[3]), .B(_const7[3]), .Y(_axb37));
+  DFFPOSX1 _dff48 (.D(_axb10), .C(clk), .Q(q[0]));
+  DFFPOSX1 _dff49 (.D(_axb15), .C(clk), .Q(q[1]));
+  DFFPOSX1 _dff50 (.D(_axb26), .C(clk), .Q(q[2]));
+  DFFPOSX1 _dff51 (.D(_axb37), .C(clk), .Q(q[3]));
+endmodule

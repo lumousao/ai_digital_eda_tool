@@ -1,0 +1,63 @@
+/* Gate-level netlist by ai_digital synthesis */
+/* Module: ternary_concat Cells: 16 */
+
+module ternary_concat (a, b, sel, result);
+  input[7:0] a;
+  input[7:0] b;
+  input sel;
+  output[15:0] result;
+  wire _mux0;
+  wire _mux0[0];
+  wire _mux0[10];
+  wire _mux0[11];
+  wire _mux0[12];
+  wire _mux0[13];
+  wire _mux0[14];
+  wire _mux0[15];
+  wire _mux0[1];
+  wire _mux0[2];
+  wire _mux0[3];
+  wire _mux0[4];
+  wire _mux0[5];
+  wire _mux0[6];
+  wire _mux0[7];
+  wire _mux0[8];
+  wire _mux0[9];
+  wire[7:0] a;
+  wire[7:0] b;
+  wire[15:0] result;
+  wire result[0];
+  wire result[10];
+  wire result[11];
+  wire result[12];
+  wire result[13];
+  wire result[14];
+  wire result[15];
+  wire result[1];
+  wire result[2];
+  wire result[3];
+  wire result[4];
+  wire result[5];
+  wire result[6];
+  wire result[7];
+  wire result[8];
+  wire result[9];
+  wire sel;
+
+  BUFX2 _c2 (.A(_mux0[0]), .Y(result[0]));
+  BUFX2 _c3 (.A(_mux0[1]), .Y(result[1]));
+  BUFX2 _c4 (.A(_mux0[2]), .Y(result[2]));
+  BUFX2 _c5 (.A(_mux0[3]), .Y(result[3]));
+  BUFX2 _c6 (.A(_mux0[4]), .Y(result[4]));
+  BUFX2 _c7 (.A(_mux0[5]), .Y(result[5]));
+  BUFX2 _c8 (.A(_mux0[6]), .Y(result[6]));
+  BUFX2 _c9 (.A(_mux0[7]), .Y(result[7]));
+  BUFX2 _c10 (.A(_mux0[8]), .Y(result[8]));
+  BUFX2 _c11 (.A(_mux0[9]), .Y(result[9]));
+  BUFX2 _c12 (.A(_mux0[10]), .Y(result[10]));
+  BUFX2 _c13 (.A(_mux0[11]), .Y(result[11]));
+  BUFX2 _c14 (.A(_mux0[12]), .Y(result[12]));
+  BUFX2 _c15 (.A(_mux0[13]), .Y(result[13]));
+  BUFX2 _c16 (.A(_mux0[14]), .Y(result[14]));
+  BUFX2 _c17 (.A(_mux0[15]), .Y(result[15]));
+endmodule

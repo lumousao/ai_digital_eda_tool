@@ -1,0 +1,16 @@
+#V2
+/project switch default
+/sim top_soc
+quit
+/project switch default
+/full top_soc
+quit
+/project switch default
+/full top_soc
+quit
+/project switch default
+/full top_soc
+quit
+/sim sync_fifo
+quit
+/sim sync_fifo
