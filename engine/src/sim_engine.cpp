@@ -204,6 +204,21 @@ bool SimKernel::load_module(const std::string &code) {
     auto result = parser.parseString(code, "<input>");
     log_msg("SIM", "load_module: parse complete, %zu modules, %zu errors, success=%d",
             result.modules.size(), result.errors.size(), result.success);
+    if (!result.errors.empty()) {
+        const auto &first = result.errors.front();
+        log_msg("SIM", "load_module: first parse error at %d:%d: %s",
+                first.line, first.column, first.message.c_str());
+        if (first.line > 0) {
+            std::istringstream source_lines(code);
+            std::string source_line;
+            for (int line = 0; line < first.line && std::getline(source_lines, source_line); ++line) {
+                if (line + 1 == first.line) {
+                    log_msg("SIM", "load_module: source[%d]: %s",
+                            first.line, source_line.c_str());
+                }
+            }
+        }
+    }
     if (!result.success && result.modules.empty()) {
         if (!result.errors.empty()) {
             output_ = "Parse error: " + result.errors[0].message;
@@ -248,6 +263,35 @@ void SimKernel::build_hierarchy(ModuleInstance *inst, const std::string &module_
     for (auto &item : mod_decl->items) {
         if (!item) continue;
         switch (item->type) {
+            case VerilogParser::NodeType::MODULE_PORT: {
+                auto port_decl = std::dynamic_pointer_cast<VerilogParser::PortDecl>(item);
+                if (!port_decl || port_decl->name.empty()) break;
+                auto existing = inst->signals.find(port_decl->name);
+                if (existing == inst->signals.end()) {
+                    Signal sig;
+                    sig.name = port_decl->name;
+                    sig.width = std::max(port_decl->width, 1);
+                    sig.is_port = true;
+                    sig.is_reg = port_decl->isReg;
+                    sig.dir = (port_decl->dir == VerilogParser::PortDecl::INPUT) ? Signal::INPUT :
+                              (port_decl->dir == VerilogParser::PortDecl::OUTPUT) ? Signal::OUTPUT :
+                                                                                  Signal::INOUT;
+                    sig.current = Value(sig.width, 0);
+                    sig.next = Value(sig.width, 0);
+                    inst->signals[sig.name] = sig;
+                } else {
+                    existing->second.width = std::max(port_decl->width, 1);
+                    existing->second.is_port = true;
+                    existing->second.is_reg = port_decl->isReg;
+                    existing->second.dir =
+                        (port_decl->dir == VerilogParser::PortDecl::INPUT) ? Signal::INPUT :
+                        (port_decl->dir == VerilogParser::PortDecl::OUTPUT) ? Signal::OUTPUT :
+                                                                            Signal::INOUT;
+                    existing->second.current = existing->second.current.resize(existing->second.width);
+                    existing->second.next = existing->second.next.resize(existing->second.width);
+                }
+                break;
+            }
             case VerilogParser::NodeType::WIRE_DECL:
             case VerilogParser::NodeType::REG_DECL:
             case VerilogParser::NodeType::LOGIC_DECL: {
@@ -402,7 +446,7 @@ void SimKernel::build_hierarchy(ModuleInstance *inst, const std::string &module_
                             if (child->attributes.count("signal")) {
                                 signal_name = child->attributes.at("signal");
                             } else if (!child->children.empty()) {
-                                signal_name = get_identifier(child->children[0]);
+                                signal_name = get_connection_name(child->children[0]);
                             }
                             if (!signal_name.empty()) {
                                 inst->port_map[port_name] = signal_name;
@@ -470,7 +514,7 @@ void SimKernel::elaborate() {
                 if (conn->attributes.count("signal")) {
                     signal_name = conn->attributes.at("signal");
                 } else if (!conn->children.empty()) {
-                    signal_name = get_identifier(conn->children[0]);
+                    signal_name = get_connection_name(conn->children[0]);
                 }
                 if (!signal_name.empty()) {
                     child->port_map[port_name] = signal_name;
@@ -478,10 +522,10 @@ void SimKernel::elaborate() {
             }
 
             for (auto &[port, sig] : child->port_map) {
-                auto parent_sig = parent->find_signal(sig);
                 auto child_sig = child->find_signal(port);
-                if (parent_sig && child_sig && child_sig->dir != Signal::OUTPUT) {
-                    auto propagated = parent_sig->current.resize(child_sig->width);
+                Value propagated;
+                if (child_sig && child_sig->dir != Signal::OUTPUT &&
+                    read_connection(parent, sig, child_sig->width, propagated)) {
                     child_sig->current = propagated;
                     child_sig->next = propagated;
                 }
@@ -497,9 +541,10 @@ void SimKernel::elaborate() {
     log_msg("SIM", "elaborate: %zu child instances, top signals=%zu",
             child_instances_.size(), top_->signals.size());
     for (auto &child : child_instances_) {
-        log_msg("SIM", "  child: %s (module=%s, signals=%zu, port_map=%zu)",
+        log_msg("SIM", "  child: %s (module=%s, signals=%zu, ports=%zu, always=%zu, assigns=%zu)",
                 child->name.c_str(), child->module_name.c_str(),
-                child->signals.size(), child->port_map.size());
+                child->signals.size(), child->port_map.size(),
+                child->always_blocks.size(), child->assign_stmts.size());
     }
 }
 void SimKernel::schedule_event(const Event &e) {
@@ -624,7 +669,26 @@ Value SimKernel::eval_expr(ModuleInstance *ctx, std::shared_ptr<VerilogParser::A
                 return r;
             }
             Value left = eval_expr(ctx, expr->left);
-            Value right = eval_expr(ctx, expr->right);
+            Value right;
+            // Arithmetic operands are context-sized. Evaluate a shift operand
+            // at the peer arithmetic width before shifting; otherwise
+            // `wide_acc = wide_acc + (narrow_bus << i)` loses every bit shifted
+            // past narrow_bus' MSB before the addition can extend it.
+            auto eval_arithmetic_operand = [&](std::shared_ptr<VerilogParser::ASTNode> operand,
+                                               int context_width) {
+                auto shift = std::dynamic_pointer_cast<VerilogParser::Expression>(operand);
+                if (shift && shift->op == VerilogParser::Expression::SHL && shift->left && shift->right) {
+                    Value shifted_left = eval_expr(ctx, shift->left).resize(context_width);
+                    return shifted_left.shl((int)eval_expr(ctx, shift->right).to_int());
+                }
+                return eval_expr(ctx, operand);
+            };
+            if (expr->op == VerilogParser::Expression::ADD || expr->op == VerilogParser::Expression::SUB) {
+                right = eval_arithmetic_operand(expr->right, left.width());
+                left = eval_arithmetic_operand(expr->left, right.width());
+            } else {
+                right = eval_expr(ctx, expr->right);
+            }
             switch (expr->op) {
                 case VerilogParser::Expression::ADD: return left + right;
                 case VerilogParser::Expression::SUB: return left - right;
@@ -935,8 +999,21 @@ int SimKernel::exec_stmt_with_delay(ModuleInstance *ctx, std::shared_ptr<Verilog
         }
         case VerilogParser::NodeType::WAIT_FOR_EDGE: {
             std::string edge_type = node->attributes.count("edge_type") ? node->attributes.at("edge_type") : "";
+            std::string signal_name = node->attributes.count("signal") ? node->attributes.at("signal") : "";
             if (edge_type == "posedge" || edge_type == "negedge") {
-                delay_acc = clock_period_; // Wait one clock period
+                int half_period = std::max(clock_period_ / 2, 1);
+                int full_period = std::max(clock_period_, half_period);
+                Signal *sig = signal_name.empty() ? nullptr : ctx->find_signal(signal_name);
+                Value::State current = sig ? sig->current.get_bit(0) : Value::X;
+
+                // Align clock-style event controls to the next matching edge instead of
+                // blindly stalling for a full period, otherwise @(posedge clk) sequences
+                // drift onto negedges with always #delay clock generators.
+                if (edge_type == "posedge") {
+                    delay_acc = (current == Value::ONE) ? full_period : half_period;
+                } else {
+                    delay_acc = (current == Value::ZERO) ? full_period : half_period;
+                }
             }
             break;
         }
@@ -1501,10 +1578,10 @@ void SimKernel::eval_continuous_assigns() {
             auto *parent_inst = child->parent;
             if (!parent_inst) continue;
             for (auto &[port, sig_name] : child->port_map) {
-                auto parent_sig = parent_inst->find_signal(sig_name);
                 auto child_sig = child->find_signal(port);
-                if (parent_sig && child_sig && child_sig->dir != Signal::OUTPUT) {
-                    auto propagated = parent_sig->current.resize(child_sig->width);
+                Value propagated;
+                if (child_sig && child_sig->dir != Signal::OUTPUT &&
+                    read_connection(parent_inst, sig_name, child_sig->width, propagated)) {
                     if (value_differs(propagated, child_sig->current, child_sig->width)) {
                         child_sig->current = propagated;
                         child_sig->next = propagated;
@@ -1518,15 +1595,9 @@ void SimKernel::eval_continuous_assigns() {
             }
 
             for (auto &[port, sig_name] : child->port_map) {
-                auto parent_sig = parent_inst->find_signal(sig_name);
                 auto child_sig = child->find_signal(port);
-                if (parent_sig && child_sig && child_sig->dir != Signal::INPUT) {
-                    auto propagated = child_sig->current.resize(parent_sig->width);
-                    if (value_differs(propagated, parent_sig->current, parent_sig->width)) {
-                        parent_sig->current = propagated;
-                        parent_sig->next = propagated;
-                        changed = true;
-                    }
+                if (child_sig && child_sig->dir != Signal::INPUT) {
+                    changed = write_connection(parent_inst, sig_name, child_sig->current) || changed;
                 }
             }
         }
@@ -2025,6 +2096,11 @@ bool SimKernel::run() {
                 prev_signals[prefix + sig_name] = sig.current;
             }
         }
+        // Preserve the time-step boundary independently from the per-delta
+        // sensitivity baseline below.  VCD/toggle accounting must compare
+        // the settled state against the start of this time step, not against
+        // the last delta-cycle snapshot.
+        const std::map<std::string, Value> cycle_start_signals = prev_signals;
 
         // Check timeout
         if (timeout_seconds_ > 0 && cycle % 100 == 0) {
@@ -2072,16 +2148,21 @@ bool SimKernel::run() {
                     if (body->type == VerilogParser::NodeType::BEGIN_STATEMENT &&
                         t.stmt_idx < body->children.size()) {
                         auto stmt = body->children[t.stmt_idx];
-                        if (stmt && stmt->type == VerilogParser::NodeType::REPEAT_LOOP &&
-                            stmt->children.size() >= 2) {
-                            int delay = exec_stmt_with_delay(top_.get(), stmt->children[1]);
-                            if (delay > 0) {
-                                t.delay_remaining = delay_to_remaining_cycles(delay);
-                                advanced_time = true;
-                            } else {
+                    if (stmt && stmt->type == VerilogParser::NodeType::REPEAT_LOOP &&
+                        stmt->children.size() >= 2) {
+                        int delay = exec_stmt_with_delay(top_.get(), stmt->children[1]);
+                        if (delay > 0) {
+                            t.delay_remaining = delay_to_remaining_cycles(delay);
+                            if (stmt->children[1] &&
+                                stmt->children[1]->type == VerilogParser::NodeType::WAIT_FOR_EDGE) {
                                 t.repeat_remaining--;
                                 if (t.repeat_remaining <= 0) t.stmt_idx++;
                             }
+                            advanced_time = true;
+                        } else {
+                            t.repeat_remaining--;
+                            if (t.repeat_remaining <= 0) t.stmt_idx++;
+                        }
                             continue;
                         }
                     }
@@ -2105,6 +2186,11 @@ bool SimKernel::run() {
                             int delay = exec_stmt_with_delay(top_.get(), stmt->children[1]);
                             if (delay > 0) {
                                 t.delay_remaining = delay_to_remaining_cycles(delay);
+                                if (stmt->children[1] &&
+                                    stmt->children[1]->type == VerilogParser::NodeType::WAIT_FOR_EDGE &&
+                                    t.repeat_remaining <= 0) {
+                                    t.stmt_idx++;
+                                }
                                 advanced_time = true;
                             } else if (t.repeat_remaining <= 0) {
                                 t.stmt_idx++;
@@ -2116,6 +2202,9 @@ bool SimKernel::run() {
                         int delay = exec_stmt_with_delay(top_.get(), stmt);
                         if (delay > 0) {
                             t.delay_remaining = delay_to_remaining_cycles(delay);
+                            if (stmt->type == VerilogParser::NodeType::WAIT_FOR_EDGE) {
+                                t.stmt_idx++;
+                            }
                             advanced_time = true;
                         } else {
                             t.stmt_idx++;
@@ -2152,39 +2241,85 @@ bool SimKernel::run() {
             return {pos, neg};
         };
 
-        auto should_trigger = [&](VerilogParser::AlwaysBlock *ab, ModuleInstance *ctx, const std::string &prefix) -> bool {
-            if (!ab) return true;
-
-            // Autonomous always blocks (those with internal delays like always #5 clk=~clk)
-            // These should fire every cycle regardless of signal changes
-            bool has_internal_delay = false;
-            for (auto &child : ab->children) {
-                if (!child) continue;
-                // Check if any child or its descendants have delay attributes
-                std::function<bool(std::shared_ptr<VerilogParser::ASTNode>)> check_delay;
-                check_delay = [&](std::shared_ptr<VerilogParser::ASTNode> n) -> bool {
-                    if (!n) return false;
-                    if (n->attributes.count("delay")) return true;
-                    for (auto &c : n->children) {
-                        if (check_delay(c)) return true;
-                    }
-                    return false;
-                };
-                if (check_delay(child)) { has_internal_delay = true; break; }
+    auto block_has_internal_delay = [&](const VerilogParser::AlwaysBlock *ab) -> bool {
+        if (!ab) return false;
+        std::function<bool(std::shared_ptr<VerilogParser::ASTNode>)> check_delay;
+        check_delay = [&](std::shared_ptr<VerilogParser::ASTNode> n) -> bool {
+            if (!n) return false;
+            if (n->attributes.count("delay")) return true;
+            for (auto &c : n->children) {
+                if (check_delay(c)) return true;
             }
+            return false;
+        };
+        for (auto &child : ab->children) {
+            if (check_delay(child)) return true;
+        }
+        return false;
+    };
 
-            // LEVEL sensitivity (always @(*)): auto-infer sensitivity list from RHS signals
-            if (ab->sens == VerilogParser::AlwaysBlock::LEVEL) {
-                // Autonomous blocks with delays fire every cycle
-                if (has_internal_delay) return true;
+    auto run_autonomous_always = [&](ModuleInstance *ctx, const std::string &block_key,
+                                     std::shared_ptr<VerilogParser::ASTNode> always) {
+        auto delay_it = always_delay_remaining.find(block_key);
+        if (delay_it != always_delay_remaining.end() && delay_it->second > 0) {
+            delay_it->second--;
+            return;
+        }
+
+        int next_delay = 0;
+        for (auto &child : always->children) {
+            if (!child) continue;
+            int delay = exec_stmt_with_delay(ctx, child);
+            if (delay > 0) {
+                next_delay = delay;
+                break;
+            }
+        }
+
+        // Timed always blocks iterate forever. If the current visit executed the
+        // body (delay==0), immediately arm the next timed wait from the next loop
+        // iteration so always #5 clk=~clk keeps a 10ns period instead of doubling.
+        if (next_delay <= 0) {
+            for (auto &child : always->children) {
+                if (!child) continue;
+                int delay = exec_stmt_with_delay(ctx, child);
+                if (delay > 0) {
+                    next_delay = delay;
+                    break;
+                }
+            }
+        }
+
+        if (next_delay > 0) {
+            always_delay_remaining[block_key] = delay_to_remaining_cycles(next_delay);
+        } else {
+            always_delay_remaining.erase(block_key);
+        }
+    };
+
+    auto should_trigger = [&](VerilogParser::AlwaysBlock *ab, ModuleInstance *ctx, const std::string &prefix) -> bool {
+        if (!ab) return true;
+
+        bool has_internal_delay = block_has_internal_delay(ab);
+
+        // LEVEL sensitivity (always @(*)): auto-infer sensitivity list from RHS signals
+        if (ab->sens == VerilogParser::AlwaysBlock::LEVEL) {
+            // Autonomous blocks with delays fire every cycle
+            if (has_internal_delay) return true;
                 // Check if any signal in the always block's body changed
                 for (auto &[sig_name, sig] : ctx->signals) {
+                    // For an instantiated module, only changes arriving on
+                    // input ports may trigger always @(*). Observing its own
+                    // outputs or procedural temporaries re-enters the block
+                    // indefinitely during delta cycles and corrupts blocking
+                    // accumulator loops.
+                    if (ctx != top_.get() && sig.dir != Signal::INPUT) continue;
                     std::string lookup = prefix.empty() ? sig_name : prefix + sig_name;
                     auto it = prev_signals.find(lookup);
                     if (it == prev_signals.end()) {
                         it = prev_signals.find(sig_name);
                     }
-                    if (it != prev_signals.end() &&
+                    if (it == prev_signals.end() ||
                         value_differs(sig.current, it->second, sig.width)) {
                         return true;
                     }
@@ -2221,24 +2356,10 @@ bool SimKernel::run() {
             if (finish_requested_) break;
             auto *ab = dynamic_cast<VerilogParser::AlwaysBlock*>(always.get());
             if (ab && should_trigger(ab, top_.get(), "")) {
-                // Check delay tracking for this always block (handles always #5 clk=~clk)
-                auto delay_it = always_delay_remaining.find(name);
-                if (delay_it != always_delay_remaining.end() && delay_it->second > 0) {
-                    delay_it->second--;
-                    continue; // Still waiting for delay, skip execution
-                }
-                // Execute the always block body
-                // If body has a delay (e.g., #5), track it
-                int delay_before = 0;
-                if (always->children.size() > 0 && always->children[0] &&
-                    always->children[0]->attributes.count("delay")) {
-                    try { delay_before = std::stoi(always->children[0]->attributes.at("delay")); } catch(...) {}
-                }
-                exec_always(top_.get(), always);
-                if (delay_before > 0) {
-                    // Re-inject the delay attribute (it gets erased by exec_stmt_with_delay)
-                    always->children[0]->attributes["delay"] = std::to_string(delay_before);
-                    always_delay_remaining[name] = delay_to_remaining_cycles(delay_before);
+                if (block_has_internal_delay(ab)) {
+                    run_autonomous_always(top_.get(), name, always);
+                } else {
+                    exec_always(top_.get(), always);
                 }
             } else if (!ab) {
                 exec_always(top_.get(), always);
@@ -2252,10 +2373,10 @@ bool SimKernel::run() {
             if (!parent_inst) continue;
             // Propagate parent signals to child
             for (auto &[port, sig] : child->port_map) {
-                auto parent_sig = parent_inst->find_signal(sig);
                 auto child_sig = child->find_signal(port);
-                if (parent_sig && child_sig && child_sig->dir != Signal::OUTPUT) {
-                    auto propagated = parent_sig->current.resize(child_sig->width);
+                Value propagated;
+                if (child_sig && child_sig->dir != Signal::OUTPUT &&
+                    read_connection(parent_inst, sig, child_sig->width, propagated)) {
                     child_sig->current = propagated;
                     child_sig->next = propagated;
                 }
@@ -2265,19 +2386,20 @@ bool SimKernel::run() {
                 auto *ab = dynamic_cast<VerilogParser::AlwaysBlock*>(always.get());
                 std::string prefix = child->name + ".";
                 if (ab && should_trigger(ab, child.get(), prefix)) {
-                    exec_always(child.get(), always);
+                    if (block_has_internal_delay(ab)) {
+                        run_autonomous_always(child.get(), prefix + name, always);
+                    } else {
+                        exec_always(child.get(), always);
+                    }
                 } else if (!ab) {
                     exec_always(child.get(), always);
                 }
             }
             // Propagate child outputs back
             for (auto &[port, sig] : child->port_map) {
-                auto parent_sig = parent_inst->find_signal(sig);
                 auto child_sig = child->find_signal(port);
-                if (parent_sig && child_sig && child_sig->dir != Signal::INPUT) {
-                    auto propagated = child_sig->current.resize(parent_sig->width);
-                    parent_sig->current = propagated;
-                    parent_sig->next = propagated;
+                if (child_sig && child_sig->dir != Signal::INPUT) {
+                    write_connection(parent_inst, sig, child_sig->current);
                 }
             }
         }
@@ -2285,6 +2407,25 @@ bool SimKernel::run() {
         // ====== STEP 5b: IEEE 1364 Delta Cycle Loop ======
         // Full 5-region event processing within the same time step
         // Active → Inactive → NBA → Monitor → Postponed
+        // `prev_signals` initially describes the start of this time step so
+        // edge-triggered blocks above can see the stimulus transition.  The
+        // level-sensitive work below needs a fresh baseline for each delta
+        // cycle, otherwise one changed input makes every `always @(*)` block
+        // appear sensitive forever and large combinational cones never
+        // converge.
+        auto snapshot_delta_signals = [&]() {
+            prev_signals.clear();
+            for (auto &[sig_name, sig] : top_->signals) {
+                prev_signals[sig_name] = sig.current;
+            }
+            for (auto &child : child_instances_) {
+                std::string prefix = child->name + ".";
+                for (auto &[sig_name, sig] : child->signals) {
+                    prev_signals[prefix + sig_name] = sig.current;
+                }
+            }
+        };
+        snapshot_delta_signals();
         int delta_limit = 10000;
         bool converged = false;
         int delta_cycles = 0;
@@ -2314,6 +2455,7 @@ bool SimKernel::run() {
                 if (finish_requested_) break;
                 auto *ab = dynamic_cast<VerilogParser::AlwaysBlock*>(always.get());
                 if (ab && ab->sens == VerilogParser::AlwaysBlock::LEVEL &&
+                    !block_has_internal_delay(ab) &&
                     should_trigger(ab, top_.get(), "")) {
                     exec_always(top_.get(), always);
                     any_change = true;
@@ -2324,10 +2466,10 @@ bool SimKernel::run() {
                 auto *parent_inst = child->parent;
                 if (!parent_inst) continue;
                 for (auto &[port, sig] : child->port_map) {
-                    auto parent_sig = parent_inst->find_signal(sig);
                     auto child_sig = child->find_signal(port);
-                    if (parent_sig && child_sig && child_sig->dir != Signal::OUTPUT) {
-                        auto propagated = parent_sig->current.resize(child_sig->width);
+                    Value propagated;
+                    if (child_sig && child_sig->dir != Signal::OUTPUT &&
+                        read_connection(parent_inst, sig, child_sig->width, propagated)) {
                         if (value_differs(propagated, child_sig->current, child_sig->width)) {
                             child_sig->current = propagated;
                             child_sig->next = propagated;
@@ -2340,21 +2482,16 @@ bool SimKernel::run() {
                     auto *ab = dynamic_cast<VerilogParser::AlwaysBlock*>(always.get());
                     std::string prefix = child->name + ".";
                     if (ab && ab->sens == VerilogParser::AlwaysBlock::LEVEL &&
+                        !block_has_internal_delay(ab) &&
                         should_trigger(ab, child.get(), prefix)) {
                         exec_always(child.get(), always);
                         any_change = true;
                     }
                 }
                 for (auto &[port, sig] : child->port_map) {
-                    auto parent_sig = parent_inst->find_signal(sig);
                     auto child_sig = child->find_signal(port);
-                    if (parent_sig && child_sig && child_sig->dir != Signal::INPUT) {
-                        auto propagated = child_sig->current.resize(parent_sig->width);
-                        if (value_differs(propagated, parent_sig->current, parent_sig->width)) {
-                            parent_sig->current = propagated;
-                            parent_sig->next = propagated;
-                            any_change = true;
-                        }
+                    if (child_sig && child_sig->dir != Signal::INPUT) {
+                        any_change = write_connection(parent_inst, sig, child_sig->current) || any_change;
                     }
                 }
             }
@@ -2396,6 +2533,9 @@ bool SimKernel::run() {
             strobe_queue_.clear();
 
             converged = !any_change; // Converge if nothing changed this delta cycle
+            if (!converged) {
+                snapshot_delta_signals();
+            }
         }
         if (delta_cycles > 100 && cycle % 10 == 0) {
             log_msg("SIM", "delta_cycle=%d at cycle=%d (many delta cycles, possible oscillation)", delta_cycles, cycle);
@@ -2446,12 +2586,9 @@ bool SimKernel::run() {
             auto *parent_inst = child->parent;
             if (!parent_inst) continue;
             for (auto &[port, sig] : child->port_map) {
-                auto parent_sig = parent_inst->find_signal(sig);
                 auto child_sig = child->find_signal(port);
-                if (parent_sig && child_sig && child_sig->dir != Signal::INPUT) {
-                    auto propagated = child_sig->current.resize(parent_sig->width);
-                    parent_sig->current = propagated;
-                    parent_sig->next = propagated;
+                if (child_sig && child_sig->dir != Signal::INPUT) {
+                    write_connection(parent_inst, sig, child_sig->current);
                 }
             }
         }
@@ -2459,8 +2596,8 @@ bool SimKernel::run() {
         // Track VCD/toggle deltas against the state before this time step.
         std::vector<std::pair<std::string, std::string>> cycle_changes;
         for (auto &[name, sig] : top_->signals) {
-            auto prev_it = prev_signals.find(name);
-            bool changed = (prev_it == prev_signals.end());
+            auto prev_it = cycle_start_signals.find(name);
+            bool changed = (prev_it == cycle_start_signals.end());
             if (!changed) {
                 for (int bi = 0; bi < sig.width && !changed; bi++) {
                     if (sig.current.get_bit(bi) != prev_it->second.get_bit(bi)) changed = true;
@@ -2475,8 +2612,8 @@ bool SimKernel::run() {
         for (auto &child : child_instances_) {
             for (auto &[name, sig] : child->signals) {
                 std::string hier_name = child->name + "." + name;
-                auto prev_it = prev_signals.find(hier_name);
-                bool changed = (prev_it == prev_signals.end());
+                auto prev_it = cycle_start_signals.find(hier_name);
+                bool changed = (prev_it == cycle_start_signals.end());
                 if (!changed) {
                     for (int bi = 0; bi < sig.width && !changed; bi++) {
                         if (sig.current.get_bit(bi) != prev_it->second.get_bit(bi)) changed = true;
@@ -2570,11 +2707,16 @@ bool SimKernel::run() {
     }
     output_ = out.str();
 
-    // Check for PASS/FAIL
+    // Check for PASS/FAIL/ERROR. A later informational PASS must never erase
+    // an earlier failure or timeout.
     passed_ = true;
     for (auto &line : display_lines_) {
-        if (line.find("FAIL") != std::string::npos) passed_ = false;
-        if (line.find("PASS") != std::string::npos) passed_ = true;
+        if (line.find("FAIL") != std::string::npos ||
+            line.find("ERROR") != std::string::npos ||
+            line.find("timeout") != std::string::npos ||
+            line.find("TIMEOUT") != std::string::npos) {
+            passed_ = false;
+        }
     }
     // Add simulation summary with coverage info to output
     {
@@ -2700,13 +2842,18 @@ Signal *SimKernel::find_signal_hier(const std::string &path) {
     // Check top-level first
     auto *sig = top_->find_signal(path);
     if (sig) return sig;
+    ModuleInstance *best_instance = nullptr;
+    size_t best_prefix_length = 0;
     for (auto &child : child_instances_) {
         std::string prefix = child->name + ".";
-        if (path.rfind(prefix, 0) == 0) {
-            return child->find_signal(path.substr(prefix.size()));
+        if (path.rfind(prefix, 0) == 0 && prefix.size() > best_prefix_length) {
+            best_instance = child.get();
+            best_prefix_length = prefix.size();
         }
     }
-    return nullptr;
+    return best_instance
+        ? best_instance->find_signal(path.substr(best_prefix_length))
+        : nullptr;
 }
 std::string SimKernel::get_node_attr(std::shared_ptr<VerilogParser::ASTNode> node, const std::string &key) {
     if (!node) return "";
@@ -2732,6 +2879,132 @@ std::string SimKernel::get_identifier(std::shared_ptr<VerilogParser::ASTNode> no
     // Check children
     if (!node->children.empty()) return get_identifier(node->children[0]);
     return "";
+}
+std::string SimKernel::get_connection_name(std::shared_ptr<VerilogParser::ASTNode> node) {
+    std::string name = get_identifier(node);
+    if (!node) return name;
+    if (auto expr = std::dynamic_pointer_cast<VerilogParser::Expression>(node)) {
+        if (expr->op == VerilogParser::Expression::BIT_SELECT && expr->right) {
+            return name + "[" + std::to_string(get_number(expr->right)) + "]";
+        }
+        if (expr->op == VerilogParser::Expression::PART_SELECT &&
+            expr->right && expr->third) {
+            return name + "[" + std::to_string(get_number(expr->right)) + ":" +
+                   std::to_string(get_number(expr->third)) + "]";
+        }
+    }
+    return name;
+}
+bool SimKernel::read_connection(ModuleInstance *parent, const std::string &connection,
+                                int width, Value &value) {
+    if (!parent || connection.empty()) return false;
+
+    size_t quote = connection.find('\'');
+    if (quote != std::string::npos && quote + 2 <= connection.size()) {
+        int literal_width = width;
+        try {
+            if (quote > 0) literal_width = std::max(std::stoi(connection.substr(0, quote)), 1);
+        } catch (...) {}
+        char base = quote + 1 < connection.size() ? connection[quote + 1] : 'd';
+        std::string digits = quote + 2 < connection.size() ? connection.substr(quote + 2) : "0";
+        digits.erase(std::remove(digits.begin(), digits.end(), '_'), digits.end());
+        int radix = (base == 'b' || base == 'B') ? 2 :
+                    (base == 'o' || base == 'O') ? 8 :
+                    (base == 'h' || base == 'H') ? 16 : 10;
+        try {
+            value = Value(literal_width, std::stoll(digits, nullptr, radix)).resize(width);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    size_t left_bracket = connection.rfind('[');
+    size_t right_bracket = connection.rfind(']');
+    if (left_bracket != std::string::npos && right_bracket == connection.size() - 1 &&
+        left_bracket < right_bracket) {
+        std::string base_name = connection.substr(0, left_bracket);
+        std::string range = connection.substr(left_bracket + 1, right_bracket - left_bracket - 1);
+        auto *signal = parent->find_signal(base_name);
+        if (!signal) return false;
+        size_t colon = range.find(':');
+        if (colon != std::string::npos) {
+            int hi = -1, lo = -1;
+            try {
+                hi = std::stoi(range.substr(0, colon));
+                lo = std::stoi(range.substr(colon + 1));
+            } catch (...) { return false; }
+            if (hi < lo) std::swap(hi, lo);
+            if (lo < 0 || hi >= signal->width) return false;
+            Value selected(hi - lo + 1, 0);
+            for (int bit = 0; bit <= hi - lo; bit++) {
+                selected.set_bit(bit, signal->current.get_bit(lo + bit));
+            }
+            value = selected.resize(width);
+            return true;
+        }
+        int index = -1;
+        try { index = std::stoi(range); }
+        catch (...) { return false; }
+        if (index < 0 || index >= signal->width) return false;
+        Value selected(1, 0);
+        selected.set_bit(0, signal->current.get_bit(index));
+        value = selected.resize(width);
+        return true;
+    }
+
+    auto *signal = parent->find_signal(connection);
+    if (!signal) return false;
+    value = signal->current.resize(width);
+    return true;
+}
+bool SimKernel::write_connection(ModuleInstance *parent, const std::string &connection,
+                                 const Value &value) {
+    if (!parent || connection.empty() || connection.find('\'') != std::string::npos) return false;
+    size_t left_bracket = connection.rfind('[');
+    size_t right_bracket = connection.rfind(']');
+    if (left_bracket != std::string::npos && right_bracket == connection.size() - 1 &&
+        left_bracket < right_bracket) {
+        std::string base_name = connection.substr(0, left_bracket);
+        std::string range = connection.substr(left_bracket + 1, right_bracket - left_bracket - 1);
+        auto *signal = parent->find_signal(base_name);
+        if (!signal) return false;
+        size_t colon = range.find(':');
+        if (colon != std::string::npos) {
+            int hi = -1, lo = -1;
+            try {
+                hi = std::stoi(range.substr(0, colon));
+                lo = std::stoi(range.substr(colon + 1));
+            } catch (...) { return false; }
+            if (hi < lo) std::swap(hi, lo);
+            if (lo < 0 || hi >= signal->width) return false;
+            bool changed = false;
+            for (int bit = 0; bit <= hi - lo; bit++) {
+                Value::State new_bit = value.get_bit(bit);
+                if (signal->current.get_bit(lo + bit) != new_bit) changed = true;
+                signal->current.set_bit(lo + bit, new_bit);
+                signal->next.set_bit(lo + bit, new_bit);
+            }
+            return changed;
+        }
+        int index = -1;
+        try { index = std::stoi(range); }
+        catch (...) { return false; }
+        if (index < 0 || index >= signal->width) return false;
+        Value::State new_bit = value.get_bit(0);
+        bool changed = signal->current.get_bit(index) != new_bit;
+        signal->current.set_bit(index, new_bit);
+        signal->next.set_bit(index, new_bit);
+        return changed;
+    }
+
+    auto *signal = parent->find_signal(connection);
+    if (!signal) return false;
+    Value propagated = value.resize(signal->width);
+    bool changed = value_differs(propagated, signal->current, signal->width);
+    signal->current = propagated;
+    signal->next = propagated;
+    return changed;
 }
 int64_t SimKernel::get_number(std::shared_ptr<VerilogParser::ASTNode> node) {
     if (!node) return 0;

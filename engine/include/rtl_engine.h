@@ -152,8 +152,8 @@ TimingReport rtl_timing_analysis(const char *synth_output, const char *module_na
                                   const char *liberty_file, double clock_period);
 
 /**
- * Run per-corner timing analysis with PVT-based delay scaling.
- * Does NOT parse large .lib files — uses corner type + voltage + temperature.
+ * Run per-corner timing analysis using the specified Liberty library.
+ * PVT scaling is used only if the corner library cannot be loaded.
  *
  * @param synth_output synthesis output text
  * @param module_name target module name
@@ -163,7 +163,8 @@ TimingReport rtl_timing_analysis(const char *synth_output, const char *module_na
  * @param clock_period clock period in ns
  */
 TimingReport rtl_timing_analysis_corner(const char *synth_output, const char *module_name,
-    const char *corner_type, double voltage, double temperature, double clock_period);
+    const char *liberty_file, const char *corner_type, double voltage,
+    double temperature, double clock_period);
 
 /**
  * Generate SDC constraint file for the design.
@@ -285,12 +286,13 @@ void rtl_free_system_info(char* s);
 
 /**
  * Run formal equivalence check between RTL and gate-level netlist.
- * Uses built-in SAT-based equivalence checking.
+ * Uses exhaustive vectors for small combinational interfaces and deterministic
+ * functional regression for larger combinational and sequential designs.
  *
  * @param rtl_code Original RTL source
  * @param gate_code Gate-level netlist source
  * @param module_name Module name to check
- * @return 1 if equivalent, 0 if not, -1 on error
+ * @return 1 if equivalent, 0 if not, -1 if the check is inconclusive or invalid
  */
 int rtl_formal_check(const char *rtl_code, const char *gate_code,
                      const char *module_name);

@@ -536,7 +536,12 @@ private:
     // Helpers
     std::string get_node_attr(std::shared_ptr<VerilogParser::ASTNode> node, const std::string &key);
     std::string get_identifier(std::shared_ptr<VerilogParser::ASTNode> node);
+    std::string get_connection_name(std::shared_ptr<VerilogParser::ASTNode> node);
     int64_t get_number(std::shared_ptr<VerilogParser::ASTNode> node);
+    bool read_connection(ModuleInstance *parent, const std::string &connection,
+                         int width, Value &value);
+    bool write_connection(ModuleInstance *parent, const std::string &connection,
+                          const Value &value);
     Signal *find_signal_hier(const std::string &path);
 };
 

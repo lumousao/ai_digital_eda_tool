@@ -25,6 +25,7 @@ pub struct ProjectManager {
 
 /// Full project configuration with settings persistence for cross-session restore
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProjectConfig {
     pub project_name: String,
     pub top_module: Option<String>,

@@ -13,6 +13,7 @@
 // Global liberty library (loaded once, used by techmap + timing + power)
 static Liberty::LibertyLibrary g_liberty_lib;
 static bool g_liberty_loaded = false;
+static std::string g_liberty_path;
 #include <sstream>
 #include <iostream>
 #include <algorithm>
@@ -98,18 +99,52 @@ static int get_width(std::shared_ptr<VerilogParser::ASTNode> n) {
     return 1;
 }
 
+static bool parse_verilog_int(const std::string &text, int64_t &out) {
+    std::string value = text;
+    value.erase(std::remove(value.begin(), value.end(), '_'), value.end());
+    size_t quote = value.find('\'');
+    try {
+        if (quote != std::string::npos && quote + 1 < value.size()) {
+            char base = value[quote + 1];
+            std::string digits = value.substr(quote + 2);
+            int radix = (base == 'b' || base == 'B') ? 2 :
+                        (base == 'o' || base == 'O') ? 8 :
+                        (base == 'h' || base == 'H') ? 16 : 10;
+            out = digits.empty() ? 0 : std::stoll(digits, nullptr, radix);
+            return true;
+        }
+        out = value.empty() ? 0 : std::stoll(value);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool const_int(std::shared_ptr<VerilogParser::ASTNode> node, int64_t &out) {
+    if (!node || !node->attributes.count("value")) return false;
+    return parse_verilog_int(node->attributes.at("value"), out);
+}
+
 // Expression → gate conversion
 static std::string emit_expr(GateNetlist &gn, std::shared_ptr<VerilogParser::ASTNode> node,
-                              std::map<std::string, std::string> &sm);
+                              std::map<std::string, std::string> &sm,
+                              int required_width = 0);
+static std::string emit_lvalue(std::shared_ptr<VerilogParser::ASTNode> node,
+                               const std::map<std::string, std::string> &sm);
+static int get_signal_width(const GateNetlist &gn, const std::string &signal);
+static std::string ensure_bit_signal(GateNetlist &gn, const std::string &signal, int width, int bit);
+static std::string build_equality_signal(GateNetlist &gn, const std::string &lhs,
+                                         const std::string &rhs, int width);
 
 // Forward declarations for advanced operators
-static std::string emit_booth_multiplier(GateNetlist &gn, const std::string &l, const std::string &r,
-                                          const std::string &o, int wa, int wb, bool is_signed = false);
+static void emit_multiplier_array(GateNetlist &gn, const std::string &l, const std::string &r,
+                                  const std::string &o, int wa, int wb, bool is_signed = false);
 static std::string emit_cla_adder(GateNetlist &gn, const std::string &l, const std::string &r,
                                    const std::string &o, int width, bool is_sub);
 
 static std::string emit_expr(GateNetlist &gn, std::shared_ptr<VerilogParser::ASTNode> node,
-                              std::map<std::string, std::string> &sm) {
+                              std::map<std::string, std::string> &sm,
+                              int required_width) {
     if (!node) return "";
     if (node->type == VerilogParser::NodeType::IDENTIFIER) {
         std::string name = get_name(node);
@@ -172,6 +207,92 @@ static std::string emit_expr(GateNetlist &gn, std::shared_ptr<VerilogParser::AST
 
     auto expr = std::dynamic_pointer_cast<VerilogParser::Expression>(node);
     if (expr) {
+        if (expr->op == VerilogParser::Expression::CONCAT) {
+            // Verilog concatenation is MSB-first: {a, b} places `a` above
+            // `b`.  Preserve every operand instead of falling through to the
+            // generic first-child path, which silently discarded all but the
+            // leading expression.
+            struct ConcatPart { std::string signal; int width; };
+            std::vector<ConcatPart> parts;
+            int total_width = 0;
+            for (const auto &child : expr->children) {
+                std::string signal = emit_expr(gn, child, sm);
+                if (signal.empty()) continue;
+                int width = get_signal_width(gn, signal);
+                if (width < 1) width = 1;
+                parts.push_back({signal, width});
+                total_width += width;
+            }
+            if (parts.empty()) return "";
+            if (parts.size() == 1) return parts.front().signal;
+
+            std::string out = gn.new_wire("_concat");
+            gn.wires[out] = total_width;
+            int out_bit = 0;
+            for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+                for (int bit = 0; bit < it->width; ++bit) {
+                    std::string src = ensure_bit_signal(gn, it->signal, it->width, bit);
+                    std::string dst = out + "[" + std::to_string(out_bit++) + "]";
+                    gn.wires[dst] = 1;
+                    gn.add_cell("$_BUF_", "_c" + std::to_string(gn.next_id++),
+                                {{"A", {src}}, {"Y", {dst}}});
+                }
+            }
+            return out;
+        }
+        if (expr->op == VerilogParser::Expression::BIT_SELECT && expr->left && expr->right) {
+            std::string base = emit_expr(gn, expr->left, sm);
+            int64_t idx = 0;
+            if (!const_int(expr->right, idx)) {
+                std::string dyn = emit_expr(gn, expr->right, sm);
+                std::string out = gn.new_wire("_bitsel_dyn");
+                int base_width = std::max(get_width(expr->left), gn.wires.count(base) ? gn.wires[base] : 1);
+                int sel_width = gn.wires.count(dyn) ? gn.wires[dyn] : 1;
+                std::string cur = "0";
+                for (int bit = base_width - 1; bit >= 0; --bit) {
+                    std::string bit_sig = base + "[" + std::to_string(bit) + "]";
+                    gn.wires[bit_sig] = 1;
+                    int64_t bit_value = bit;
+                    std::string bit_const = "_const" + std::to_string(bit_value);
+                    gn.wires[bit_const] = std::max(sel_width, 1);
+                    for (int bi = 0; bi < sel_width; bi++) {
+                        std::string cb = bit_const + "[" + std::to_string(bi) + "]";
+                        gn.wires[cb] = 1;
+                        gn.add_cell("$_BUF_", "_c" + std::to_string(gn.next_id++),
+                                    {{"A", {((bit_value >> bi) & 1) ? "1" : "0"}}, {"Y", {cb}}});
+                    }
+                    std::string eq = build_equality_signal(gn, dyn, bit_const, sel_width);
+                    std::string next = gn.new_wire("_bitsel_mux");
+                    gn.add_cell("$_MUX_", "_c" + std::to_string(gn.next_id++),
+                                {{"A", {cur}}, {"B", {bit_sig}}, {"S", {eq}}, {"Y", {next}}});
+                    cur = next;
+                }
+                gn.add_cell("$_BUF_", "_c" + std::to_string(gn.next_id++), {{"A", {cur}}, {"Y", {out}}});
+                return out;
+            }
+            std::string bit = base + "[" + std::to_string(idx) + "]";
+            gn.wires[bit] = 1;
+            return sm.count(bit) ? sm[bit] : bit;
+        }
+        if (expr->op == VerilogParser::Expression::PART_SELECT && expr->left && expr->right && expr->third) {
+            std::string base = emit_expr(gn, expr->left, sm);
+            int64_t hi = 0, lo = 0;
+            if (!const_int(expr->right, hi) || !const_int(expr->third, lo)) {
+                return base;
+            }
+            if (hi < lo) std::swap(hi, lo);
+            int width = static_cast<int>(hi - lo + 1);
+            std::string out = gn.new_wire("_part");
+            gn.wires[out] = width;
+            for (int bit = 0; bit < width; bit++) {
+                std::string src = base + "[" + std::to_string(lo + bit) + "]";
+                std::string dst = out + "[" + std::to_string(bit) + "]";
+                gn.wires[src] = 1;
+                gn.wires[dst] = 1;
+                gn.add_cell("$_BUF_", "_c" + std::to_string(gn.next_id++), {{"A", {src}}, {"Y", {dst}}});
+            }
+            return out;
+        }
         if (node->type == VerilogParser::NodeType::TERNARY_OP && expr->left && expr->right && expr->third) {
             std::string c = emit_expr(gn, expr->left, sm);
             // Check if condition is constant
@@ -205,8 +326,16 @@ static std::string emit_expr(GateNetlist &gn, std::shared_ptr<VerilogParser::AST
             return o;
         }
         if (node->type == VerilogParser::NodeType::BINARY_OP && expr->left && expr->right) {
-            std::string l = emit_expr(gn, expr->left, sm);
-            std::string r = emit_expr(gn, expr->right, sm);
+            // Assignment context propagates through arithmetic expressions in
+            // Verilog.  For example, `wire [4:0] s = a + b` must retain the
+            // carry from two 4-bit operands rather than evaluate a 4-bit add
+            // and append a zero.  Carry this context through nested add/sub
+            // trees; non-arithmetic operators retain their self width.
+            const int arithmetic_context =
+                (expr->op == VerilogParser::Expression::ADD ||
+                 expr->op == VerilogParser::Expression::SUB) ? required_width : 0;
+            std::string l = emit_expr(gn, expr->left, sm, arithmetic_context);
+            std::string r = emit_expr(gn, expr->right, sm, arithmetic_context);
             std::string o = gn.new_wire("_bin");
 
             // Constant folding: if both operands are const wires (_constN), fold at compile time
@@ -397,6 +526,7 @@ static std::string emit_expr(GateNetlist &gn, std::shared_ptr<VerilogParser::AST
                     if (gn.wires.count(l)) width = std::max(width, gn.wires[l]);
                     if (gn.wires.count(r)) width = std::max(width, gn.wires[r]);
                     for (auto &p : gn.ports) { if (p.name == l) width = std::max(width, p.width); if (p.name == r) width = std::max(width, p.width); }
+                    width = std::max(width, required_width);
                     if (width < 1) width = 1;
                     // Use CLA for widths >= 8 (O(log n) vs O(n) ripple carry)
                     if (width >= 8) {
@@ -465,63 +595,12 @@ static std::string emit_expr(GateNetlist &gn, std::shared_ptr<VerilogParser::AST
                         is_signed = true;
                     }
 
-                    // Use Booth encoding for widths >= 8 (reduces partial products by ~50%)
-                    if (wa >= 8 || wb >= 8) {
-                        emit_booth_multiplier(gn, l, r, o, wa, wb, is_signed);
-                        gn.wires[o] = width;
-                        break;
-                    }
-                    // Step 1: Generate partial products (AND gates)
-                    std::vector<std::vector<std::string>> pp(wa, std::vector<std::string>(wb));
-                    for (int i = 0; i < wa; i++) {
-                        for (int j = 0; j < wb; j++) {
-                            std::string lb = l + "[" + std::to_string(i) + "]";
-                            std::string rb = r + "[" + std::to_string(j) + "]";
-                            gn.wires[lb] = 1; gn.wires[rb] = 1;
-                            pp[i][j] = gn.new_wire("_pp");
-                            gn.add_cell("$_AND_","_c"+std::to_string(gn.next_id++),{{"A",{lb}},{"B",{rb}},{"Y",{pp[i][j]}}});
-                        }
-                    }
-                    // Step 2: Reduce partial products using carry-save adder tree
-                    // For each column, count the number of 1s using full/half adders
-                    for (int col = 0; col < width; col++) {
-                        std::vector<std::string> col_bits;
-                        for (int i = 0; i < wa; i++) {
-                            int j = col - i;
-                            if (j >= 0 && j < wb) col_bits.push_back(pp[i][j]);
-                        }
-                        // If only 1 bit, connect directly
-                        if (col_bits.size() == 1) {
-                            std::string ob = o + "[" + std::to_string(col) + "]";
-                            gn.wires[ob] = 1;
-                            gn.add_cell("$_BUF_","_c"+std::to_string(gn.next_id++),{{"A",{col_bits[0]}},{"Y",{ob}}});
-                        } else if (col_bits.size() >= 2) {
-                            // Use full adder chain: reduce to sum + carry
-                            std::string cur_sum = col_bits[0];
-                            std::string cur_carry;
-                            for (size_t k = 1; k < col_bits.size(); k++) {
-                                std::string axb = gn.new_wire("_axb");
-                                gn.add_cell("$_XOR_","_c"+std::to_string(gn.next_id++),{{"A",{cur_sum}},{"B",{col_bits[k]}},{"Y",{axb}}});
-                                if (k == 1) {
-                                    cur_carry = gn.new_wire("_carry");
-                                    gn.add_cell("$_AND_","_c"+std::to_string(gn.next_id++),{{"A",{cur_sum}},{"B",{col_bits[k]}},{"Y",{cur_carry}}});
-                                } else {
-                                    std::string sum_new = gn.new_wire("_snew");
-                                    gn.add_cell("$_XOR_","_c"+std::to_string(gn.next_id++),{{"A",{axb}},{"B",{cur_carry}},{"Y",{sum_new}}});
-                                    std::string ab = gn.new_wire("_ab2");
-                                    gn.add_cell("$_AND_","_c"+std::to_string(gn.next_id++),{{"A",{cur_sum}},{"B",{col_bits[k]}},{"Y",{ab}}});
-                                    std::string cab = gn.new_wire("_cab2");
-                                    gn.add_cell("$_AND_","_c"+std::to_string(gn.next_id++),{{"A",{cur_carry}},{"B",{axb}},{"Y",{cab}}});
-                                    cur_carry = gn.new_wire("_cnew");
-                                    gn.add_cell("$_OR_","_c"+std::to_string(gn.next_id++),{{"A",{ab}},{"B",{cab}},{"Y",{cur_carry}}});
-                                    cur_sum = sum_new;
-                                }
-                            }
-                            std::string ob = o + "[" + std::to_string(col) + "]";
-                            gn.wires[ob] = 1;
-                            gn.add_cell("$_BUF_","_c"+std::to_string(gn.next_id++),{{"A",{cur_sum}},{"Y",{ob}}});
-                        }
-                    }
+                    // The former radix-4 Booth lowering emitted incomplete
+                    // pin connections for wide multipliers. Use a full-width
+                    // shift/add implementation until a formally proven Booth
+                    // mapper replaces it. Every partial product and carry is
+                    // explicitly represented in the gate netlist.
+                    emit_multiplier_array(gn, l, r, o, wa, wb, is_signed);
                     gn.wires[o] = width;
                     break;
                 }
@@ -747,30 +826,48 @@ static std::string emit_expr(GateNetlist &gn, std::shared_ptr<VerilogParser::AST
                 case VerilogParser::Expression::SHR:
                 case VerilogParser::Expression::SRA:
                 case VerilogParser::Expression::SRL: {
-                    int w = 1, shift = 1;
+                    int w = 1, shift_width = 1;
                     if (gn.wires.count(l)) w = std::max(w, gn.wires[l]);
+                    if (gn.wires.count(r)) shift_width = std::max(shift_width, gn.wires[r]);
                     for (auto &p : gn.ports) { if (p.name == l) w = std::max(w, p.width); }
                     if (w < 1) w = 1;
-                    if (gn.wires.count(r)) shift = std::min(shift, gn.wires[r]);
-                    // Barrel shifter: each output bit = MUX between multiple input bits
-                    for (int out_bit = 0; out_bit < w; out_bit++) {
-                        std::string ob = o + "[" + std::to_string(out_bit) + "]";
-                        gn.wires[ob] = 1;
-                        int in_bit = (expr->op == VerilogParser::Expression::SHL) ? (out_bit - shift) : (out_bit + shift);
-                        bool is_arith = (expr->op == VerilogParser::Expression::SRA);
-                        std::string src;
-                        if (in_bit >= 0 && in_bit < w) {
-                            src = l + "[" + std::to_string(in_bit) + "]";
-                            gn.wires[src] = 1;
-                        } else if (is_arith && in_bit >= w) {
-                            // Arithmetic right shift: fill with sign bit (MSB)
-                            src = l + "[" + std::to_string(w - 1) + "]";
-                            gn.wires[src] = 1;
-                        } else {
-                            src = gn.new_wire("_zero");
-                            gn.wires[src] = 1;
+                    int stages = 0;
+                    while ((1 << stages) < w && stages < shift_width) stages++;
+                    if (stages == 0) {
+                        for (int bit = 0; bit < w; bit++) {
+                            std::string src = ensure_bit_signal(gn, l, w, bit);
+                            std::string dst = o + "[" + std::to_string(bit) + "]";
+                            gn.wires[dst] = 1;
+                            gn.add_cell("$_BUF_", "_c" + std::to_string(gn.next_id++), {{"A", {src}}, {"Y", {dst}}});
                         }
-                        gn.add_cell("$_BUF_","_c"+std::to_string(gn.next_id++),{{"A",{src}},{"Y",{ob}}});
+                    } else {
+                        std::string current = l;
+                        gn.wires[current] = std::max(gn.wires.count(current) ? gn.wires[current] : 1, w);
+                        for (int stage = 0; stage < stages; stage++) {
+                            int amount = 1 << stage;
+                            std::string next_bus = (stage == stages - 1) ? o : gn.new_wire("_shift");
+                            gn.wires[next_bus] = w;
+                            std::string sel = ensure_bit_signal(gn, r, shift_width, stage);
+                            for (int out_bit = 0; out_bit < w; out_bit++) {
+                                std::string hold = ensure_bit_signal(gn, current, w, out_bit);
+                                int in_bit = (expr->op == VerilogParser::Expression::SHL)
+                                    ? (out_bit - amount)
+                                    : (out_bit + amount);
+                                std::string shifted;
+                                if (in_bit >= 0 && in_bit < w) {
+                                    shifted = ensure_bit_signal(gn, current, w, in_bit);
+                                } else if (expr->op == VerilogParser::Expression::SRA && in_bit >= w) {
+                                    shifted = ensure_bit_signal(gn, current, w, w - 1);
+                                } else {
+                                    shifted = "0";
+                                }
+                                std::string dst = next_bus + "[" + std::to_string(out_bit) + "]";
+                                gn.wires[dst] = 1;
+                                gn.add_cell("$_MUX_", "_c" + std::to_string(gn.next_id++),
+                                            {{"A", {hold}}, {"B", {shifted}}, {"S", {sel}}, {"Y", {dst}}});
+                            }
+                            current = next_bus;
+                        }
                     }
                     gn.wires[o] = w;
                     break;
@@ -961,6 +1058,26 @@ static std::string emit_expr(GateNetlist &gn, std::shared_ptr<VerilogParser::AST
     return "";
 }
 
+// The signal map represents the current value of a procedural variable on
+// RHS expressions. LHS names must remain the declared storage/net name.
+static std::string emit_lvalue(std::shared_ptr<VerilogParser::ASTNode> node,
+                               const std::map<std::string, std::string> &sm) {
+    if (!node) return "";
+    if (node->type == VerilogParser::NodeType::IDENTIFIER) {
+        std::string name = get_name(node);
+        if (node->children.empty()) return name;
+        auto index = node->children[0];
+        if (index && index->type == VerilogParser::NodeType::NUMBER) {
+            return name + "[" + (index->attributes.count("value") ? index->attributes.at("value") : "0") + "]";
+        }
+        std::string index_name = get_name(index);
+        auto it = sm.find(index_name);
+        if (it != sm.end()) index_name = it->second;
+        return index_name.empty() ? name : name + "[" + index_name + "]";
+    }
+    return get_name(node);
+}
+
 // Statement → gates
 static void process_stmt(GateNetlist &gn, std::shared_ptr<VerilogParser::ASTNode> stmt,
                           std::map<std::string, std::string> &sm,
@@ -1148,8 +1265,9 @@ static void collect_stmt_assignments(GateNetlist &gn, std::shared_ptr<VerilogPar
     if (!stmt) return;
 
     if (stmt->type == VerilogParser::NodeType::ASSIGN && stmt->children.size() >= 2) {
-        std::string dst = emit_expr(gn, stmt->children[0], sm);
-        std::string src = emit_expr(gn, stmt->children[1], sm);
+        std::string dst = emit_lvalue(stmt->children[0], sm);
+        std::string src = emit_expr(gn, stmt->children[1], sm,
+                                    get_signal_width(gn, dst));
         if (!dst.empty() && !src.empty()) {
             out[dst] = {src, get_assignment_width(gn, dst, src)};
         }
@@ -1159,6 +1277,36 @@ static void collect_stmt_assignments(GateNetlist &gn, std::shared_ptr<VerilogPar
     if (stmt->type == VerilogParser::NodeType::BEGIN_STATEMENT) {
         for (auto &child : stmt->children) {
             collect_stmt_assignments(gn, child, sm, mod_map, depth, clk, seq, rst, rst_active_low, out);
+            // Blocking assignments in a combinational process make their new
+            // value visible to all following statements in source order.
+            for (const auto &[dst, assign] : out) sm[dst] = assign.src;
+        }
+        return;
+    }
+
+    if (stmt->type == VerilogParser::NodeType::FOR_LOOP) {
+        int unroll_count = 0;
+        std::string loop_var;
+        if (!stmt->children.empty()) {
+            auto init = stmt->children[0];
+            if (init && !init->children.empty()) loop_var = get_name(init->children[0]);
+        }
+        if (stmt->children.size() >= 2) {
+            auto cond = std::dynamic_pointer_cast<VerilogParser::Expression>(stmt->children[1]);
+            int64_t bound = 0;
+            if (cond && const_int(cond->right, bound) && bound >= 0 && bound <= 4096) {
+                unroll_count = static_cast<int>(bound);
+            }
+        }
+        auto body = stmt->children.size() >= 4 ? stmt->children[3] : nullptr;
+        if (body && !loop_var.empty() && unroll_count > 0) {
+            for (int iter = 0; iter < unroll_count; ++iter) {
+                auto iteration_map = sm;
+                iteration_map[loop_var] = std::to_string(iter);
+                collect_stmt_assignments(gn, body, iteration_map, mod_map, depth,
+                                         clk, seq, rst, rst_active_low, out);
+                for (const auto &[dst, assign] : out) sm[dst] = assign.src;
+            }
         }
         return;
     }
@@ -1294,6 +1442,14 @@ static void elaborate_instance(GateNetlist &gn, const std::string &inst_name,
                     sig_name = conn->attributes.at("signal");
                 } else if (!conn->children.empty()) {
                     sig_name = get_name(conn->children[0]);
+                    // Named instance ports may be connected to expressions,
+                    // not only identifiers: .a(bus[3:0]), .d({a,b}), and
+                    // constants are all legal.  Falling back to the common
+                    // expression mapper preserves those connections while
+                    // retaining the direct identifier path for output ports.
+                    if (sig_name.empty()) {
+                        sig_name = emit_expr(gn, conn->children[0], parent_sm);
+                    }
                 }
                 if (!sig_name.empty()) port_map[port_name] = sig_name;
             }
@@ -1307,15 +1463,23 @@ static void elaborate_instance(GateNetlist &gn, const std::string &inst_name,
     for (auto &p : sub_mod->ports) {
         auto pd = std::dynamic_pointer_cast<VerilogParser::PortDecl>(p);
         if (!pd) continue;
-        std::string full_name = inst_name + "." + pd->name;
+        // Flatten hierarchy into a legal plain Verilog identifier.  A dot is
+        // hierarchy syntax in Verilog, not a character permitted in an
+        // unescaped net name; emitting `u.a` here produced an invalid
+        // gate-level netlist and broke every downstream consumer that parsed
+        // it.  The separator is intentionally reversible and collision-safe
+        // for normal identifier components.
+        std::string full_name = inst_name + "__" + pd->name;
         gn.wires[full_name] = pd->width;
         sub_sm[pd->name] = full_name;
 
-        // Connect to parent signal via port map
+        // Connect parent inputs to the child. Outputs are driven back after the child logic is emitted.
         if (port_map.count(pd->name)) {
             std::string parent_sig = port_map[pd->name];
             if (parent_sm.count(parent_sig)) parent_sig = parent_sm[parent_sig];
-            gn.add_cell("$_BUF_", "_c"+std::to_string(gn.next_id++), {{"A",{parent_sig}},{"Y",{full_name}}});
+            if (pd->dir != VerilogParser::PortDecl::OUTPUT) {
+                emit_assignment_cells(gn, full_name, parent_sig, pd->width, "", false, "", true, sub_sm);
+            }
         }
     }
 
@@ -1327,7 +1491,7 @@ static void elaborate_instance(GateNetlist &gn, const std::string &inst_name,
             std::string n = get_name(item);
             int w = get_width(item);
             if (!n.empty()) {
-                std::string full_name = inst_name + "." + n;
+                std::string full_name = inst_name + "__" + n;
                 gn.wires[full_name] = w;
                 sub_sm[n] = full_name;
             }
@@ -1353,9 +1517,11 @@ static void elaborate_instance(GateNetlist &gn, const std::string &inst_name,
         // Continuous assignment
         if (item->type == VerilogParser::NodeType::ASSIGN && item->children.size() >= 2) {
             std::string d = emit_expr(gn, item->children[0], sub_sm);
-            std::string s = emit_expr(gn, item->children[1], sub_sm);
-            if (!d.empty() && !s.empty())
-                gn.add_cell("$_BUF_", "_c"+std::to_string(gn.next_id++), {{"A",{s}},{"Y",{d}}});
+            std::string s = emit_expr(gn, item->children[1], sub_sm,
+                                      get_signal_width(gn, d));
+            if (!d.empty() && !s.empty()) {
+                emit_assignment_cells(gn, d, s, get_assignment_width(gn, d, s), "", false, "", true, sub_sm);
+            }
             return;
         }
         // Always block
@@ -1376,7 +1542,7 @@ static void elaborate_instance(GateNetlist &gn, const std::string &inst_name,
             std::string sub_type = item->attributes.count("type") ? item->attributes.at("type") : "";
             std::string sub_name = item->attributes.count("name") ? item->attributes.at("name") : "";
             if (!sub_type.empty() && !sub_name.empty())
-                elaborate_instance(gn, inst_name + "." + sub_name, sub_type, item, mod_map, sub_sm, depth + 1);
+                elaborate_instance(gn, inst_name + "__" + sub_name, sub_type, item, mod_map, sub_sm, depth + 1);
             return;
         }
     };
@@ -1394,7 +1560,7 @@ static void elaborate_instance(GateNetlist &gn, const std::string &inst_name,
                 std::string parent_sig = port_map[pd->name];
                 if (parent_sm.count(parent_sig)) parent_sig = parent_sm[parent_sig];
                 std::string sub_sig = sub_sm[pd->name];
-                gn.add_cell("$_BUF_", "_c"+std::to_string(gn.next_id++), {{"A",{sub_sig}},{"Y",{parent_sig}}});
+                emit_assignment_cells(gn, parent_sig, sub_sig, pd->width, "", false, "", true, parent_sm);
             }
         }
     }
@@ -1406,16 +1572,81 @@ static void process_stmt(GateNetlist &gn, std::shared_ptr<VerilogParser::ASTNode
                           const std::string &rst, bool rst_active_low) {
     if (!stmt) return;
 
-    if (seq && !clk.empty() &&
-        (stmt->type == VerilogParser::NodeType::BEGIN_STATEMENT ||
-         stmt->type == VerilogParser::NodeType::IF_STATEMENT ||
-         stmt->type == VerilogParser::NodeType::CASE_STATEMENT)) {
+    // Recognize the canonical combinational shift/add multiplier:
+    //   acc = 0; for (i=0; i<N; i=i+1) if (b[i]) acc = acc + (a << i); y = acc;
+    // Lowering this as a multiplier preserves blocking-assignment semantics
+    // while avoiding an unnecessarily large procedural MUX network.
+    if (!seq && stmt->type == VerilogParser::NodeType::BEGIN_STATEMENT && stmt->children.size() >= 3) {
+        auto init = stmt->children[0];
+        auto loop = stmt->children[1];
+        auto final_assign = stmt->children.back();
+        if (init && loop && final_assign && init->type == VerilogParser::NodeType::ASSIGN &&
+            loop->type == VerilogParser::NodeType::FOR_LOOP &&
+            final_assign->type == VerilogParser::NodeType::ASSIGN &&
+            init->children.size() >= 2 && final_assign->children.size() >= 2 &&
+            loop->children.size() >= 4) {
+            int64_t initial_value = 1;
+            std::string accumulator = emit_lvalue(init->children[0], sm);
+            std::string final_source = get_name(final_assign->children[1]);
+            auto body_if = loop->children[3];
+            if (body_if && body_if->type == VerilogParser::NodeType::BEGIN_STATEMENT &&
+                !body_if->children.empty()) {
+                body_if = body_if->children[0];
+            }
+            auto condition_node = body_if && !body_if->children.empty() ? body_if->children[0] : nullptr;
+            auto condition = std::dynamic_pointer_cast<VerilogParser::Expression>(condition_node);
+            auto body_assign = body_if && body_if->children.size() >= 2 ? body_if->children[1] : nullptr;
+            if (const_int(init->children[1], initial_value) && initial_value == 0 &&
+                accumulator == final_source && condition_node && body_assign &&
+                body_assign->type == VerilogParser::NodeType::ASSIGN && body_assign->children.size() >= 2) {
+                std::string multiplier;
+                std::string loop_var;
+                if (condition && condition->op == VerilogParser::Expression::BIT_SELECT &&
+                    condition->left && condition->right) {
+                    multiplier = get_name(condition->left);
+                    loop_var = get_name(condition->right);
+                } else if (condition_node->type == VerilogParser::NodeType::IDENTIFIER &&
+                           !condition_node->children.empty()) {
+                    multiplier = get_name(condition_node);
+                    loop_var = get_name(condition_node->children[0]);
+                }
+                auto update = std::dynamic_pointer_cast<VerilogParser::Expression>(body_assign->children[1]);
+                if (update && update->op == VerilogParser::Expression::ADD && update->left && update->right &&
+                    get_name(update->left) == accumulator) {
+                    auto shifted = std::dynamic_pointer_cast<VerilogParser::Expression>(update->right);
+                    if (shifted && shifted->op == VerilogParser::Expression::SHL && shifted->left && shifted->right &&
+                        get_name(shifted->right) == loop_var && !multiplier.empty()) {
+                        std::string multiplicand = get_name(shifted->left);
+                        std::string output = emit_lvalue(final_assign->children[0], sm);
+                        int wa = get_signal_width(gn, multiplicand);
+                        int wb = get_signal_width(gn, multiplier);
+                        if (!multiplicand.empty() && !output.empty() && wa > 0 && wb > 0) {
+                            synth_log("SYNTH", "  Recognized shift/add multiplier: %s * %s -> %s",
+                                      multiplicand.c_str(), multiplier.c_str(), output.c_str());
+                            emit_multiplier_array(gn, multiplicand, multiplier, output, wa, wb, false);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (stmt->type == VerilogParser::NodeType::BEGIN_STATEMENT ||
+        stmt->type == VerilogParser::NodeType::IF_STATEMENT ||
+        stmt->type == VerilogParser::NodeType::CASE_STATEMENT) {
         std::map<std::string, PendingAssign> pending;
         collect_stmt_assignments(gn, stmt, sm, mod_map, depth, clk, seq, rst, rst_active_low, pending);
-        for (const auto &[dst, assign] : pending) {
-            emit_assignment_cells(gn, dst, assign.src, assign.width, clk, true, rst, rst_active_low, sm);
+        if (!pending.empty()) {
+            for (const auto &[dst, assign] : pending) {
+                emit_assignment_cells(gn, dst, assign.src, assign.width, clk, seq, rst, rst_active_low, sm);
+            }
+            return;
         }
-        return;
+        if (stmt->type == VerilogParser::NodeType::IF_STATEMENT ||
+            stmt->type == VerilogParser::NodeType::CASE_STATEMENT) {
+            return;
+        }
     }
 
     // Assignment (blocking or non-blocking)
@@ -1424,7 +1655,8 @@ static void process_stmt(GateNetlist &gn, std::shared_ptr<VerilogParser::ASTNode
         auto rhs_node = stmt->children[1];
 
         std::string dst = emit_expr(gn, lhs_node, sm);
-        std::string src = emit_expr(gn, rhs_node, sm);
+        std::string src = emit_expr(gn, rhs_node, sm,
+                                    get_signal_width(gn, dst));
         if (dst.empty() || src.empty()) return;
 
         int width = get_assignment_width(gn, dst, src);
@@ -1904,7 +2136,8 @@ static GateNetlist module_to_gates(const std::string &name, std::shared_ptr<Veri
                     for (auto &c : gc->children) process_stmt(gn, c, sm, clk, seq, mod_map, 0, rst);
                 } else if (gct == VerilogParser::NodeType::ASSIGN && gc->children.size() >= 2) {
                     std::string d = emit_expr(gn, gc->children[0], sm);
-                    std::string s = emit_expr(gn, gc->children[1], sm);
+                    std::string s = emit_expr(gn, gc->children[1], sm,
+                                              get_signal_width(gn, d));
                     if (!d.empty() && !s.empty()) {
                         int w = std::max(gn.wires.count(d)?gn.wires[d]:1, gn.wires.count(s)?gn.wires[s]:1);
                         if (w > 1) { for (int b=0;b<w;b++) { std::string dw=d+"["+std::to_string(b)+"]",sw=s+"["+std::to_string(b)+"]"; gn.wires[dw]=1;gn.wires[sw]=1;gn.add_cell("$_BUF_","_c"+std::to_string(gn.next_id++),{{"A",{sw}},{"Y",{dw}}}); } }
@@ -1921,7 +2154,8 @@ static GateNetlist module_to_gates(const std::string &name, std::shared_ptr<Veri
         }
         if (item->type==VerilogParser::NodeType::ASSIGN && item->children.size()>=2) {
             std::string d = emit_expr(gn, item->children[0], sm);
-            std::string s = emit_expr(gn, item->children[1], sm);
+            std::string s = emit_expr(gn, item->children[1], sm,
+                                      get_signal_width(gn, d));
             if (!d.empty() && !s.empty()) {
                 int dw = gn.wires.count(d) ? gn.wires[d] : 1;
                 int sw = gn.wires.count(s) ? gn.wires[s] : 1;
@@ -2371,7 +2605,14 @@ static void pass_cse(GateNetlist &gn) {
     for (auto &cell : gn.cells) {
         if (is_stateful(cell.type)) continue;
         for (auto &conn : cell.conns) {
-            if (replace_map.count(conn.second.signal)) {
+            // A common-expression alias may only substitute a consumer input.
+            // Rewriting Y/Q turns a duplicate cell into a second driver of the
+            // canonical wire and disconnects its declared destination.  That
+            // is especially destructive at hierarchy boundaries, where a
+            // port-connection BUF is the sole driver of a parent signal.
+            // Leave producer pins intact; DCE will remove an unreferenced
+            // duplicate producer after its consumers have been redirected.
+            if (conn.first != "Y" && conn.first != "Q" && replace_map.count(conn.second.signal)) {
                 if (merge_details.size() < 50) {
                     merge_details.push_back(conn.second.signal + "=>" + replace_map[conn.second.signal]);
                 }
@@ -2712,17 +2953,29 @@ static void pass_logic_min(GateNetlist &gn) {
     int const_folded = 0;
     for (auto &cell : gn.cells) {
         if (cell.type == "$_AND_" || cell.type == "$_OR_") {
+            bool force_zero = false;
+            bool force_one = false;
             for (auto &conn : cell.conns) {
                 if (conn.first == "A" || conn.first == "B") {
                     std::string s = conn.second.signal;
                     bool is_zero = (s == "0" || s == "1'b0");
                     bool is_one = (s == "1" || s == "1'b1");
-                    if ((cell.type == "$_AND_" && is_zero) || (cell.type == "$_OR_" && is_one)) {
-                        cell.type = "$_BUF_";
-                        const_folded++;
-                        break;
-                    }
+                    force_zero = force_zero || (cell.type == "$_AND_" && is_zero);
+                    force_one = force_one || (cell.type == "$_OR_" && is_one);
                 }
+            }
+            if (force_zero || force_one) {
+                // Dominating constants must remain explicit. Merely changing
+                // the cell type to BUF preserves its old A input and changes
+                // A&0 into A, which is a functional corruption.
+                const char *value = force_one ? "1" : "0";
+                cell.type = "$_BUF_";
+                for (auto &conn : cell.conns) {
+                    if (conn.first == "A") conn.second.signal = value;
+                }
+                cell.conns.erase(std::remove_if(cell.conns.begin(), cell.conns.end(),
+                    [](const auto &conn) { return conn.first == "B"; }), cell.conns.end());
+                const_folded++;
             }
         }
     }
@@ -2977,6 +3230,105 @@ static void pass_resource_share(GateNetlist &gn) {
 // Reduces partial products by half compared to simple AND array.
 // Reference: Booth, A.D. "A Signed Binary Multiplication Technique" (1951)
 // ============================================================================
+// Correctness-first lowering used by the expression mapper. The legacy Booth
+// implementation below is retained for reference, but generated undriven
+// intermediate signals for wide operands. This explicit shift/add network
+// drives every partial-product and carry signal.
+static void emit_multiplier_array(GateNetlist &gn, const std::string &l, const std::string &r,
+                                  const std::string &o, int wa, int wb, bool is_signed) {
+    const int width = wa + wb;
+    auto source_bit = [&](const std::string &signal, int signal_width, int bit) {
+        if (signal_width == 1) return signal;
+        std::string name = signal + "[" + std::to_string(bit) + "]";
+        gn.wires[name] = 1;
+        return name;
+    };
+    auto add_vectors = [&](const std::vector<std::string> &a, const std::vector<std::string> &b,
+                           const std::string &prefix) {
+        std::vector<std::string> sum(width);
+        std::string carry = "0";
+        for (int bit = 0; bit < width; ++bit) {
+            std::string axb = gn.new_wire(prefix + "_xab");
+            sum[bit] = gn.new_wire(prefix + "_sum");
+            gn.add_cell("$_XOR_", "_c" + std::to_string(gn.next_id++),
+                        {{"A", {a[bit]}}, {"B", {b[bit]}}, {"Y", {axb}}});
+            gn.add_cell("$_XOR_", "_c" + std::to_string(gn.next_id++),
+                        {{"A", {axb}}, {"B", {carry}}, {"Y", {sum[bit]}}});
+            if (bit + 1 < width) {
+                std::string ab = gn.new_wire(prefix + "_ab");
+                std::string carry_xab = gn.new_wire(prefix + "_cab");
+                std::string next_carry = gn.new_wire(prefix + "_carry");
+                gn.add_cell("$_AND_", "_c" + std::to_string(gn.next_id++),
+                            {{"A", {a[bit]}}, {"B", {b[bit]}}, {"Y", {ab}}});
+                gn.add_cell("$_AND_", "_c" + std::to_string(gn.next_id++),
+                            {{"A", {carry}}, {"B", {axb}}, {"Y", {carry_xab}}});
+                gn.add_cell("$_OR_", "_c" + std::to_string(gn.next_id++),
+                            {{"A", {ab}}, {"B", {carry_xab}}, {"Y", {next_carry}}});
+                carry = next_carry;
+            }
+        }
+        return sum;
+    };
+    auto absolute_operand = [&](const std::string &signal, int signal_width, const std::string &sign,
+                                const std::string &prefix) {
+        std::vector<std::string> inverted(width, "0");
+        std::vector<std::string> increment(width, "0");
+        increment[0] = sign;
+        for (int bit = 0; bit < signal_width; ++bit) {
+            inverted[bit] = gn.new_wire(prefix + "_abs");
+            gn.add_cell("$_XOR_", "_c" + std::to_string(gn.next_id++),
+                        {{"A", {source_bit(signal, signal_width, bit)}}, {"B", {sign}}, {"Y", {inverted[bit]}}});
+        }
+        return add_vectors(inverted, increment, prefix + "_inc");
+    };
+
+    std::string sign_a = is_signed ? source_bit(l, wa, wa - 1) : "0";
+    std::string sign_b = is_signed ? source_bit(r, wb, wb - 1) : "0";
+    std::vector<std::string> a(width, "0");
+    std::vector<std::string> b(width, "0");
+    if (is_signed) {
+        a = absolute_operand(l, wa, sign_a, "_mul_a");
+        b = absolute_operand(r, wb, sign_b, "_mul_b");
+    } else {
+        for (int bit = 0; bit < wa; ++bit) a[bit] = source_bit(l, wa, bit);
+        for (int bit = 0; bit < wb; ++bit) b[bit] = source_bit(r, wb, bit);
+    }
+    std::vector<std::string> accumulator(width, "0");
+
+    for (int shift = 0; shift < wb; ++shift) {
+        std::vector<std::string> partial(width, "0");
+        for (int bit = shift; bit < width && bit - shift < wa; ++bit) {
+            partial[bit] = gn.new_wire("_mul_pp");
+            gn.add_cell("$_AND_", "_c" + std::to_string(gn.next_id++),
+                        {{"A", {a[bit - shift]}}, {"B", {b[shift]}}, {"Y", {partial[bit]}}});
+        }
+        accumulator = add_vectors(accumulator, partial, "_mul_add");
+    }
+
+    if (is_signed) {
+        std::string result_sign = gn.new_wire("_mul_sign");
+        gn.add_cell("$_XOR_", "_c" + std::to_string(gn.next_id++),
+                    {{"A", {sign_a}}, {"B", {sign_b}}, {"Y", {result_sign}}});
+        std::vector<std::string> inverted(width);
+        std::vector<std::string> increment(width, "0");
+        increment[0] = result_sign;
+        for (int bit = 0; bit < width; ++bit) {
+            inverted[bit] = gn.new_wire("_mul_neg");
+            gn.add_cell("$_XOR_", "_c" + std::to_string(gn.next_id++),
+                        {{"A", {accumulator[bit]}}, {"B", {result_sign}}, {"Y", {inverted[bit]}}});
+        }
+        accumulator = add_vectors(inverted, increment, "_mul_neginc");
+    }
+
+    for (int bit = 0; bit < width; ++bit) {
+        std::string output_bit = o + "[" + std::to_string(bit) + "]";
+        gn.wires[output_bit] = 1;
+        gn.add_cell("$_BUF_", "_c" + std::to_string(gn.next_id++),
+                    {{"A", {accumulator[bit]}}, {"Y", {output_bit}}});
+    }
+    gn.wires[o] = width;
+}
+
 static std::string emit_booth_multiplier(GateNetlist &gn, const std::string &l, const std::string &r,
                                           const std::string &o, int wa, int wb, bool is_signed) {
     int width = wa + wb;
@@ -3281,6 +3633,7 @@ static std::string emit_cla_adder(GateNetlist &gn, const std::string &l, const s
     } else {
         carry_in = gn.new_wire("_cin_zero");
         gn.wires[carry_in] = 1;
+        gn.add_cell("$_BUF_", "_c"+std::to_string(gn.next_id++), {{"A",{"0"}},{"Y",{carry_in}}});
     }
 
     for (int blk = 0; blk < num_blocks; blk++) {
@@ -3289,7 +3642,14 @@ static std::string emit_cla_adder(GateNetlist &gn, const std::string &l, const s
 
         // Get bit signals
         auto get_bit = [&](const std::string &sig, int b) -> std::string {
-            if (remaining > 1) {
+            const int signal_width = get_signal_width(gn, sig);
+            // A partial final CLA block still addresses the original bus at
+            // its absolute bit index.  Returning the unsliced bus here made
+            // a 9-bit add read bit 0 for bit 8 (and similarly for every
+            // non-multiple-of-four width).  Missing high bits are unsigned
+            // zero-extension under Verilog arithmetic rules.
+            if (b >= signal_width) return "0";
+            if (signal_width > 1) {
                 std::string n = sig + "[" + std::to_string(b) + "]";
                 gn.wires[n] = 1;
                 return n;
@@ -5188,15 +5548,20 @@ CppSynthResult synth_real_with_lib(const char *rtl_code, const char *module_name
     Synthesis::synth_log("SYNTH", "=== Synthesis with lib: %s (%zu bytes) ===", mod.c_str(), rtl.size());
 
     // Load full liberty library (NLDM tables, cell info, timing arcs)
-    if (!lib_path_str.empty() && !g_liberty_loaded) {
-        if (g_liberty_lib.load(lib_path_str)) {
+    if (!lib_path_str.empty() && (!g_liberty_loaded || g_liberty_path != lib_path_str)) {
+        Liberty::LibertyLibrary requested_lib;
+        if (requested_lib.load(lib_path_str)) {
+            g_liberty_lib = std::move(requested_lib);
             g_liberty_loaded = true;
+            g_liberty_path = lib_path_str;
             lib_name_str = g_liberty_lib.name;
             Synthesis::synth_log("SYNTH", "  Liberty loaded: %s — %zu cells, %.1fV/%.0fC",
                 lib_name_str.c_str(), g_liberty_lib.cells.size(),
                 g_liberty_lib.nom_voltage, g_liberty_lib.nom_temperature);
             result.lib_name = strdup_safe(lib_name_str.c_str());
         } else {
+            g_liberty_loaded = false;
+            g_liberty_path.clear();
             Synthesis::synth_log("SYNTH", "  WARNING: Failed to load liberty file, using estimates");
         }
     }

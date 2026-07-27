@@ -1613,15 +1613,21 @@ std::shared_ptr<ASTNode> Parser::parseForLoop() {
         error("Expected ';'");
     }
 
-    // Parse update (parseStatement may or may not consume the trailing ';')
-    auto update = parseStatement();
-    if (update) {
-        forLoop->addChild(update);
+    // The update clause is inside the for-header and therefore has no
+    // terminating semicolon. Parsing it as a normal statement makes
+    // parseBlockingAssignment consume the closing ')' as if it were ';',
+    // which in turn loses the loop body and following statements.
+    auto update = std::make_shared<ASTNode>(NodeType::ASSIGN);
+    auto update_lhs = parseExpression();
+    if (update_lhs) update->addChild(update_lhs);
+    tok = lexer_->next();
+    if (tok.type != TokenType::TOK_ASSIGN_OP) {
+        error("Expected '=' in for-loop update");
     }
-    // Consume ';' if present (some parsers include it in update)
-    tok = lexer_->peek();
-    if (tok.type == TokenType::TOK_SEMICOLON) {
-        lexer_->next();
+    auto update_rhs = parseExpression();
+    if (update_rhs) update->addChild(update_rhs);
+    if (!update->children.empty()) {
+        forLoop->addChild(update);
     }
 
     // Consume ')'

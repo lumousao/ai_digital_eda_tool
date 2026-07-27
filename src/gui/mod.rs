@@ -18,7 +18,7 @@ pub fn run() -> Result<(), String> {
     let script_path = find_gui_script()?;
 
     println!("╔══════════════════════════════════════════╗");
-    println!("║   AI Digital v0.6.7 — GUI Mode          ║");
+    println!("║   AI Digital v0.6.8 — GUI Mode          ║");
     println!("╚══════════════════════════════════════════╝");
     println!();
     println!("  Launching Tcl/Tk GUI...");

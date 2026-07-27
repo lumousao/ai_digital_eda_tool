@@ -204,6 +204,8 @@ struct ResponseMessage {
     #[serde(default)]
     reasoning: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<ToolCallMsg>>,
 }
 
@@ -650,6 +652,17 @@ impl LlmClient {
         self.chat_internal(messages, None, false)
     }
 
+    /// Ultra-short non-JSON chat for flow-control decisions. This avoids
+    /// JSON-mode providers spending many hidden reasoning tokens before
+    /// emitting a tiny object.
+    pub fn chat_compact(
+        &self,
+        messages: &[Message],
+        max_tokens: u32,
+    ) -> Result<(String, Usage), String> {
+        self.chat_internal_with_options(messages, None, false, Some(max_tokens), Some(0.0), true)
+    }
+
     /// Chat with function calling using ToolMessage directly
     pub fn chat_with_tool_messages(
         &self,
@@ -693,6 +706,18 @@ impl LlmClient {
         tools: Option<&[ToolDef]>,
         json_mode: bool,
     ) -> Result<(String, Usage), String> {
+        self.chat_internal_with_options(messages, tools, json_mode, None, None, false)
+    }
+
+    fn chat_internal_with_options(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDef]>,
+        json_mode: bool,
+        max_tokens_override: Option<u32>,
+        temperature_override: Option<f32>,
+        compact_no_retry: bool,
+    ) -> Result<(String, Usage), String> {
         self.check_cost_limit()?;
 
         // Check cache
@@ -705,6 +730,21 @@ impl LlmClient {
 
         let style = self.effective_api_style();
         let mut last_err = String::new();
+        let compact_response_mode = compact_no_retry || (json_mode && tools.is_none());
+        let request_max_tokens = if let Some(max_tokens) = max_tokens_override {
+            max_tokens
+        } else if compact_response_mode {
+            self.config.max_tokens.min(1024)
+        } else {
+            self.config.max_tokens
+        };
+        let request_temperature = if let Some(temperature) = temperature_override {
+            temperature
+        } else if compact_response_mode {
+            0.0
+        } else {
+            self.config.temperature
+        };
 
         match style {
             ApiStyle::Anthropic => {
@@ -713,8 +753,8 @@ impl LlmClient {
                 let mut body = json!({
                     "model": self.config.model,
                     "messages": api_messages,
-                    "temperature": self.config.temperature,
-                    "max_tokens": self.config.max_tokens,
+                    "temperature": request_temperature,
+                    "max_tokens": request_max_tokens,
                     "stream": false,
                 });
                 if let Some(system_text) = system {
@@ -781,6 +821,13 @@ impl LlmClient {
                                     }
                                     if content.is_empty() && tools.is_none() {
                                         last_err = "Empty response from LLM".to_string();
+                                        if compact_response_mode {
+                                            self.token_tracker.record_failure();
+                                            return Err(format!(
+                                                "{} (compact response, max_tokens={})",
+                                                last_err, request_max_tokens
+                                            ));
+                                        }
                                         if attempt < 2 {
                                             std::thread::sleep(std::time::Duration::from_millis(2u64.pow(attempt as u32) * 1000 + rand_ms()));
                                             continue;
@@ -823,8 +870,8 @@ impl LlmClient {
                         "role": m.role,
                         "content": m.content,
                     })).collect::<Vec<_>>(),
-                    "temperature": self.config.temperature,
-                    "max_tokens": self.config.max_tokens,
+                    "temperature": request_temperature,
+                    "max_tokens": request_max_tokens,
                     "stream": false,
                 });
 
@@ -874,7 +921,19 @@ impl LlmClient {
                                         let content = match msg {
                                             Some(ref m) if m.content.as_ref().map_or(false, |c| !c.is_empty()) =>
                                                 m.content.clone().unwrap_or_default(),
-                                            Some(ref m) => m.reasoning.clone().unwrap_or_default(),
+                                            Some(ref m) if compact_response_mode => m.reasoning_content.clone()
+                                                .or_else(|| m.reasoning.clone())
+                                                .unwrap_or_default(),
+                                            Some(ref m) => {
+                                                let aux = m.reasoning_content.clone()
+                                                    .or_else(|| m.reasoning.clone())
+                                                    .unwrap_or_default();
+                                                if json_mode {
+                                                    if aux.contains('{') && aux.contains('}') { aux } else { String::new() }
+                                                } else {
+                                                    aux
+                                                }
+                                            }
                                             None => String::new(),
                                         };
 
@@ -882,6 +941,13 @@ impl LlmClient {
 
                                         if content.is_empty() && tools.is_none() {
                                             last_err = "Empty response from LLM".to_string();
+                                            if compact_response_mode {
+                                                self.token_tracker.record_failure();
+                                                return Err(format!(
+                                                    "{} (compact response, max_tokens={})",
+                                                    last_err, request_max_tokens
+                                                ));
+                                            }
                                             if attempt < 2 {
                                                 std::thread::sleep(std::time::Duration::from_millis(2u64.pow(attempt as u32) * 1000 + rand_ms()));
                                                 continue;

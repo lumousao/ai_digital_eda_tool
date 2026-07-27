@@ -43,6 +43,20 @@ public:
         return t;
     }
 
+    std::string location() const {
+        size_t line = 1;
+        size_t column = 1;
+        for (size_t i = 0; i < pos_; ++i) {
+            if (s_[i] == '\n') {
+                ++line;
+                column = 1;
+            } else {
+                ++column;
+            }
+        }
+        return std::to_string(line) + ":" + std::to_string(column);
+    }
+
     Token next() {
         skip();
         if (pos_ >= len_) return {END, ""};
@@ -140,7 +154,8 @@ private:
  * ========================================================================= */
 class Parser {
 public:
-    Parser(const std::string &content) : tok_(content), lib_(nullptr) {}
+    Parser(const std::string &content, const std::string &source_name)
+        : tok_(content), lib_(nullptr), source_name_(source_name) {}
 
     bool parse(LibertyLibrary &lib) {
         lib_ = &lib;
@@ -148,7 +163,8 @@ public:
             parse_library();
             return true;
         } catch (const std::string &e) {
-            std::cerr << "Liberty parse error: " << e << std::endl;
+            std::cerr << "Liberty parse error in " << source_name_ << " at "
+                      << tok_.location() << ": " << e << std::endl;
             return false;
         }
     }
@@ -156,6 +172,7 @@ public:
 private:
     Tokenizer tok_;
     LibertyLibrary *lib_;
+    std::string source_name_;
 
     double to_dbl(const std::string &s) { try { return std::stod(s); } catch (...) { return 0.0; } }
 
@@ -351,6 +368,21 @@ private:
             }
             if (!when.empty()) cell.state_leakages[when] = val;
             else cell.cell_leakage_power = val > 0 ? val : cell.cell_leakage_power;
+            return;
+        }
+
+        // Cell bodies contain several structured attributes besides pins, such
+        // as ff(), latch(), statetable(), and test_cell().  They do not affect
+        // combinational mapping, but their complete body must be consumed so
+        // the enclosing cell/library brace depth remains correct.
+        if (p.type == Tokenizer::LPAREN) {
+            parse_paren_name();
+            if (tok_.peek().type == Tokenizer::LBR) {
+                tok_.next();
+                skip_to_rbrace();
+            } else if (tok_.peek().type == Tokenizer::SEMI) {
+                tok_.next();
+            }
             return;
         }
 
@@ -724,7 +756,7 @@ bool LibertyLibrary::load(const std::string &filename) {
 
     if (content.empty()) return false;
 
-    Parser parser(content);
+    Parser parser(content, filename);
     return parser.parse(*this);
 }
 

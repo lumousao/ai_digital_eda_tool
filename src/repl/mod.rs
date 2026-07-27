@@ -10,12 +10,316 @@ use colored::Colorize;
 #[allow(unused_imports)]
 use crate::agent::{Agent, ThinkingMode};
 use crate::data_api::{DataApi, FlowSnapshotBuilder, FlowDecision, FlowAction};
-use crate::gui_exchange::{self, GuiSyncContext};
+use crate::gui_exchange::{self, GuiSyncContext, GuiTechnologyCorner};
 use crate::engine::{self, Design, LintResult, SynthStats, TimingReport};
 use crate::llm::{LlmClient, LlmConfig, Message};
 use crate::project;
 use crate::tech::{self, CornerDatabase, CornerType, LibCorner};
 use crate::terminal;
+
+struct CornerPowerResult {
+    corner: LibCorner,
+    power: engine::PowerAnalysisResult,
+}
+
+fn compact_token(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':' | '/' ) {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+fn compact_token_limited(value: &str, max_chars: usize) -> String {
+    let token = compact_token(value);
+    if token.len() <= max_chars {
+        token
+    } else {
+        let mut truncated = token.chars().take(max_chars.saturating_sub(3)).collect::<String>();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
+/// Keep repair prompts bounded without cutting an UTF-8 code point.
+fn llm_excerpt(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut excerpt = value.chars().take(max_chars).collect::<String>();
+    excerpt.push_str("\n// [truncated by local agent]\n");
+    excerpt
+}
+
+fn parse_compact_llm_decision(response: &str) -> Option<FlowDecision> {
+    let first_line = response
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim();
+    if first_line.contains('{') || first_line.contains('}') {
+        return None;
+    }
+
+    let normalized = first_line
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches(',')
+        .trim_matches('.')
+        .to_ascii_lowercase();
+    if matches!(normalized.as_str(), "ok" | "pass" | "passed" | "proceed" | "continue" | "yes") {
+        return Some(FlowDecision {
+            action: FlowAction::Proceed,
+            target: String::new(),
+            reason: "ok".to_string(),
+            suggestions: None,
+        });
+    }
+
+    // A decision must occupy the whole first line. Searching prose for a
+    // `p|ok` substring made unrelated explanations able to steer the flow.
+    if normalized.contains(char::is_whitespace) {
+        return None;
+    }
+    let parts: Vec<&str> = normalized.split('|').collect();
+    let action_text = parts.first()?.trim().to_ascii_lowercase();
+    let action = match action_text.as_str() {
+        "p" => FlowAction::Proceed,
+        "r" => FlowAction::Retry,
+        "b" => FlowAction::Back,
+        "o" => FlowAction::Optimize,
+        "x" => FlowAction::Abort,
+        _ => return None,
+    };
+
+    let (target, reason, suggestions) = match action {
+        FlowAction::Back => {
+            if parts.len() < 3 || parts[1].is_empty() || parts[2].is_empty() {
+                return None;
+            }
+            let target = parts.get(1).map(|s| compact_token_limited(s, 32)).unwrap_or_default();
+            let reason = parts.get(2).map(|s| compact_token_limited(s, 64)).unwrap_or_else(|| "back".to_string());
+            let suggestions = parts.get(3).map(|s| compact_token_limited(s, 80)).filter(|s| !s.is_empty());
+            (target, reason, suggestions)
+        }
+        _ => {
+            if parts.len() < 2 || parts[1].is_empty() {
+                return None;
+            }
+            let reason = parts.get(1).map(|s| compact_token_limited(s, 64)).unwrap_or_else(|| action.as_str().to_ascii_lowercase());
+            let suggestions = parts.get(2).map(|s| compact_token_limited(s, 80)).filter(|s| !s.is_empty());
+            (String::new(), reason, suggestions)
+        }
+    };
+
+    Some(FlowDecision {
+        action,
+        target,
+        reason,
+        suggestions,
+    })
+}
+
+fn data_value<'a>(data: &'a [(&str, &str)], key: &str) -> Option<&'a str> {
+    data.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+}
+
+fn data_bool(data: &[(&str, &str)], key: &str) -> Option<bool> {
+    data_value(data, key).map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "pass" | "passed" | "met" | "1"))
+}
+
+fn data_f64(data: &[(&str, &str)], key: &str) -> Option<f64> {
+    data_value(data, key).and_then(|v| v.parse::<f64>().ok())
+}
+
+fn guarded_decision_after_bad_llm_format(
+    step_name: &str,
+    step_result: &str,
+    data: &[(&str, &str)],
+    response: &str,
+) -> FlowDecision {
+    let result_lc = step_result.to_ascii_lowercase();
+    let response_code = compact_token_limited(response, 24);
+    let reason = if response_code.is_empty() {
+        "api_format_bad_guard".to_string()
+    } else {
+        format!("api_format_bad_guard:{}", response_code)
+    };
+    let proceed = || FlowDecision {
+        action: FlowAction::Proceed,
+        target: String::new(),
+        reason: reason.clone(),
+        suggestions: None,
+    };
+    let retry = |target: &str, why: &str| FlowDecision {
+        action: if target.is_empty() { FlowAction::Retry } else { FlowAction::Back },
+        target: target.to_string(),
+        reason: format!("{}_{}", why, response_code),
+        suggestions: None,
+    };
+
+    match step_name {
+        "Simulation" => {
+            if data_bool(data, "sim_passed") == Some(true) && result_lc.contains("pass") {
+                proceed()
+            } else {
+                retry("Simulation", "sim_not_passed")
+            }
+        }
+        "Synthesis" => {
+            if data_f64(data, "cells").unwrap_or(0.0) > 0.0
+                && data_f64(data, "area_ge").unwrap_or(0.0) >= 0.0
+                && !result_lc.contains("fail")
+            {
+                proceed()
+            } else {
+                retry("Synthesis", "synth_invalid")
+            }
+        }
+        "Timing" => {
+            if data_bool(data, "timing_met") == Some(true)
+                && data_f64(data, "max_freq_mhz").unwrap_or(0.0) > 0.0
+                && !result_lc.contains("violated")
+            {
+                proceed()
+            } else {
+                retry("Synthesis", "timing_not_met")
+            }
+        }
+        "Formal" => {
+            if data_bool(data, "formal_equivalent") == Some(true) && result_lc.contains("pass") {
+                proceed()
+            } else {
+                retry("Synthesis", "formal_not_equivalent")
+            }
+        }
+        "Power" => {
+            if data_bool(data, "power_liberty_ok") != Some(true) {
+                retry("Power", "power_not_liberty")
+            } else if data_bool(data, "explicit_power_budget") == Some(true)
+                && data_f64(data, "power_total_uw").unwrap_or(0.0)
+                    > data_f64(data, "power_budget_uw").unwrap_or(f64::INFINITY)
+            {
+                FlowDecision {
+                    action: FlowAction::Optimize,
+                    target: String::new(),
+                    reason: "power_budget_exceeded".to_string(),
+                    suggestions: Some("power_opt".to_string()),
+                }
+            } else if !result_lc.contains("fail") {
+                proceed()
+            } else {
+                retry("Power", "power_failed")
+            }
+        }
+        "FinalReport" => {
+            if data_bool(data, "timing_met") == Some(true)
+                && data_bool(data, "formal_equivalent") == Some(true)
+                && data_f64(data, "max_freq_mhz").unwrap_or(0.0) > 0.0
+                && !result_lc.contains("fail")
+            {
+                proceed()
+            } else {
+                retry("FinalReport", "report_not_ready")
+            }
+        }
+        _ => {
+            if result_lc.contains("pass") || result_lc.contains("met") || result_lc.contains("complete") || result_lc.contains("ready") {
+                proceed()
+            } else {
+                retry(step_name, "step_not_passed")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod compact_decision_tests {
+    use super::{guarded_decision_after_bad_llm_format, parse_compact_llm_decision, DetailLogger};
+    use crate::data_api::FlowAction;
+    use std::fs;
+
+    #[test]
+    fn compact_decision_requires_an_exact_action_token() {
+        let decision = parse_compact_llm_decision("p|ok").expect("compact proceed should parse");
+        assert_eq!(decision.action, FlowAction::Proceed);
+
+        assert!(parse_compact_llm_decision("The design passed; p|ok").is_none());
+        assert!(parse_compact_llm_decision("proceed|ok").is_none());
+        assert!(parse_compact_llm_decision(r#"{\"a\":\"p\",\"r\":\"ok\"}"#).is_none());
+    }
+
+    #[test]
+    fn malformed_simulation_response_cannot_advance_a_failure() {
+        let decision = guarded_decision_after_bad_llm_format(
+            "Simulation",
+            "FAIL",
+            &[("sim_passed", "false")],
+            "The simulation is probably fine; p|ok",
+        );
+
+        assert_eq!(decision.action, FlowAction::Back);
+        assert_eq!(decision.target, "Simulation");
+        assert!(decision.reason.starts_with("sim_not_passed_"));
+    }
+
+    #[test]
+    fn malformed_power_response_requires_full_liberty_coverage() {
+        let decision = guarded_decision_after_bad_llm_format(
+            "Power",
+            "complete",
+            &[("power_liberty_ok", "false")],
+            "p|ok",
+        );
+
+        assert_eq!(decision.action, FlowAction::Back);
+        assert_eq!(decision.target, "Power");
+        assert!(decision.reason.starts_with("power_not_liberty_"));
+    }
+
+    #[test]
+    fn detail_log_appends_across_logger_reinitialization() {
+        let dir = std::env::temp_dir().join(format!("ai_digital_detail_log_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temporary log directory");
+        let path = dir.join("detail.log");
+
+        let mut first = DetailLogger::new(&path);
+        first.echo_to_cli = false;
+        first.log("TEST", "FIRST", "first-entry");
+        drop(first);
+
+        let mut second = DetailLogger::new(&path);
+        second.echo_to_cli = false;
+        second.log("TEST", "SECOND", "second-entry");
+        drop(second);
+
+        let contents = fs::read_to_string(&path).expect("read detail log");
+        assert!(contents.contains("first-entry"));
+        assert!(contents.contains("second-entry"));
+        assert_eq!(contents.matches("AI Digital v0.6.8 Detail Log").count(), 1);
+        fs::remove_dir_all(&dir).expect("remove temporary log directory");
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct ReportExtras<'a> {
+    technology: Option<&'a str>,
+    synthesis_corner: Option<&'a LibCorner>,
+    constraint_corner_powers: Option<&'a [CornerPowerResult]>,
+    max_corner_powers: Option<&'a [CornerPowerResult]>,
+    final_llm_decision: Option<&'a str>,
+    formal_report: Option<&'a str>,
+}
 
 // Macros that route all output through the terminal manager.
 // In TTY mode: output goes to content area with status bar preserved.
@@ -40,11 +344,18 @@ struct DetailLogger {
 
 impl DetailLogger {
     fn new(log_path: &Path) -> Self {
-        let file = std::fs::File::create(log_path).expect("Failed to create detail log");
+        let new_file = fs::metadata(log_path).map(|meta| meta.len() == 0).unwrap_or(true);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .expect("Failed to open detail log");
         let mut writer = std::io::BufWriter::new(file);
         use std::io::Write;
-        let _ = writeln!(writer, "=== AI Digital v0.6.7 Detail Log ===");
-        let _ = writeln!(writer, "=== JSON-line format: [timestamp] [LEVEL] [CATEGORY] {{json data}} ===");
+        if new_file {
+            let _ = writeln!(writer, "=== AI Digital v0.6.8 Detail Log ===");
+            let _ = writeln!(writer, "=== JSON-line format: [timestamp] [LEVEL] [CATEGORY] {{json data}} ===");
+        }
         let _ = writer.flush();
         DetailLogger {
             file: writer,
@@ -244,7 +555,9 @@ impl DetailLogger {
     }
 
     fn log_power_total(&mut self, total_mw: f64, freq_mhz: i32, voltage: f64) {
-        self.log("POWER", "TOTAL", &format!("\"total_mw\":{:.4},\"freq_mhz\":{},\"voltage\":{:.2}", total_mw, freq_mhz, voltage));
+        // The CLI already prints a multi-corner power table. Keep per-corner
+        // totals in detail.log only to avoid duplicate row-by-row console spam.
+        self.log_level("INFO", "POWER", "TOTAL", &format!("\"total_mw\":{:.4},\"freq_mhz\":{},\"voltage\":{:.2}", total_mw, freq_mhz, voltage));
     }
 
     fn log_power_per_cell(&mut self, cell_type: &str, count: usize, leakage_uw: f64, dynamic_uw: f64, internal_uw: f64) {
@@ -1305,6 +1618,27 @@ impl Repl {
     fn gui_sync_state(&mut self) {
         let Some(project_dir) = self.current_project.clone() else { return; };
         let module_name = self.gui_current_module_name();
+        let active_technology = self.corner_db.active_process.clone().unwrap_or_default();
+        let mut technology_corners = Vec::new();
+        for process in &self.corner_db.processes {
+            let synthesis_path = process.get_synthesis_corner().map(|corner| corner.file_path.clone());
+            for corner in &process.corners {
+                technology_corners.push(GuiTechnologyCorner {
+                    technology: process.process_name.clone(),
+                    corner: corner.short_name.clone(),
+                    corner_type: corner.corner_type.to_string(),
+                    library: corner.lib_name.clone(),
+                    voltage: corner.voltage,
+                    temperature: corner.temperature,
+                    cells: corner.cell_count,
+                    time_unit: corner.time_unit.clone(),
+                    voltage_unit: corner.voltage_unit.clone(),
+                    leakage_power_unit: corner.leakage_power_unit.clone(),
+                    capacitance_unit: corner.capacitive_load_unit.clone(),
+                    is_synthesis: synthesis_path.as_ref() == Some(&corner.file_path),
+                });
+            }
+        }
         let ctx = GuiSyncContext {
             project_name: self.gui_project_name(),
             project_dir,
@@ -1315,6 +1649,8 @@ impl Repl {
             status_text: self.gui_status_text.clone(),
             constraint_freq_mhz: self.constraint_freq,
             last_error: self.gui_last_error.clone(),
+            active_technology,
+            technology_corners,
         };
 
         match gui_exchange::write_state(&ctx) {
@@ -1430,6 +1766,15 @@ impl Repl {
         self.last_iteration_reason.clear();
         self.turn_count = 0;
 
+        if let Some(config) = self.project_manager.load_config() {
+            self.constraint_freq = config.clock_frequency_mhz.round().max(1.0) as i32;
+            if let Some(technology) = config.technology {
+                if self.corner_db.set_active_process(&technology).is_err() {
+                    self.gui_last_error = format!("Saved technology '{}' is not available", technology);
+                }
+            }
+        }
+
         if let Some(project_dir) = self.current_project.clone() {
             if let Some(module_name) = self.detect_project_module(&project_dir) {
                 self.current_module = Some(module_name.clone());
@@ -1440,6 +1785,17 @@ impl Repl {
             }
         }
         self.gui_mark_project_loaded();
+    }
+
+    fn persist_project_technology(&self) -> Result<(), String> {
+        let mut config = self.project_manager.load_config().unwrap_or_default();
+        config.project_name = self.gui_project_name();
+        config.top_module = self.current_module.clone();
+        config.clock_frequency_mhz = self.constraint_freq as f64;
+        config.technology = self.corner_db.active_process.clone();
+        config.liberty_file = self.corner_db.get_default_liberty()
+            .map(|path| path.to_string_lossy().to_string());
+        self.project_manager.save_config(&config)
     }
 
     fn detect_project_module(&self, project_dir: &Path) -> Option<String> {
@@ -1540,7 +1896,8 @@ impl Repl {
                 oprintln!("  {} Failed to create log: {}", "⚠".yellow(), e);
             }
         }
-        // Create detailed log — ALWAYS create fresh
+        // Detail log is append-only so RTL repair iterations preserve the
+        // evidence that led to the rollback and the subsequent rerun.
         let logs_dir = project_dir.join("logs");
         fs::create_dir_all(&logs_dir).ok();
         let detail_path = logs_dir.join("detail.log");
@@ -1557,8 +1914,8 @@ impl Repl {
         // Log initial system state
         if let Some(ref mut logger) = self.detail_logger {
             let sys = engine::get_system_info();
-            logger.log_separator("AI Digital v0.6.7 Session Start");
-            logger.log("SYS", "INIT", &format!("\"version\":\"0.6.7\",\"cpu_cores\":{},\"cpu_threads\":{},\"cpu_model\":\"{}\",\"total_ram_mb\":{},\"available_ram_mb\":{},\"load_1min\":{:.2},\"process_rss_mb\":{}",
+            logger.log_separator("AI Digital v0.6.8 Session Start");
+            logger.log("SYS", "INIT", &format!("\"version\":\"0.6.8\",\"cpu_cores\":{},\"cpu_threads\":{},\"cpu_model\":\"{}\",\"total_ram_mb\":{},\"available_ram_mb\":{},\"load_1min\":{:.2},\"process_rss_mb\":{}",
                 sys.cpu_cores, sys.cpu_threads, sys.cpu_model, sys.total_ram_mb, sys.available_ram_mb, sys.load_1min, sys.process_rss_mb));
             logger.log("SYS", "PROJECT", &format!("\"path\":\"{}\"", project_dir.display()));
             // Log configuration
@@ -1594,7 +1951,7 @@ impl Repl {
 
     pub fn run(&mut self) {
         oprintln!("{}", "╔══════════════════════════════════════════╗".bright_cyan());
-        oprintln!("{}", "║        AI Digital v0.6.7                 ║".bright_cyan());
+        oprintln!("{}", "║        AI Digital v0.6.8                 ║".bright_cyan());
         oprintln!("{}", "║  Generate · Lint · Synthesize · Optimize ║".bright_cyan());
         oprintln!("{}", "╚══════════════════════════════════════════╝".bright_cyan());
         oprintln!();
@@ -2004,7 +2361,19 @@ impl Repl {
                     None,
                 );
                 // Summary table for synth
-                print_flow_summary_tables(&synth_info, self.constraint_freq, self.constraint_freq, None, lint.passed, None, None, None);
+                print_flow_summary_tables(
+                    &synth_info,
+                    self.constraint_freq,
+                    self.constraint_freq,
+                    None,
+                    lint.passed,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
                 self.gui_set_step(
                     "synthesis",
                     "passed",
@@ -2170,7 +2539,19 @@ impl Repl {
                                 delay_ns: 0.0, power_mw: 0.0, logic_depth: 0,
                                 max_freq_mhz: 0.0, raw_output: String::new(),
                             };
-                            print_flow_summary_tables(&sim_info, self.constraint_freq, self.constraint_freq, Some(true), true, None, None, None);
+                            print_flow_summary_tables(
+                                &sim_info,
+                                self.constraint_freq,
+                                self.constraint_freq,
+                                Some(true),
+                                true,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            );
                         }
                     }
                     self.stop_status("Simulation PASS", true);
@@ -2253,14 +2634,21 @@ impl Repl {
                 let formal_result = self.run_formal_verification(&rtl_code, &mod_name, &syn_dir, &formal_dir);
                 match formal_result {
                     Ok(result) => {
-                        if result.contains("PASS") {
-                            self.stop_status("Formal verification: EQUIVALENT", true);
-                            oprintln!("  {} RTL vs gate-level: EQUIVALENT", "✓".green());
-                            self.gui_set_step("formal", "passed", "EQUIVALENT");
+                        if let Some(verdict) = FormalVerdict::from_report(&result) {
+                            if verdict.is_equivalent() {
+                                self.stop_status("Formal verification: EQUIVALENT", true);
+                                oprintln!("  {} RTL vs gate-level: EQUIVALENT", "✓".green());
+                                self.gui_set_step("formal", "passed", "EQUIVALENT");
+                            } else {
+                                self.stop_status("Formal verification: DIFFERENT", false);
+                                oprintln!("  {} RTL vs gate-level: DIFFERENT", "✗".red());
+                                self.gui_set_step("formal", "failed", "DIFFERENT");
+                            }
                         } else {
-                            self.stop_status("Formal verification: DIFFERENT", false);
-                            oprintln!("  {} RTL vs gate-level: DIFFERENT", "✗".red());
-                            self.gui_set_step("formal", "failed", "DIFFERENT");
+                            self.stop_status("Formal verification produced unknown status", false);
+                            oprintln!("  {} Formal verification returned an unrecognized verdict", "✗".red());
+                            self.gui_set_error("Formal verification returned an unrecognized verdict");
+                            return;
                         }
                         let _ = fs::write(formal_dir.join("formal_report.txt"), &result);
                     }
@@ -2302,8 +2690,10 @@ impl Repl {
 
     /// Print multi-corner power table (uses engine::analyze_power for real liberty NLDM data)
     fn print_multi_corner_power(&self, corner_timings: &[(LibCorner, TimingReport)],
-                                 syn_dir: &Path, module_name: &str, freq_mhz: i32, label: &str) {
-        oprintln!("{}", self.format_multi_corner_power_report(corner_timings, syn_dir, module_name, freq_mhz, label));
+                                syn_dir: &Path, module_name: &str, freq_mhz: i32, label: &str) -> Vec<CornerPowerResult> {
+        let results = self.analyze_multi_corner_power(corner_timings, syn_dir, module_name, freq_mhz);
+        oprintln!("{}", self.format_multi_corner_power_results(&results, freq_mhz, label));
+        results
     }
 
     fn pick_worst_timing<'a>(&self, corner_timings: &'a [(LibCorner, TimingReport)]) -> Option<(&'a LibCorner, &'a TimingReport)> {
@@ -2431,45 +2821,28 @@ impl Repl {
         if corners.is_empty() {
             return Vec::new();
         }
-        let v_nom = self.active_nominal_voltage();
-        let base_corner = corners
-            .iter()
-            .find(|corner| corner.corner_type == CornerType::TT)
-            .unwrap_or(&corners[0]);
-        let base_key = match base_corner.corner_type {
-            CornerType::TT => "tt",
-            CornerType::FF => "ff",
-            CornerType::SS => "ss",
-        };
-        let base_timing = normalize_timing_report(
-            self.design.timing_analysis_corner(
-                synth_output,
-                mod_name,
-                base_key,
-                base_corner.voltage,
-                base_corner.temperature,
-                clock_period,
-            ),
-            clock_period,
-        );
-
-        corners
-            .iter()
-            .map(|corner| {
-                let timing = if corner.short_name == base_corner.short_name {
-                    self.clone_timing_report(&base_timing)
-                } else {
-                    self.synthesize_corner_timing_from_base(
-                        base_corner,
-                        &base_timing,
-                        corner,
+        let mut results = std::thread::scope(|scope| {
+            let mut jobs = Vec::new();
+            for (index, corner) in corners.iter().cloned().enumerate() {
+                jobs.push(scope.spawn(move || {
+                    let timing = normalize_timing_report(self.design.timing_analysis_corner(
+                        synth_output,
+                        mod_name,
+                        &corner.file_path.to_string_lossy(),
+                        corner.corner_type.engine_name(),
+                        corner.voltage,
+                        corner.temperature,
                         clock_period,
-                        v_nom,
-                    )
-                };
-                (corner.clone(), timing)
-            })
-            .collect()
+                    ), clock_period);
+                    (index, corner, timing)
+                }));
+            }
+            jobs.into_iter()
+                .filter_map(|job| job.join().ok())
+                .collect::<Vec<_>>()
+        });
+        results.sort_by_key(|(index, _, _)| *index);
+        results.into_iter().map(|(_, corner, timing)| (corner, timing)).collect()
     }
 
     fn estimate_max_frequency_from_timing(&self, timing: &TimingReport, synth_info: &SynthInfo) -> i32 {
@@ -2481,31 +2854,17 @@ impl Repl {
         cap_max_frequency((1000.0 / min_period).floor() as i32, synth_info)
     }
 
-    fn scan_corner_max_frequency(
+    fn scan_max_frequency_with<F>(
         &self,
-        synth_output: &str,
-        module_name: &str,
-        corner: &LibCorner,
         start_freq_mhz: i32,
-        synth_info: &SynthInfo,
-    ) -> i32 {
-        let corner_type = match corner.corner_type {
-            CornerType::TT => "tt",
-            CornerType::FF => "ff",
-            CornerType::SS => "ss",
-        };
-        let analyze_freq = |freq_mhz: i32| -> bool {
-            let period = 1000.0 / freq_mhz.max(10) as f64;
-            self.design.timing_analysis_corner(
-                synth_output,
-                module_name,
-                corner_type,
-                corner.voltage,
-                corner.temperature,
-                period,
-            ).timing_met
-        };
-
+        logic_depth: usize,
+        cell_count: usize,
+        dff_count: usize,
+        mut analyze_freq: F,
+    ) -> i32
+    where
+        F: FnMut(i32) -> bool,
+    {
         let mut best_met = 0;
         let start_freq = start_freq_mhz.clamp(10, 5000);
         let coarse_step = 100;
@@ -2521,7 +2880,7 @@ impl Repl {
                     best_met = probe;
                     low = probe;
                     if probe == 5000 {
-                        return cap_max_frequency(best_met, synth_info);
+                        return cap_max_frequency_with_profile(best_met, logic_depth, cell_count, dff_count);
                     }
                 } else {
                     high_fail = probe;
@@ -2579,7 +2938,65 @@ impl Repl {
             }
         }
 
-        cap_max_frequency(best_met, synth_info)
+        cap_max_frequency_with_profile(best_met, logic_depth, cell_count, dff_count)
+    }
+
+    fn scan_corner_max_frequency(
+        &self,
+        synth_output: &str,
+        module_name: &str,
+        corner: &LibCorner,
+        start_freq_mhz: i32,
+        synth_info: &SynthInfo,
+    ) -> i32 {
+        let corner_type = match corner.corner_type {
+            CornerType::TT => "tt",
+            CornerType::FF => "ff",
+            CornerType::SS => "ss",
+        };
+        let analyze_freq = |freq_mhz: i32| -> bool {
+            let period = 1000.0 / freq_mhz.max(10) as f64;
+            self.design.timing_analysis_corner(
+                synth_output,
+                module_name,
+                &corner.file_path.to_string_lossy(),
+                corner_type,
+                corner.voltage,
+                corner.temperature,
+                period,
+            ).timing_met
+        };
+        self.scan_max_frequency_with(
+            start_freq_mhz,
+            synth_info.logic_depth,
+            synth_info.cell_count,
+            synth_info.dff_count,
+            analyze_freq,
+        )
+    }
+
+    fn scan_single_corner_max_frequency(
+        &self,
+        synth_output: &str,
+        module_name: &str,
+        liberty: &str,
+        start_freq_mhz: i32,
+        logic_depth: usize,
+        cell_count: usize,
+        dff_count: usize,
+    ) -> i32 {
+        self.scan_max_frequency_with(
+            start_freq_mhz,
+            logic_depth,
+            cell_count,
+            dff_count,
+            |freq_mhz| {
+                let period = 1000.0 / freq_mhz.max(10) as f64;
+                self.design
+                    .timing_analysis(synth_output, module_name, Some(liberty), period)
+                    .timing_met
+            },
+        )
     }
 
     fn format_multi_corner_power_report(
@@ -2590,66 +3007,369 @@ impl Repl {
         freq_mhz: i32,
         label: &str,
     ) -> String {
-        let corner_name = |c: &LibCorner| -> String {
-            let s = c.short_name.clone();
-            if s.len() > 14 { format!("{}..", &s[..12]) } else { s }
-        };
-        let mut buf = String::new();
-        buf.push_str(&format!("  {} ({} MHz)\n", label, freq_mhz));
-        buf.push_str(&format!("  {:<30} {:>10} {:>10} {:>10} {:>10} {:>10}\n", "Corner", "Type", "Voltage", "Static", "Dynamic", "Total"));
-        buf.push_str(&format!("  {:-<30} {:-<10} {:-<10} {:-<10} {:-<10} {:-<10}\n", "", "", "", "", "", ""));
+        let results = self.analyze_multi_corner_power(corner_timings, syn_dir, module_name, freq_mhz);
+        self.format_multi_corner_power_results(&results, freq_mhz, label)
+    }
 
+    fn analyze_multi_corner_power(
+        &self,
+        corner_timings: &[(LibCorner, TimingReport)],
+        syn_dir: &Path,
+        module_name: &str,
+        freq_mhz: i32,
+    ) -> Vec<CornerPowerResult> {
         let gate_path = syn_dir.join(format!("{}_synth_gate.v", module_name));
         let gate_netlist = std::fs::read_to_string(&gate_path).unwrap_or_default();
-        for (corner, _timing) in corner_timings {
-            let lib_path = self.corner_db.liberty_path_for_corner(corner);
-            let power = if let Some(ref lp) = lib_path {
-                if gate_netlist.is_empty() {
-                    let ge = 100.0;
-                    let v_ratio = corner.voltage / 1.2;
-                    let sp = ge * 0.01 * v_ratio.powi(2);
-                    let dp = ge * 0.05 * freq_mhz as f64 / 1000.0 * v_ratio.powi(2);
-                    engine::PowerAnalysisResult {
-                        static_power_uw: sp,
-                        dynamic_power_uw: dp,
-                        total_power_uw: sp + dp,
-                        internal_power_uw: 0.0,
-                        switching_power_uw: dp,
-                        clock_power_uw: 0.0,
-                        leakage_power_uw: sp,
-                        report: String::new(),
-                    }
-                } else {
-                    engine::analyze_power(&gate_netlist, module_name, &lp.to_string_lossy(), freq_mhz as f64)
+        let activity_json = self.current_activity_json_for_power(module_name);
+        let mut results = std::thread::scope(|scope| {
+            let mut jobs = Vec::new();
+            for (index, (corner, _)) in corner_timings.iter().enumerate() {
+                let corner = corner.clone();
+                let activity_json = activity_json.clone();
+                let gate_netlist = gate_netlist.clone();
+                jobs.push(scope.spawn(move || {
+                    let lib_path = self.corner_db.liberty_path_for_corner(&corner);
+                    let start = std::time::Instant::now();
+                    let power = if let Some(ref lp) = lib_path {
+                        if gate_netlist.is_empty() {
+                            Self::fallback_corner_power(&corner, freq_mhz)
+                        } else {
+                            engine::analyze_power_with_activity(
+                                &gate_netlist,
+                                module_name,
+                                &lp.to_string_lossy(),
+                                freq_mhz as f64,
+                                activity_json.as_deref(),
+                            )
+                        }
+                    } else {
+                        Self::fallback_corner_power(&corner, freq_mhz)
+                    };
+                    (index, CornerPowerResult { corner, power }, start.elapsed())
+                }));
+            }
+            jobs.into_iter()
+                .filter_map(|job| job.join().ok())
+                .collect::<Vec<_>>()
+        });
+        results.sort_by_key(|(index, _, _)| *index);
+        for (_, result, _) in results.iter_mut() {
+            if gate_netlist.is_empty() || !result.power.report.contains("Power Analysis Report (estimated)") {
+                continue;
+            }
+            if let Some(lib_path) = self.corner_db.liberty_path_for_corner(&result.corner) {
+                let retry = engine::analyze_power_with_activity(
+                    &gate_netlist,
+                    module_name,
+                    &lib_path.to_string_lossy(),
+                    freq_mhz as f64,
+                    activity_json.as_deref(),
+                );
+                if retry.report.contains("Power Analysis Report (liberty NLDM)") {
+                    result.power = retry;
                 }
-            } else {
-                let v_ratio = corner.voltage / 1.2;
-                let ge = 100.0;
-                let sp = ge * 0.01 * v_ratio.powi(2);
-                let dp = ge * 0.05 * freq_mhz as f64 / 1000.0 * v_ratio.powi(2);
-                engine::PowerAnalysisResult {
-                    static_power_uw: sp,
-                    dynamic_power_uw: dp,
-                    total_power_uw: sp + dp,
-                    internal_power_uw: 0.0,
-                    switching_power_uw: dp,
-                    clock_power_uw: 0.0,
-                    leakage_power_uw: sp,
-                    report: String::new(),
-                }
-            };
+            }
+        }
+        results.into_iter().map(|(_, result, _)| result).collect()
+    }
+
+    fn current_activity_json_for_power(&self, module_name: &str) -> Option<String> {
+        let project_dir = self.current_project.as_ref()?;
+        let rtl_code = self.current_rtl.clone().or_else(|| {
+            let module_path = project_dir.join("src").join(format!("{}.v", module_name));
+            std::fs::read_to_string(module_path).ok()
+        })?;
+        let tb_path = project_dir.join("tb").join(format!("{}_tb.v", module_name));
+        let tb_code = std::fs::read_to_string(tb_path).ok()?;
+        let json = engine::get_toggle_counts_json(&rtl_code, &tb_code, module_name);
+        if json.trim().is_empty() { None } else { Some(json) }
+    }
+
+    fn fallback_corner_power(corner: &LibCorner, freq_mhz: i32) -> engine::PowerAnalysisResult {
+        let ge = 100.0;
+        let v_ratio = corner.voltage / 1.2;
+        let static_power_uw = ge * 0.01 * v_ratio.powi(2);
+        let dynamic_power_uw = ge * 0.05 * freq_mhz as f64 / 1000.0 * v_ratio.powi(2);
+        engine::PowerAnalysisResult {
+            static_power_uw,
+            dynamic_power_uw,
+            total_power_uw: static_power_uw + dynamic_power_uw,
+            internal_power_uw: 0.0,
+            switching_power_uw: dynamic_power_uw,
+            clock_power_uw: 0.0,
+            leakage_power_uw: static_power_uw,
+            report: "Power Analysis Report (estimated)\nReason: missing gate netlist or missing liberty corner\n".to_string(),
+        }
+    }
+
+    fn power_result_uses_liberty(result: &CornerPowerResult) -> bool {
+        result.power.report.contains("Power Analysis Report (liberty NLDM)")
+    }
+
+    fn all_power_results_use_liberty(results: &[CornerPowerResult]) -> bool {
+        !results.is_empty() && results.iter().all(Self::power_result_uses_liberty)
+    }
+
+    fn power_source_summary(results: &[CornerPowerResult]) -> String {
+        let real = results.iter().filter(|result| Self::power_result_uses_liberty(result)).count();
+        format!("{}/{} liberty_NLDM", real, results.len())
+    }
+
+    fn format_multi_corner_power_results(
+        &self,
+        results: &[CornerPowerResult],
+        freq_mhz: i32,
+        label: &str,
+    ) -> String {
+        let corner_width = results.iter().map(|result| result.corner.short_name.len()).max().unwrap_or(6).max(30);
+        let mut buf = String::new();
+        buf.push_str(&format!("  {} ({} MHz)\n", label, freq_mhz));
+        buf.push_str(&format!("  {:<corner_width$} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12}\n", "Corner", "Type", "Voltage", "Static", "Dynamic", "Total", "Source"));
+        buf.push_str(&format!("  {:-<corner_width$} {:-<10} {:-<10} {:-<10} {:-<10} {:-<10} {:-<12}\n", "", "", "", "", "", "", ""));
+        for result in results {
             buf.push_str(&format!(
-                "  {:<30} {:>10} {:>10} {:>10.1} {:>10.1} {:>10.1}\n",
-                corner_name(corner),
-                corner.corner_type,
-                format!("{}V", corner.voltage),
-                power.static_power_uw,
-                power.dynamic_power_uw,
-                power.static_power_uw + power.dynamic_power_uw
+                "  {:<corner_width$} {:>10} {:>10} {:>10.1} {:>10.1} {:>10.1} {:>12}\n",
+                result.corner.short_name,
+                result.corner.corner_type,
+                format!("{}V", result.corner.voltage),
+                result.power.static_power_uw,
+                result.power.dynamic_power_uw,
+                result.power.total_power_uw,
+                if Self::power_result_uses_liberty(result) { "NLDM" } else { "ESTIMATED" },
             ));
+        }
+        if !Self::all_power_results_use_liberty(results) {
+            buf.push_str("  WARNING: at least one corner used estimated power. This is not a valid signoff power result.\n");
         }
         buf.push('\n');
         buf
+    }
+
+    fn build_report_extras<'a>(
+        &'a self,
+        constraint_corner_powers: Option<&'a [CornerPowerResult]>,
+        max_corner_powers: Option<&'a [CornerPowerResult]>,
+        final_llm_decision: Option<&'a str>,
+        formal_report: Option<&'a str>,
+    ) -> ReportExtras<'a> {
+        ReportExtras {
+            technology: self.corner_db.active_process.as_deref(),
+            synthesis_corner: self.corner_db.get_synthesis_corner(),
+            constraint_corner_powers,
+            max_corner_powers,
+            final_llm_decision,
+            formal_report,
+        }
+    }
+
+    fn llm_decision_summary(step: &str, decision: &LlmDecision) -> String {
+        match decision {
+            LlmDecision::Proceed(reason) => format!("{}=PROCEED ({})", step, reason),
+            LlmDecision::Iterate(reason) => format!("{}=ITERATE ({})", step, reason),
+            LlmDecision::Abort(reason) => format!("{}=ABORT ({})", step, reason),
+        }
+    }
+
+    fn consult_timing_review(
+        &mut self,
+        module_name: &str,
+        synth_info: &SynthInfo,
+        timing: Option<&TimingReport>,
+        corner_timings: &[(LibCorner, TimingReport)],
+        max_freq_mhz: i32,
+    ) -> LlmDecision {
+        let max_freq_s = max_freq_mhz.to_string();
+        let corner_count_s = corner_timings.len().to_string();
+        let timing_met_s = timing.map(|t| t.timing_met).unwrap_or(false).to_string();
+        let slack_s = timing.map(|t| format!("{:.4}", t.slack_ns)).unwrap_or_else(|| "N/A".to_string());
+        let arrival_s = timing.map(|t| format!("{:.4}", t.arrival_time_ns)).unwrap_or_else(|| "N/A".to_string());
+        let required_s = timing.map(|t| format!("{:.4}", t.required_time_ns)).unwrap_or_else(|| "N/A".to_string());
+        let cells_s = synth_info.cell_count.to_string();
+        let depth_s = synth_info.logic_depth.to_string();
+        let worst_corner = self.pick_worst_timing(corner_timings)
+            .map(|(corner, t)| format!("{} slack={:.4}ns arrival={:.4}ns", corner.short_name, t.slack_ns, t.arrival_time_ns))
+            .unwrap_or_else(|| "single-corner or unavailable".to_string());
+        let context = format!(
+            "Timing API review. Worst corner: {}. Constraint={}MHz, max={}MHz, cells={}, depth={}. Critical path data is in the timing report.",
+            worst_corner, self.constraint_freq, max_freq_mhz, synth_info.cell_count, synth_info.logic_depth
+        );
+        let data = vec![
+            ("module", module_name),
+            ("max_freq_mhz", max_freq_s.as_str()),
+            ("timing_met", timing_met_s.as_str()),
+            ("slack_ns", slack_s.as_str()),
+            ("arrival_ns", arrival_s.as_str()),
+            ("required_ns", required_s.as_str()),
+            ("corner_count", corner_count_s.as_str()),
+            ("cells", cells_s.as_str()),
+            ("logic_depth", depth_s.as_str()),
+        ];
+        self.consult_llm_decision("Timing", if timing_met_s == "true" { "MET" } else { "VIOLATED" }, &data, Some(&context))
+    }
+
+    fn consult_power_review(
+        &mut self,
+        module_name: &str,
+        synth_info: &SynthInfo,
+        timing: Option<&TimingReport>,
+        constraint_freq_mhz: i32,
+        max_freq_mhz: i32,
+        constraint_powers: &[CornerPowerResult],
+        max_powers: &[CornerPowerResult],
+    ) -> LlmDecision {
+        let worst_constraint = constraint_powers.iter()
+            .max_by(|a, b| a.power.total_power_uw.partial_cmp(&b.power.total_power_uw).unwrap_or(std::cmp::Ordering::Equal));
+        let worst_max = max_powers.iter()
+            .max_by(|a, b| a.power.total_power_uw.partial_cmp(&b.power.total_power_uw).unwrap_or(std::cmp::Ordering::Equal));
+        let constraint_total_s = worst_constraint.map(|p| format!("{:.4}", p.power.total_power_uw)).unwrap_or_else(|| "0.0".to_string());
+        let max_total_s = worst_max.map(|p| format!("{:.4}", p.power.total_power_uw)).unwrap_or_else(|| "0.0".to_string());
+        let static_s = worst_max.or(worst_constraint).map(|p| format!("{:.4}", p.power.static_power_uw)).unwrap_or_else(|| "0.0".to_string());
+        let dynamic_s = worst_max.or(worst_constraint).map(|p| format!("{:.4}", p.power.dynamic_power_uw)).unwrap_or_else(|| "0.0".to_string());
+        let corner_count_s = constraint_powers.len().max(max_powers.len()).to_string();
+        let max_freq_s = max_freq_mhz.to_string();
+        let constraint_freq_s = constraint_freq_mhz.to_string();
+        let cells_s = synth_info.cell_count.to_string();
+        let area_s = format!("{:.4}", synth_info.area_ge);
+        let dff_s = synth_info.dff_count.to_string();
+        let depth_s = synth_info.logic_depth.to_string();
+        let timing_met_s = timing.map(|t| t.timing_met).unwrap_or(false).to_string();
+        let slack_s = timing.map(|t| format!("{:.4}", t.slack_ns)).unwrap_or_else(|| "N/A".to_string());
+        let explicit_power_budget_s = self.design_goals.max_power_uw.is_some().to_string();
+        let power_budget_s = self.design_goals.max_power_uw
+            .map(|p| format!("{:.4}", p))
+            .unwrap_or_else(|| "none".to_string());
+        let power_optimize_goal_s = matches!(self.design_goals.optimize_for.as_deref(), Some("power")).to_string();
+        let power_liberty_ok = Self::all_power_results_use_liberty(constraint_powers)
+            && Self::all_power_results_use_liberty(max_powers);
+        let power_liberty_ok_s = power_liberty_ok.to_string();
+        let constraint_source_s = Self::power_source_summary(constraint_powers);
+        let max_source_s = Self::power_source_summary(max_powers);
+        let context = format!(
+            "Power API review. Worst {}MHz operating-point corner: {}. Worst {}MHz max-frequency operating-point corner: {}. \
+             Results use Liberty power with simulation activity when available. \
+             IMPORTANT: power_at_constraint_freq_uw and max_operating_power_total_uw are two measured operating points, not limits. \
+             If power_liberty_ok=false, do not proceed; retry/back is required because signoff power is not valid. \
+             Only treat power as a violation when explicit_power_budget=true and power_budget_uw is exceeded, or when power_optimize_goal=true and a concrete optimization opportunity is supported by the data.",
+            constraint_freq_mhz,
+            worst_constraint.map(|p| p.corner.short_name.as_str()).unwrap_or("N/A"),
+            max_freq_mhz,
+            worst_max.map(|p| p.corner.short_name.as_str()).unwrap_or("N/A")
+        );
+        let data = vec![
+            ("module", module_name),
+            ("cells", cells_s.as_str()),
+            ("area_ge", area_s.as_str()),
+            ("dff", dff_s.as_str()),
+            ("logic_depth", depth_s.as_str()),
+            ("timing_met", timing_met_s.as_str()),
+            ("slack_ns", slack_s.as_str()),
+            ("constraint_mhz", constraint_freq_s.as_str()),
+            ("max_freq_mhz", max_freq_s.as_str()),
+            ("power_total_uw", max_total_s.as_str()),
+            ("max_operating_power_total_uw", max_total_s.as_str()),
+            ("power_static_uw", static_s.as_str()),
+            ("power_dynamic_uw", dynamic_s.as_str()),
+            ("power_at_constraint_freq_uw", constraint_total_s.as_str()),
+            ("explicit_power_budget", explicit_power_budget_s.as_str()),
+            ("power_budget_uw", power_budget_s.as_str()),
+            ("power_optimize_goal", power_optimize_goal_s.as_str()),
+            ("power_liberty_ok", power_liberty_ok_s.as_str()),
+            ("constraint_power_source", constraint_source_s.as_str()),
+            ("max_power_source", max_source_s.as_str()),
+            ("corner_count", corner_count_s.as_str()),
+        ];
+        self.consult_llm_decision(
+            "Power",
+            if power_liberty_ok { "complete" } else { "LIBERTY_FAILED" },
+            &data,
+            Some(&context),
+        )
+    }
+
+    fn consult_formal_review(
+        &mut self,
+        module_name: &str,
+        synth_info: &SynthInfo,
+        timing: Option<&TimingReport>,
+        formal_ok: bool,
+        formal_report: &str,
+    ) -> LlmDecision {
+        let ok_s = formal_ok.to_string();
+        let checks_s = formal_report.lines().filter(|line| line.trim_start().starts_with('-')).count().to_string();
+        let cells_s = synth_info.cell_count.to_string();
+        let area_s = format!("{:.4}", synth_info.area_ge);
+        let dff_s = synth_info.dff_count.to_string();
+        let depth_s = synth_info.logic_depth.to_string();
+        let timing_met_s = timing.map(|t| t.timing_met).unwrap_or(false).to_string();
+        let slack_s = timing.map(|t| format!("{:.4}", t.slack_ns)).unwrap_or_else(|| "N/A".to_string());
+        let excerpt = formal_report.lines().take(12).collect::<Vec<_>>().join("\n");
+        let data = vec![
+            ("module", module_name),
+            ("cells", cells_s.as_str()),
+            ("area_ge", area_s.as_str()),
+            ("dff", dff_s.as_str()),
+            ("logic_depth", depth_s.as_str()),
+            ("timing_met", timing_met_s.as_str()),
+            ("slack_ns", slack_s.as_str()),
+            ("formal_equivalent", ok_s.as_str()),
+            ("formal_checks", checks_s.as_str()),
+        ];
+        self.consult_llm_decision(
+            "Formal",
+            if formal_ok { "PASS" } else { "FAIL" },
+            &data,
+            Some(&format!(
+                "Formal API review. Synthesis/timing context is included for live flow perception only; \
+                 formal action should be driven by formal_equivalent/formal_checks unless context is internally inconsistent. \
+                 Method: structural interface equivalence plus built-in bounded/exhaustive functional vector comparison. Excerpt:\n{}",
+                excerpt
+            )),
+        )
+    }
+
+    fn consult_final_report_review(
+        &mut self,
+        module_name: &str,
+        synth_info: &SynthInfo,
+        timing: Option<&TimingReport>,
+        formal_ok: Option<bool>,
+        max_freq_mhz: i32,
+        max_power_total_uw: Option<f64>,
+    ) -> LlmDecision {
+        let cells_s = synth_info.cell_count.to_string();
+        let area_s = format!("{:.4}", synth_info.area_ge);
+        let dff_s = synth_info.dff_count.to_string();
+        let depth_s = synth_info.logic_depth.to_string();
+        let max_freq_s = max_freq_mhz.to_string();
+        let timing_met_s = timing.map(|t| t.timing_met).unwrap_or(false).to_string();
+        let slack_s = timing.map(|t| format!("{:.4}", t.slack_ns)).unwrap_or_else(|| "N/A".to_string());
+        let formal_s = formal_ok.map(|v| v.to_string()).unwrap_or_else(|| "N/A".to_string());
+        let power_s = max_power_total_uw.map(|v| format!("{:.4}", v)).unwrap_or_else(|| "N/A".to_string());
+        let data = vec![
+            ("module", module_name),
+            ("cells", cells_s.as_str()),
+            ("area_ge", area_s.as_str()),
+            ("dff", dff_s.as_str()),
+            ("logic_depth", depth_s.as_str()),
+            ("max_freq_mhz", max_freq_s.as_str()),
+            ("timing_met", timing_met_s.as_str()),
+            ("slack_ns", slack_s.as_str()),
+            ("formal_equivalent", formal_s.as_str()),
+            ("power_total_uw", power_s.as_str()),
+        ];
+        // Final-report review is allowed to publish only after the local
+        // verification gates have passed.  Encode that fact in the compact
+        // decision result so an unavailable optional adviser falls back to
+        // local publication for a genuinely verified design, not for a mere
+        // report-generation attempt.
+        let final_verified = timing.map(|t| t.timing_met).unwrap_or(false) &&
+            formal_ok == Some(true);
+        self.consult_llm_decision(
+            "FinalReport",
+            if final_verified { "PASS" } else { "INCOMPLETE" },
+            &data,
+            Some("Final API review before publishing report: verify report consistency, no missing verification status, timing/power/formal numbers coherent."),
+        )
     }
 
     /// Print max-frequency timing for all corners
@@ -2670,6 +3390,7 @@ impl Repl {
         for (corner, _) in corner_timings {
             let timing = self.design.timing_analysis_corner(
                 synth_output, module_name,
+                &corner.file_path.to_string_lossy(),
                 corner_type_str(corner.corner_type),
                 corner.voltage, corner.temperature, max_period);
             let status = if timing.timing_met { "MET" } else { "VIO" };
@@ -2733,7 +3454,7 @@ impl Repl {
 
         let liberty = self.corner_db.get_default_liberty()
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "libs/cmos_cells.lib".to_string());
+            .unwrap_or_else(|| "libs/demo/cmos_cells.lib".to_string());
 
         // Collect ALL source files for synthesis (merge with already-loaded all_code)
         let src_dir = project_dir.join("src");
@@ -2786,7 +3507,7 @@ impl Repl {
             logger.log_algorithm("synthesize", "AST → RTLIL → gate-level netlist", "constprop dce cse expr_opt demorgan wreduce resource_share fsm_extract logic_min retiming boundary_opt techmap");
             logger.log_algorithm("timing", "Graph-based STA with PVT delay scaling", "NLDM lookup + interconnect delay + AOCV derating");
             logger.log_algorithm("power", "Liberty NLDM power analysis", "leakage + switching + internal + clock power per cell");
-            logger.log_algorithm("formal", "Combinatorial equivalence checking", "SAT-based miter circuit + BDD/SAT solver");
+            logger.log_algorithm("formal", "Built-in RTL/netlist equivalence checking", "Port signature compare + deterministic functional equivalence vectors");
             logger.log_resource_usage("flow_start", flow_sys.cpu_cores, flow_sys.cpu_threads, flow_sys.available_ram_mb, flow_sys.load_1min);
         }
 
@@ -2907,6 +3628,7 @@ impl Repl {
                     if report.contains("FAIL") || !report.contains("PASS") {
                         steps.step_fail(&format!("Simulation FAILED ({}ms)", sim_elapsed.as_millis()));
                         self.log_file_only(&format!("--- Simulation FAIL (attempt {}/{}) ---\n{}", attempt, MAX_RETRIES_SIM, report));
+                        let _ = fs::write(sim_dir.join("sim_report.txt"), &report);
 
                         if attempt >= MAX_RETRIES_SIM {
                             oprintln!("  {} Auto-fix exhausted ({} attempts). Please modify manually.", "✗".red(), MAX_RETRIES_SIM);
@@ -2937,7 +3659,38 @@ impl Repl {
                             }
                         }
                     }
-sim_passed = true;
+                    if let Some(issue) = Self::simulation_report_issue(&report) {
+                        steps.step_fail(&format!("Simulation invalid: {} ({}ms)", issue, sim_elapsed.as_millis()));
+                        self.log_file_only(&format!("--- Simulation INVALID (attempt {}/{}) ---\n{}", attempt, MAX_RETRIES_SIM, report));
+                        let _ = fs::write(sim_dir.join("sim_report.txt"), &report);
+
+                        if attempt >= MAX_RETRIES_SIM {
+                            oprintln!("  {} Auto-fix exhausted ({} attempts). Please modify manually.", "✗".red(), MAX_RETRIES_SIM);
+                            self.gui_set_error(&issue);
+                            return;
+                        }
+
+                        oprintln!();
+                        oprintln!("  {} Auto-fix attempt {}/{}...", "●".yellow(), attempt, MAX_RETRIES_SIM);
+                        match self.auto_fix_on_error(&current_rtl_sim, current_tb_sim.as_deref(),
+                                                     current_sdc_sim.as_deref(), &mod_name, &report,
+                                                     attempt, MAX_RETRIES_SIM, &previous_attempts_sim) {
+                            Ok(Some((new_rtl, new_tb, new_sdc))) => {
+                                let diagnosis = new_rtl.lines().take(3).collect::<Vec<_>>().join(" ");
+                                previous_attempts_sim.push(diagnosis);
+                                current_rtl_sim = new_rtl;
+                                current_tb_sim = new_tb;
+                                current_sdc_sim = new_sdc;
+                                continue;
+                            }
+                            Ok(None) => continue,
+                            Err(e) => {
+                                self.gui_set_error(&e);
+                                return;
+                            }
+                        }
+                    }
+                    sim_passed = true;
                     steps.step_ok(&format!("Simulation PASSED ({}ms)", sim_elapsed.as_millis()));
                     steps.substep("Simulation completed successfully");
                     for line in report.lines().take(5) { steps.detail(line); }
@@ -2962,46 +3715,15 @@ sim_passed = true;
                         }
                     }
                     // LLM decision after simulation — let LLM evaluate if results are acceptable
-                    let sim_context = format!(
-                        "Simulation: PASS\nTime steps: {}\nModule: {}",
-                        report.lines().find(|l| l.starts_with("Time steps:")).unwrap_or("N/A"),
-                        mod_name
-                    );
+                    let sim_steps = Self::simulation_report_time_steps(&report).to_string();
+                    let sim_context = format!("sim_valid=true time_steps={} module={}", sim_steps, mod_name);
                     let sim_decision = self.consult_llm_decision("Simulation", "PASS",
-                        &[("module", &mod_name), ("status", "PASS")],
+                        &[("module", &mod_name), ("status", "PASS"), ("sim_passed", "true"), ("time_steps", sim_steps.as_str())],
                         Some(&sim_context));
                     match sim_decision {
                         LlmDecision::Iterate(reason) => {
-                            oprintln!("  {} LLM suggests: {}", "●".yellow(), reason);
-                            self.last_iteration_reason = format!("Simulation: LLM suggests iteration - {}", reason);
-                            if attempt >= MAX_RETRIES_SIM {
-                                steps.step_fail(&format!("LLM advisory required: {}", reason));
-                                self.gui_set_error(&reason);
-                                return;
-                            }
-                            match self.auto_fix_on_error(&current_rtl_sim, current_tb_sim.as_deref(),
-                                                         current_sdc_sim.as_deref(), &mod_name,
-                                                         &format!("LLM supervisor requested simulation iteration after a PASS result: {}", reason),
-                                                         attempt, MAX_RETRIES_SIM, &previous_attempts_sim) {
-                                Ok(Some((new_rtl, new_tb, new_sdc))) => {
-                                    let diagnosis = new_rtl.lines().take(3).collect::<Vec<_>>().join(" ");
-                                    previous_attempts_sim.push(diagnosis);
-                                    current_rtl_sim = new_rtl;
-                                    current_tb_sim = new_tb;
-                                    current_sdc_sim = new_sdc;
-                                    continue;
-                                }
-                                Ok(None) => {
-                                    steps.step_fail(&format!("LLM advisory required: {}", reason));
-                                    self.gui_set_error(&reason);
-                                    return;
-                                }
-                                Err(e) => {
-                                    steps.step_fail(&format!("LLM advisory required: {}", reason));
-                                    self.gui_set_error(&e);
-                                    return;
-                                }
-                            }
+                            oprintln!("  {} Ignoring simulation iterate on validated PASS: {}", "●".yellow(), reason.dimmed());
+                            self.last_iteration_reason = String::new();
                         }
                         LlmDecision::Abort(reason) => {
                             oprintln!("  {} LLM: {}", "✗".red(), reason);
@@ -3056,6 +3778,16 @@ sim_passed = true;
         if !sim_passed {
             return;
         }
+
+        // Every downstream analysis must consume the exact design that passed
+        // simulation, rather than the source captured before an auto-fix.
+        let rtl_code = current_rtl_sim;
+        let tb_code = current_tb_sim;
+        let sdc_code = current_sdc_sim;
+        self.current_rtl = Some(rtl_code.clone());
+        let _ = fs::write(src_dir.join(format!("{}.v", mod_name)), &rtl_code);
+        if let Some(ref tb) = tb_code { let _ = fs::write(&tb_path_sim, tb); }
+        if let Some(ref sdc) = sdc_code { let _ = fs::write(&sdc_path_sim, sdc); }
 
         // === Step 7: Synthesize ===
         let mem_before_synth = engine::get_process_memory_mb();
@@ -3381,6 +4113,8 @@ sim_passed = true;
                 // Declare timing variables used by post-formal section
                 let mut corner_timings: Vec<(LibCorner, TimingReport)> = Vec::new();
                 let mut scan_results: Vec<TimingReport> = Vec::new();
+                let mut constraint_corner_powers: Vec<CornerPowerResult> = Vec::new();
+                let mut max_corner_powers: Vec<CornerPowerResult> = Vec::new();
                 let mut max_found = self.constraint_freq;
 
                 // === Step 8: Multi-corner timing analysis ===
@@ -3392,18 +4126,25 @@ sim_passed = true;
                     steps.step("Multi-corner Static Timing Analysis");
                     steps.substep("Algorithm: Graph-based STA with per-corner PVT delay scaling");
                     steps.substep(&format!("Constraint: {} MHz, {} corners (TT/FF/SS)", self.constraint_freq, corners.len()));
-                    steps.update_log("Multi-corner STA: computing per-corner timing...");
+                    steps.update_log(&format!(
+                        "Multi-corner STA: computing {} corners in parallel...",
+                        corners.len()
+                    ));
 
-                    // Run corner-aware timing analysis for each corner
                     let corner_type_str = |ct: CornerType| -> &str {
                         match ct { CornerType::TT => "tt", CornerType::FF => "ff", CornerType::SS => "ss" }
                     };
-                    for corner in &corners {
-                        steps.update_log(&format!("  {}: {}V {}C ...", corner.short_name, corner.voltage, corner.temperature));
-                        let timing = self.design.timing_analysis_corner(
-                            &synth_output, &mod_name,
-                            corner_type_str(corner.corner_type),
-                            corner.voltage, corner.temperature, constraint_period);
+                    corner_timings = self.estimate_corner_timings_fast(
+                        &synth_output,
+                        &mod_name,
+                        &corners,
+                        constraint_period,
+                    );
+                    for (corner, timing) in &corner_timings {
+                        steps.update_log(&format!(
+                            "  {}: arrival={:.3}ns slack={:.3}ns",
+                            corner.short_name, timing.arrival_time_ns, timing.slack_ns
+                        ));
                         if let Some(ref mut logger) = self.detail_logger {
                             logger.log_timing(self.constraint_freq, timing.timing_met, timing.slack_ns);
                             logger.log_timing_corner(&corner.short_name, timing.arrival_time_ns, timing.required_time_ns, timing.slack_ns);
@@ -3418,42 +4159,22 @@ sim_passed = true;
                             let derate = match corner.corner_type { CornerType::SS => 1.15, CornerType::FF => 0.85, CornerType::TT => 1.0 };
                             logger.log_timing_aocv(synth_info.logic_depth, derate, timing.arrival_time_ns, timing.arrival_time_ns * derate);
                         }
-                        corner_timings.push((corner.clone(), timing));
                     }
 
-                    // Clock scan: only for worst-case corner (SS, high temp)
-                    let worst_corner = corners.iter()
-                        .filter(|c| c.corner_type == CornerType::SS)
-                        .max_by(|a, b| a.temperature.partial_cmp(&b.temperature).unwrap_or(std::cmp::Ordering::Equal));
-                    if let Some(wc) = worst_corner {
+                    // Max frequency is derived from the analyzed worst corner.
+                    // In this STA model cell arrival/setup guard are fixed for a
+                    // corner, so repeated clock-period sweeps are redundant.
+                    if let Some((wc, wt)) = self.pick_worst_timing(&corner_timings) {
                         steps.substep(&format!("Clock scan: worst-case {} ({:.2}V/{}°C)", wc.short_name, wc.voltage, wc.temperature));
-                        let mut freq = self.constraint_freq;
                         let max_scan_freq = 5000;
                         if let Some(ref mut logger) = self.detail_logger {
                             logger.log_timing_scan_begin(self.constraint_freq, max_scan_freq);
                         }
-                        loop {
-                            let period = 1000.0 / freq as f64;
-                            let timing = self.design.timing_analysis_corner(
-                                &synth_output, &mod_name,
-                                "ss", wc.voltage, wc.temperature, period);
-                            if let Some(ref mut logger) = self.detail_logger {
-                                logger.log_timing(freq, timing.timing_met, timing.slack_ns);
-                                if freq % 50 == 0 {
-                                    logger.log_timing_path_detail(0, &format!("ss_scan_{}MHz", freq), timing.slack_ns, synth_info.logic_depth, timing.arrival_time_ns);
-                                    logger.log_timing_node("ss_scan", timing.arrival_time_ns, timing.required_time_ns, timing.slack_ns);
-                                }
-                            }
-                            if !timing.timing_met || freq >= max_scan_freq { break; }
-                            freq += 10;
-                        }
+                        max_found = self.estimate_max_frequency_from_timing(wt, &display_info);
                         if let Some(ref mut logger) = self.detail_logger {
-                            logger.log_timing_scan_end(freq);
+                            logger.log_timing_scan_end(max_found);
                         }
-                        max_found = freq;
-                        let cc = display_info.cell_count.saturating_sub(display_info.dff_count);
-                        if display_info.logic_depth <= 1 && cc == 0 && max_found > 2000 { max_found = 2000; }
-                        else if max_found > 5000 { max_found = 5000; }
+                        steps.substep(&format!("Max frequency derived from worst-corner STA: {} MHz", max_found));
                     }
                     steps.step_ok(&format!("{} corners analyzed, max MET = {} MHz", corners.len(), max_found));
 
@@ -3492,7 +4213,7 @@ sim_passed = true;
 
                     // Multi-corner power report — use real liberty NLDM power analysis
                     terminal::status_update("Generating multi-corner power analysis...");
-                    self.print_multi_corner_power(&corner_timings, &syn_dir, &mod_name, self.constraint_freq,
+                    constraint_corner_powers = self.print_multi_corner_power(&corner_timings, &syn_dir, &mod_name, self.constraint_freq,
                         &format!("Multi-Corner Power Analysis"));
 
                     // Update status bar for remaining steps
@@ -3506,39 +4227,42 @@ sim_passed = true;
                     steps.substep("Building timing graph: DFF clk-to-q + gate delays + interconnect");
                     steps.substep(&format!("Constraint: {} MHz (period={:.2} ns)", self.constraint_freq, constraint_period));
                     steps.update_log("Graph-based STA: computing arrival times, checking setup/hold...");
-                    steps.substep(&format!("Scanning from {} MHz in 10 MHz steps...", self.constraint_freq));
+                    steps.substep(&format!("Scanning from {} MHz with coarse/binary search...", self.constraint_freq));
 
-                    // Clock scan
-                    let scan_start = std::time::Instant::now();
-                    let mut freq = self.constraint_freq;
                     let max_scan_freq = 5000;
                     if let Some(ref mut logger) = self.detail_logger {
                         logger.log_timing_scan_begin(self.constraint_freq, max_scan_freq);
                     }
-                    loop {
-                        let period = 1000.0 / freq as f64;
-                        let timing = self.design.timing_analysis(
-                            &synth_output, &mod_name, Some(&liberty), period);
-                        let is_met = timing.timing_met;
-                        if let Some(ref mut logger) = self.detail_logger {
-                            logger.log_timing(freq, is_met, timing.slack_ns);
-                            if freq % 50 == 0 {
-                                logger.log_timing_path_detail(0, &format!("scan_{}MHz", freq), timing.slack_ns, synth_info.logic_depth, timing.arrival_time_ns);
-                                logger.log_timing_node("scan", timing.arrival_time_ns, timing.required_time_ns, timing.slack_ns);
-                                logger.log_timing_edge("launch_clk", "capture_clk", timing.arrival_time_ns, "setup");
-                            }
-                        }
-                        scan_results.push(timing);
-                        if !is_met || freq >= max_scan_freq { break; }
-                        freq += 10;
+                    let constraint_scan_timing = self.design.timing_analysis(
+                        &synth_output, &mod_name, Some(&liberty), constraint_period);
+                    if let Some(ref mut logger) = self.detail_logger {
+                        logger.log_timing(self.constraint_freq, constraint_scan_timing.timing_met, constraint_scan_timing.slack_ns);
+                        logger.log_timing_path_detail(0, &format!("scan_{}MHz", self.constraint_freq), constraint_scan_timing.slack_ns, synth_info.logic_depth, constraint_scan_timing.arrival_time_ns);
+                        logger.log_timing_node("scan", constraint_scan_timing.arrival_time_ns, constraint_scan_timing.required_time_ns, constraint_scan_timing.slack_ns);
+                        logger.log_timing_edge("launch_clk", "capture_clk", constraint_scan_timing.arrival_time_ns, "setup");
                     }
-                    max_found = freq;
-                    let cc = synth_info.cell_count.saturating_sub(synth_info.dff_count);
-                    if synth_info.logic_depth <= 1 && cc == 0 && max_found > 2000 { max_found = 2000; } else if max_found > 5000 { max_found = 5000; }
+                    scan_results.push(constraint_scan_timing);
+                    max_found = self.scan_single_corner_max_frequency(
+                        &synth_output,
+                        &mod_name,
+                        &liberty,
+                        self.constraint_freq,
+                        synth_info.logic_depth,
+                        synth_info.cell_count,
+                        synth_info.dff_count,
+                    );
+                    if max_found > 0 && max_found != self.constraint_freq {
+                        scan_results.push(self.design.timing_analysis(
+                            &synth_output,
+                            &mod_name,
+                            Some(&liberty),
+                            1000.0 / max_found as f64,
+                        ));
+                    }
                     if let Some(ref mut logger) = self.detail_logger {
                         logger.log_timing_scan_end(max_found);
                     }
-                    steps.step_ok(&format!("Scanned {}-{} MHz, max MET = {} MHz", self.constraint_freq, max_found, max_found));
+                    steps.step_ok(&format!("Scanned {}-{} MHz, max MET = {} MHz", self.constraint_freq, max_scan_freq, max_found));
 
                     let constraint_timing = self.design.timing_analysis(
                         &synth_output, &mod_name, Some(&liberty), constraint_period);
@@ -3571,25 +4295,26 @@ sim_passed = true;
                                 &rtl_code, &mod_name, Some(&liberty), self.constraint_freq, 3.0);
                             if opt_result.success {
                                 let result = opt_result;
-                                    let mut fs = self.constraint_freq;
-                                    loop {
-                                        let timing = self.design.timing_analysis(
-                                            &result.to_stat_output(), &mod_name, Some(&liberty), 1000.0 / fs as f64);
-                                        if !timing.timing_met || fs >= 5000 { break; }
-                                        fs += 10;
-                                    }
-                                    new_max_found = fs;
-                                    new_freq_ratio = new_max_found as f64 / self.constraint_freq as f64;
-                                    oprintln!("  {} Iter {}: max={}MHz, ratio={:.1}x, cells={}, depth={}",
-                                        "●".cyan(), freq_iter, new_max_found, new_freq_ratio, result.cell_count, result.logic_depth);
-                                    if let Some(ref mut logger) = self.detail_logger {
-                                        logger.log_synth_freq_optimization(freq_iter, self.constraint_freq, new_max_found as f64, new_freq_ratio, "result", "");
-                                    }
-                                    if new_freq_ratio >= 3.0 || new_freq_ratio <= freq_ratio * 1.05 || freq_iter >= MAX_FREQ_ITERS {
-                                        max_found = new_max_found;
-                                        steps.step_ok(&format!("Freq opt: {:.1}x → {:.1}x in {} iters", freq_ratio, new_freq_ratio, freq_iter));
-                                        break;
-                                    }
+                                new_max_found = self.scan_single_corner_max_frequency(
+                                    &result.to_stat_output(),
+                                    &mod_name,
+                                    &liberty,
+                                    self.constraint_freq,
+                                    result.logic_depth as usize,
+                                    result.cell_count,
+                                    result.dff_count,
+                                );
+                                new_freq_ratio = new_max_found as f64 / self.constraint_freq as f64;
+                                oprintln!("  {} Iter {}: max={}MHz, ratio={:.1}x, cells={}, depth={}",
+                                    "●".cyan(), freq_iter, new_max_found, new_freq_ratio, result.cell_count, result.logic_depth);
+                                if let Some(ref mut logger) = self.detail_logger {
+                                    logger.log_synth_freq_optimization(freq_iter, self.constraint_freq, new_max_found as f64, new_freq_ratio, "result", "");
+                                }
+                                if new_freq_ratio >= 3.0 || new_freq_ratio <= freq_ratio * 1.05 || freq_iter >= MAX_FREQ_ITERS {
+                                    max_found = new_max_found;
+                                    steps.step_ok(&format!("Freq opt: {:.1}x → {:.1}x in {} iters", freq_ratio, new_freq_ratio, freq_iter));
+                                    break;
+                                }
                             } else {
                                 oprintln!("  {} Freq opt iter {} failed", "✗".red(), freq_iter);
                                 break;
@@ -3629,81 +4354,110 @@ sim_passed = true;
                     oprintln!("  {} No MET frequency found in scan", "⚠".yellow());
                 }
 
+                let mut llm_stage_decisions: Vec<String> = Vec::new();
+                let timing_review = if self.corner_db.multi_corner && !corner_timings.is_empty() {
+                    self.pick_worst_timing(&corner_timings).map(|(_, timing)| timing)
+                } else {
+                    scan_results.iter().rev().find(|t| t.timing_met).or_else(|| scan_results.last())
+                };
+                let timing_decision = self.consult_timing_review(&mod_name, &synth_info, timing_review, &corner_timings, max_found);
+                llm_stage_decisions.push(Self::llm_decision_summary("Timing", &timing_decision));
+                match timing_decision {
+                    LlmDecision::Proceed(_) => {}
+                    LlmDecision::Iterate(reason) => {
+                        self.last_iteration_reason = format!("Timing: LLM requested iteration - {}", reason);
+                        steps.step_fail(&format!("Timing API advisory required: {}", reason));
+                        self.auto_optimize(&synth_info, &[reason], &rtl_code, tb_code.as_deref(), sdc_code.as_deref(), &mod_name);
+                        return;
+                    }
+                    LlmDecision::Abort(reason) => {
+                        self.last_iteration_reason = format!("Timing: LLM requested abort - {}", reason);
+                        steps.step_fail(&format!("Timing API advisory abort: {}", reason));
+                        self.gui_set_error(&reason);
+                        return;
+                    }
+                }
+
                 // === Step 9: Formal verification ===
                 let mut formal_ok = None;
+                let mut formal_report_text = String::new();
                 steps.step("Running formal verification (RTL vs Gate-level)");
                 steps.substep("Algorithm: Port structure equivalence checking");
                 steps.substep("[1/3] Extracting port signatures from RTL and gate-level netlist");
                 steps.substep("[2/3] Comparing input/output port names and widths");
-                steps.substep("[3/3] Verifying logic equivalence (BDD-based or SAT-based)");
-                steps.update_log("SAT solving: checking RTL vs gate-level equivalence...");
+                steps.substep("[3/3] Running built-in functional equivalence comparison");
+                steps.update_log("Comparing RTL and synthesized netlist behavior...");
                 let formal_start = std::time::Instant::now();
                 let formal_result = self.run_formal_verification(&rtl_code, &mod_name, &syn_dir, &formal_dir);
                 let formal_elapsed = formal_start.elapsed();
                 match formal_result {
                     Ok(result) => {
-                        if result.contains("PASS") {
+                        let mut effective_formal_report = result.clone();
+                        if let Some(verdict) = FormalVerdict::from_report(&result) {
+                            if verdict.is_equivalent() {
                             formal_ok = Some(true);
                             steps.step_ok(&format!("RTL vs gate-level: EQUIVALENT ({}ms)", formal_elapsed.as_millis()));
                             steps.substep("All ports match, logic function preserved after synthesis");
-                        } else {
-                            formal_ok = Some(false);
-                            steps.step_fail(&format!("RTL vs gate-level: DIFFERENT ({}ms)", formal_elapsed.as_millis()));
-                            steps.substep("Port structure mismatch - RTL and synthesized netlist differ");
-                            // Trigger auto-fix for formal failure
-                            oprintln!();
-                            oprintln!("  {} Formal verification FAILED - attempting auto-fix...", "●".yellow());
-                            self.log_file_only(&format!("--- Formal FAIL, attempting auto-fix ---"));
-                            for attempt in 1..=3 {
-                                oprintln!("  {} Formal fix attempt {}/3...", "●".yellow(), attempt);
-                                match self.auto_fix_on_error(&rtl_code, tb_code.as_deref(), sdc_code.as_deref(),
-                                    &mod_name, &format!("Formal verification FAILED: RTL and gate-level netlist differ.\n{}", result),
-                                    attempt, 3, &[]) {
-                                    Ok(Some((new_rtl, _, _))) => {
-                                        // Save fixed RTL and re-run synthesis + formal
-                                        if let Some(ref proj) = self.current_project {
-                                            let src_dir = proj.join("src");
-                                            let _ = fs::write(src_dir.join(format!("{}.v", mod_name)), &new_rtl);
-                                        }
-                                        oprintln!("  {} RTL updated, re-running synthesis...", "✓".green());
-                                        // Re-synthesize with fixed RTL
-                                        match self.run_yosys_synthesis(&new_rtl, &mod_name, &syn_dir) {
-                                            Ok(new_synth) => {
-                                                // Re-run formal
-                                                let new_formal = self.run_formal_verification(&new_rtl, &mod_name, &syn_dir, &formal_dir);
-                                                if let Ok(ref fr) = new_formal {
-                                                    if fr.contains("PASS") {
-                                                        formal_ok = Some(true);
-                                                        steps.step_ok(&format!("RTL vs gate-level: EQUIVALENT after fix (attempt {})", attempt));
-                                                        oprintln!("  {} Formal verification PASSED after auto-fix!", "✓".green());
-                                                        let _ = fs::write(formal_dir.join("formal_report.txt"), fr);
-                                                        break;
+                            } else {
+                                formal_ok = Some(false);
+                                steps.step_fail(&format!("RTL vs gate-level: DIFFERENT ({}ms)", formal_elapsed.as_millis()));
+                                steps.substep("Functional equivalence compare found RTL/netlist differences");
+                                oprintln!();
+                                oprintln!("  {} Formal verification FAILED - attempting auto-fix...", "●".yellow());
+                                self.log_file_only(&format!("--- Formal FAIL, attempting auto-fix ---"));
+                                for attempt in 1..=3 {
+                                    oprintln!("  {} Formal fix attempt {}/3...", "●".yellow(), attempt);
+                                    match self.auto_fix_on_error(&rtl_code, tb_code.as_deref(), sdc_code.as_deref(),
+                                        &mod_name, &format!("Formal verification FAILED: RTL and gate-level netlist differ.\n{}", result),
+                                        attempt, 3, &[]) {
+                                        Ok(Some((new_rtl, _, _))) => {
+                                            if let Some(ref proj) = self.current_project {
+                                                let src_dir = proj.join("src");
+                                                let _ = fs::write(src_dir.join(format!("{}.v", mod_name)), &new_rtl);
+                                            }
+                                            oprintln!("  {} RTL updated, re-running synthesis...", "✓".green());
+                                            match self.run_yosys_synthesis(&new_rtl, &mod_name, &syn_dir) {
+                                                Ok(_) => {
+                                                    let new_formal = self.run_formal_verification(&new_rtl, &mod_name, &syn_dir, &formal_dir);
+                                                    if let Ok(ref fr) = new_formal {
+                                                        if matches!(FormalVerdict::from_report(fr), Some(FormalVerdict::Equivalent)) {
+                                                            formal_ok = Some(true);
+                                                            effective_formal_report = fr.clone();
+                                                            steps.step_ok(&format!("RTL vs gate-level: EQUIVALENT after fix (attempt {})", attempt));
+                                                            oprintln!("  {} Formal verification PASSED after auto-fix!", "✓".green());
+                                                            let _ = fs::write(formal_dir.join("formal_report.txt"), fr);
+                                                            break;
+                                                        }
                                                     }
                                                 }
-                                            }
-                                            Err(e) => {
-                                                oprintln!("  {} Re-synthesis failed: {}", "✗".red(), e);
+                                                Err(e) => {
+                                                    oprintln!("  {} Re-synthesis failed: {}", "✗".red(), e);
+                                                }
                                             }
                                         }
-                                    }
-                                    Ok(None) => {
-                                        if attempt >= 3 {
-                                            oprintln!("  {} Formal fix failed after {} attempts", "✗".red(), attempt);
+                                        Ok(None) => {
+                                            if attempt >= 3 {
+                                                oprintln!("  {} Formal fix failed after {} attempts", "✗".red(), attempt);
+                                            }
                                         }
-                                    }
-                                    Err(e) => {
-                                        self.gui_set_error(&e);
-                                        return;
+                                        Err(e) => {
+                                            self.gui_set_error(&e);
+                                            return;
+                                        }
                                     }
                                 }
                             }
+                        } else {
+                            steps.step_fail(&format!("Formal verification returned an unrecognized verdict ({}ms)", formal_elapsed.as_millis()));
+                            self.gui_set_error("Formal verification returned an unrecognized verdict");
+                            return;
                         }
                         self.log_file_only(&format!("--- Formal Verification ---"));
-                        self.log(&result);
+                        self.log(&effective_formal_report);
                         self.log("");
-                        let _ = fs::write(formal_dir.join("formal_report.txt"), &result);
-                        // Store formal result in conversation for LLM context
-                        let is_ok = result.contains("PASS");
+                        let _ = fs::write(formal_dir.join("formal_report.txt"), &effective_formal_report);
+                        formal_report_text = effective_formal_report.clone();
+                        let is_ok = matches!(FormalVerdict::from_report(&effective_formal_report), Some(FormalVerdict::Equivalent));
                         self.conversation.push(Message {
                             role: "user".into(),
                             content: format!("[Formal verification] {} module={}",
@@ -3714,6 +4468,43 @@ sim_passed = true;
                     Err(e) => {
                         steps.step_fail(&format!("Formal verification failed: {} ({}ms)", e, formal_elapsed.as_millis()));
                         oprintln!("  {} {}", "⚠".yellow(), e);
+                        self.gui_set_error(&e);
+                        return;
+                    }
+                }
+
+                let formal_decision = self.consult_formal_review(
+                    &mod_name,
+                    &synth_info,
+                    timing_review,
+                    formal_ok.unwrap_or(false),
+                    &formal_report_text,
+                );
+                llm_stage_decisions.push(Self::llm_decision_summary("Formal", &formal_decision));
+                match formal_decision {
+                    LlmDecision::Proceed(_) if formal_ok == Some(true) => {}
+                    LlmDecision::Proceed(reason) => {
+                        steps.step_fail(&format!("Formal failed despite API proceed: {}", reason));
+                        self.gui_set_error("Formal verification failed");
+                        return;
+                    }
+                    LlmDecision::Iterate(reason) => {
+                        self.last_iteration_reason = format!("Formal: LLM requested iteration - {}", reason);
+                        steps.step_fail(&format!("Formal API advisory required: {}", reason));
+                        match self.auto_fix_on_error(&rtl_code, tb_code.as_deref(), sdc_code.as_deref(), &mod_name, &formal_report_text, 1, 3, &[]) {
+                            Ok(Some((new_rtl, new_tb, new_sdc))) => {
+                                self.process_all("", &new_rtl, new_tb.as_deref(), new_sdc.as_deref());
+                            }
+                            Ok(None) => self.gui_set_error(&reason),
+                            Err(e) => self.gui_set_error(&e),
+                        }
+                        return;
+                    }
+                    LlmDecision::Abort(reason) => {
+                        self.last_iteration_reason = format!("Formal: LLM requested abort - {}", reason);
+                        steps.step_fail(&format!("Formal API advisory abort: {}", reason));
+                        self.gui_set_error(&reason);
+                        return;
                     }
                 }
 
@@ -3725,33 +4516,13 @@ sim_passed = true;
                 }
                 if self.corner_db.multi_corner && !corner_timings.is_empty() {
                     // Max frequency power — uses engine::analyze_power for each corner's liberty
-                    self.print_multi_corner_power(&corner_timings, &syn_dir, &mod_name, max_found,
-                        &format!("Max Frequency Power"));
-                    // Log per-corner power totals (use actual computed values)
+                    max_corner_powers = self.print_multi_corner_power(
+                        &corner_timings, &syn_dir, &mod_name, max_found, "Max Frequency Power");
+                    // Reuse the exact values displayed above; power analysis must
+                    // not be rerun merely to populate the detail log.
                     if let Some(ref mut logger) = self.detail_logger {
-                        for (corner, _) in &corner_timings {
-                            // Compute actual power for this corner
-                            let lib_path = self.corner_db.liberty_path_for_corner(corner);
-                            let gate_path = syn_dir.join(format!("{}_synth_gate.v", mod_name));
-                            let gate_netlist = std::fs::read_to_string(&gate_path).unwrap_or_default();
-                            let power = if let Some(ref lp) = lib_path {
-                                if !gate_netlist.is_empty() {
-                                    engine::analyze_power(&gate_netlist, &mod_name, &lp.to_string_lossy(), max_found as f64)
-                                } else {
-                                    let v_ratio = corner.voltage / 1.2;
-                                    let ge = synth_info.area_ge.max(100.0);
-                                    let sp = ge * 0.01 * v_ratio.powi(2);
-                                    let dp = ge * 0.05 * max_found as f64 / 1000.0 * v_ratio.powi(2);
-                                    engine::PowerAnalysisResult { total_power_uw: sp+dp, static_power_uw: sp, dynamic_power_uw: dp, internal_power_uw: 0.0, switching_power_uw: dp, clock_power_uw: 0.0, leakage_power_uw: sp, report: String::new() }
-                                }
-                            } else {
-                                let v_ratio = corner.voltage / 1.2;
-                                let ge = synth_info.area_ge.max(100.0);
-                                let sp = ge * 0.01 * v_ratio.powi(2);
-                                let dp = ge * 0.05 * max_found as f64 / 1000.0 * v_ratio.powi(2);
-                                engine::PowerAnalysisResult { total_power_uw: sp+dp, static_power_uw: sp, dynamic_power_uw: dp, internal_power_uw: 0.0, switching_power_uw: dp, clock_power_uw: 0.0, leakage_power_uw: sp, report: String::new() }
-                            };
-                            logger.log_power_total(power.static_power_uw + power.dynamic_power_uw, max_found, corner.voltage);
+                        for result in &max_corner_powers {
+                            logger.log_power_total(result.power.total_power_uw, max_found, result.corner.voltage);
                         }
                     }
                     // Design quality score card
@@ -3774,6 +4545,48 @@ sim_passed = true;
                     print_design_quality(&synth_info, self.constraint_freq, max_found, fr);
                 }
 
+                if !constraint_corner_powers.is_empty() || !max_corner_powers.is_empty() {
+                    let power_liberty_ok = Self::all_power_results_use_liberty(&constraint_corner_powers)
+                        && Self::all_power_results_use_liberty(&max_corner_powers);
+                    let power_decision = self.consult_power_review(
+                        &mod_name,
+                        &synth_info,
+                        timing_review,
+                        self.constraint_freq,
+                        max_found,
+                        &constraint_corner_powers,
+                        &max_corner_powers,
+                    );
+                    llm_stage_decisions.push(Self::llm_decision_summary("Power", &power_decision));
+                    match power_decision {
+                        LlmDecision::Proceed(_) if power_liberty_ok => {}
+                        LlmDecision::Proceed(reason) => {
+                            let detail = format!(
+                                "Power analysis did not use liberty for all corners: constraint={}, max={}; API returned proceed: {}",
+                                Self::power_source_summary(&constraint_corner_powers),
+                                Self::power_source_summary(&max_corner_powers),
+                                reason
+                            );
+                            self.last_iteration_reason = detail.clone();
+                            steps.step_fail(&detail);
+                            self.gui_set_error(&detail);
+                            return;
+                        }
+                        LlmDecision::Iterate(reason) => {
+                            self.last_iteration_reason = format!("Power: LLM requested iteration - {}", reason);
+                            steps.step_fail(&format!("Power API advisory required: {}", reason));
+                            self.auto_optimize(&synth_info, &[reason], &rtl_code, tb_code.as_deref(), sdc_code.as_deref(), &mod_name);
+                            return;
+                        }
+                        LlmDecision::Abort(reason) => {
+                            self.last_iteration_reason = format!("Power: LLM requested abort - {}", reason);
+                            steps.step_fail(&format!("Power API advisory abort: {}", reason));
+                            self.gui_set_error(&reason);
+                            return;
+                        }
+                    }
+                }
+
                 // Flow summary tables
                 let max_freq_for_summary = if self.corner_db.multi_corner && !corner_timings.is_empty() {
                     max_found
@@ -3789,7 +4602,19 @@ sim_passed = true;
                 } else {
                     scan_results.iter().rev().find(|t| t.timing_met)
                 };
-                print_flow_summary_tables(&synth_info, self.constraint_freq, max_freq_for_summary, Some(true), lint.passed, summary_timing, formal_ok, None);
+                print_flow_summary_tables(
+                    &synth_info,
+                    self.constraint_freq,
+                    max_freq_for_summary,
+                    Some(true),
+                    lint.passed,
+                    summary_timing,
+                    formal_ok,
+                    Some(&corner_timings),
+                    if constraint_corner_powers.is_empty() { None } else { Some(constraint_corner_powers.as_slice()) },
+                    if max_corner_powers.is_empty() { None } else { Some(max_corner_powers.as_slice()) },
+                    self.corner_db.get_synthesis_corner(),
+                );
 
                 // === Step 10: Save snapshot for history ===
                 self.save_snapshot(&mod_name, &synth_info, &history_dir);
@@ -3813,12 +4638,50 @@ sim_passed = true;
                 self.generate_final_report(&mod_name, &project_dir, &synth_info,
                     final_timing, None::<&[TimingReport]>, &lint);
 
+                let max_power_total_uw = max_corner_powers.iter()
+                    .map(|result| result.power.total_power_uw)
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let final_decision = self.consult_final_report_review(
+                    &mod_name,
+                    &synth_info,
+                    Some(final_timing),
+                    formal_ok,
+                    max_found,
+                    max_power_total_uw,
+                );
+                llm_stage_decisions.push(Self::llm_decision_summary("FinalReport", &final_decision));
+                match final_decision {
+                    LlmDecision::Proceed(_) => {}
+                    LlmDecision::Iterate(reason) => {
+                        self.last_iteration_reason = format!("Final report: LLM requested iteration - {}", reason);
+                        steps.step_fail(&format!("Final report API advisory required: {}", reason));
+                        self.gui_set_error(&reason);
+                        return;
+                    }
+                    LlmDecision::Abort(reason) => {
+                        self.last_iteration_reason = format!("Final report: LLM requested abort - {}", reason);
+                        steps.step_fail(&format!("Final report API advisory abort: {}", reason));
+                        self.gui_set_error(&reason);
+                        return;
+                    }
+                }
+
                 // Generate report.rpt + report.json in report/ folder
                 let freq_ratio_for_rpt = if max_found > 0 { max_found as f64 / self.constraint_freq as f64 } else { 1.0 };
-                let _ = generate_report_rpt(&project_dir, &mod_name, &synth_info,
+                let final_llm_summary = llm_stage_decisions.join(" | ");
+                let constraint_power_slice = if constraint_corner_powers.is_empty() { None } else { Some(constraint_corner_powers.as_slice()) };
+                let max_power_slice = if max_corner_powers.is_empty() { None } else { Some(max_corner_powers.as_slice()) };
+                let report_extras = self.build_report_extras(
+                    constraint_power_slice,
+                    max_power_slice,
+                    Some(final_llm_summary.as_str()),
+                    Some(formal_report_text.as_str()),
+                );
+                let _ = generate_report_rpt_with_extras(&project_dir, &mod_name, &synth_info,
                     Some(final_timing), None, self.constraint_freq, max_found, freq_ratio_for_rpt,
                     "complete",
-                    Some(&scan_results), Some(&corner_timings), Some(true), lint.passed, formal_ok);
+                    Some(&scan_results), Some(&corner_timings), Some(true), lint.passed, formal_ok,
+                    report_extras);
 
                 // === Step 12: Check design goals and auto-optimize ===
                 if !self.design_goals.is_empty() {
@@ -4002,6 +4865,7 @@ sim_passed = true;
         let constraint_period = self.read_sdc_clock_period(&sdc_path)
             .unwrap_or(1000.0 / self.constraint_freq as f64);
         let mut freq = self.constraint_freq;
+        let mut best_met = 0;
         if let Some(ref mut logger) = self.detail_logger {
             logger.log_timing_scan_begin(self.constraint_freq, 5000);
         }
@@ -4014,14 +4878,34 @@ sim_passed = true;
             if let Some(ref mut logger) = self.detail_logger {
                 logger.log_timing(freq, is_met, slack);
             }
+            if is_met {
+                best_met = freq;
+            }
             scan_results.push(timing);
             if !is_met || freq >= 5000 { break; }
             freq += 10;
         }
-        max_found = freq;
-        // Cap for DFF-only: no comb cells → max 2000 MHz
-        let cc = synth_info.cell_count.saturating_sub(synth_info.dff_count);
-        if synth_info.logic_depth <= 1 && cc == 0 && max_found > 2000 { max_found = 2000; } else if max_found > 5000 { max_found = 5000; }
+        max_found = if best_met > 0 {
+            cap_max_frequency(best_met, synth_info)
+        } else {
+            self.scan_single_corner_max_frequency(
+                &synth_output,
+                mod_name,
+                liberty,
+                self.constraint_freq,
+                synth_info.logic_depth,
+                synth_info.cell_count,
+                synth_info.dff_count,
+            )
+        };
+        if best_met == 0 && max_found > 0 {
+            scan_results.push(self.design.timing_analysis(
+                &synth_output,
+                mod_name,
+                Some(liberty),
+                1000.0 / max_found as f64,
+            ));
+        }
         if let Some(ref mut logger) = self.detail_logger {
             logger.log_timing_scan_end(max_found);
         }
@@ -4058,16 +4942,20 @@ sim_passed = true;
         let formal_result = self.run_formal_verification(rtl_code, mod_name, &syn_dir, &formal_dir);
         match formal_result {
             Ok(ref result) => {
-                if result.contains("PASS") {
-                    oprintln!("  {} RTL vs gate-level: EQUIVALENT", "✓".green());
+                if let Some(verdict) = FormalVerdict::from_report(result) {
+                    oprintln!("  {} RTL vs gate-level: {}", if verdict.is_equivalent() { "✓".green() } else { "✗".red() }, verdict.cli_label());
                 } else {
-                    oprintln!("  {} RTL vs gate-level: DIFFERENT", "✗".red());
+                    oprintln!("  {} Formal verification returned an unrecognized verdict", "✗".red());
+                    self.gui_set_error("Formal verification returned an unrecognized verdict");
+                    return;
                 }
                 let _ = fs::write(formal_dir.join("formal_report.txt"), result);
                 self.log_file_only(&format!("--- Formal (post-auto-fix) ---\n{}", result));
             }
             Err(ref e) => {
                 oprintln!("  {} Formal: {}", "⚠".yellow(), e);
+                self.gui_set_error(e);
+                return;
             }
         }
 
@@ -4089,8 +4977,19 @@ sim_passed = true;
         let max_freq_for_summary = scan_results.iter().rev().find(|t| t.timing_met)
             .map(|t| if t.clock_period_ns > 0.0 { (1000.0 / t.clock_period_ns) as i32 } else { 0 })
             .unwrap_or(self.constraint_freq);
-        print_flow_summary_tables(synth_info, self.constraint_freq, max_freq_for_summary,
-            Some(true), true, Some(&constraint_timing), None, None);
+        print_flow_summary_tables(
+            synth_info,
+            self.constraint_freq,
+            max_freq_for_summary,
+            Some(true),
+            true,
+            Some(&constraint_timing),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
 
         // Flow summary box
         oprintln!();
@@ -4959,21 +5858,46 @@ sim_passed = true;
                             return;
                         };
                         let max_freq_mhz = self.estimate_max_frequency_from_timing(worst_timing, &synth_info);
-                        let constraint_power = self.format_multi_corner_power_report(
+                        let constraint_corner_powers = self.analyze_multi_corner_power(
                             &corner_timings,
                             &syn_dir,
                             &mod_name,
                             self.constraint_freq,
-                            "Multi-Corner Power Analysis",
                         );
-                        let max_power = self.format_multi_corner_power_report(
+                        let max_corner_powers = self.analyze_multi_corner_power(
                             &corner_timings,
                             &syn_dir,
                             &mod_name,
                             max_freq_mhz,
+                        );
+                        let constraint_power = self.format_multi_corner_power_results(
+                            &constraint_corner_powers,
+                            self.constraint_freq,
+                            "Multi-Corner Power Analysis",
+                        );
+                        let max_power = self.format_multi_corner_power_results(
+                            &max_corner_powers,
+                            max_freq_mhz,
                             "Max Frequency Power",
                         );
                         let power_report = format!("{}{}", constraint_power, max_power);
+                        let power_liberty_ok = Self::all_power_results_use_liberty(&constraint_corner_powers)
+                            && Self::all_power_results_use_liberty(&max_corner_powers);
+                        self.print_multi_corner_timing(&corner_timings, self.constraint_freq);
+                        oprintln!("{}", constraint_power);
+                        oprintln!("{}", max_power);
+                        if !power_liberty_ok {
+                            let detail = format!(
+                                "Power analysis failed signoff source check: constraint={}, max={}",
+                                Self::power_source_summary(&constraint_corner_powers),
+                                Self::power_source_summary(&max_corner_powers)
+                            );
+                            let _ = fs::write(syn_dir.join("power_report.txt"), &power_report);
+                            self.stop_status("Power analysis failed", false);
+                            self.gui_set_error(&detail);
+                            oprintln!("  {} {}", "✗".red(), detail);
+                            return;
+                        }
                         let _ = fs::write(syn_dir.join("power_report.txt"), &power_report);
                         if let Some(project_dir) = &project_dir {
                             let freq_ratio = if self.constraint_freq > 0 {
@@ -4981,7 +5905,13 @@ sim_passed = true;
                             } else {
                                 1.0
                             };
-                            let _ = generate_report_rpt(
+                            let extras = self.build_report_extras(
+                                Some(&constraint_corner_powers),
+                                Some(&max_corner_powers),
+                                None,
+                                None,
+                            );
+                            let _ = generate_report_rpt_with_extras(
                                 project_dir,
                                 &mod_name,
                                 &synth_info,
@@ -4996,11 +5926,9 @@ sim_passed = true;
                                 None,
                                 true,
                                 None,
+                                extras,
                             );
                         }
-                        self.print_multi_corner_timing(&corner_timings, self.constraint_freq);
-                        oprintln!("{}", constraint_power);
-                        oprintln!("{}", max_power);
                         print_design_quality(
                             &synth_info,
                             self.constraint_freq,
@@ -5067,6 +5995,13 @@ sim_passed = true;
                 return;
             }
 
+            oprintln!();
+            oprintln!("  {}", "Detected technologies:".bright_cyan().bold());
+            for process in &self.corner_db.processes {
+                let marker = if self.corner_db.active_process.as_deref() == Some(process.process_name.as_str()) { "*" } else { " " };
+                oprintln!("  {} {:<28} {} corner(s)  {}", marker, process.process_name, process.corners.len(), process.directory.display());
+            }
+
             let group = match self.corner_db.get_active_group() {
                 Some(g) => g,
                 None => {
@@ -5076,7 +6011,7 @@ sim_passed = true;
             };
 
             oprintln!();
-            oprintln!("  {} {}", "Technology:".bright_cyan().bold(), group.process_name.bold());
+            oprintln!("  {} {}", "Current project technology:".bright_cyan().bold(), group.process_name.bold());
             oprintln!("  {} corners, multi-corner: {}", group.corners.len(),
                 if self.corner_db.multi_corner { "ON".green() } else { "OFF".yellow() });
             oprintln!();
@@ -5107,6 +6042,9 @@ sim_passed = true;
             if let Some(best) = group.get_best_corner() {
                 oprintln!("  {} Best-case:  {} (FF, {:.2}V, {:.0}°C)", "●".green(), best.short_name, best.voltage, best.temperature);
             }
+            if let Some(synthesis) = group.get_synthesis_corner() {
+                oprintln!("  {} Synthesis:  {} ({})", "●".cyan(), synthesis.short_name, synthesis.lib_name);
+            }
 
             oprintln!();
             oprintln!("  Commands: /tech all (multi-corner ON), /tech single (OFF), /tech <process_name> to switch process");
@@ -5115,6 +6053,7 @@ sim_passed = true;
             match args {
                 "all" => {
                     self.corner_db.set_multi_corner(true);
+                    let _ = self.persist_project_technology();
                     oprintln!("  {} Multi-corner mode: {}", "✓".green(), "ON".bold());
                     let group = self.corner_db.get_active_group();
                     if let Some(g) = group {
@@ -5123,6 +6062,7 @@ sim_passed = true;
                 }
                 "single" => {
                     self.corner_db.set_multi_corner(false);
+                    let _ = self.persist_project_technology();
                     oprintln!("  {} Multi-corner mode: {}", "✓".green(), "OFF".bold());
                     if let Some(liberty) = self.corner_db.get_default_liberty() {
                         oprintln!("  {} Using: {}", "  ".dimmed(), liberty.display());
@@ -5132,9 +6072,13 @@ sim_passed = true;
                     // Try to switch process
                     match self.corner_db.set_active_process(args) {
                         Ok(()) => {
-                            oprintln!("  {} Switched to process: {}", "✓".green(), args.bold());
+                            if let Err(error) = self.persist_project_technology() {
+                                oprintln!("  {} Technology selected but project config was not saved: {}", "⚠".yellow(), error);
+                            }
+                            oprintln!("  {} Switched project technology: {}", "✓".green(), args.bold());
                             let group = self.corner_db.get_active_group().unwrap();
                             oprintln!("  {} corners available", group.corners.len());
+                            self.gui_set_step("config", "passed", &format!("Technology: {}", args));
                         }
                         Err(e) => {
                             oprintln!("  {} {}", "✗".red(), e);
@@ -5749,6 +6693,49 @@ sim_passed = true;
             tt.total_completion_tokens(),
             tt.estimated_cost_usd(),
         );
+        if let Some(prev) = self.data_api.snapshots.last() {
+            // Step decisions are cumulative: later snapshots must not make a
+            // validated simulation/formal result disappear just because that
+            // step's compact data packet is focused on timing or power.
+            builder.snapshot.rtl_lines = prev.rtl_lines;
+            builder.snapshot.rtl_modules = prev.rtl_modules.clone();
+            builder.snapshot.rtl_ports = prev.rtl_ports;
+            builder.snapshot.rtl_wires = prev.rtl_wires;
+            builder.snapshot.parse_errors = prev.parse_errors.clone();
+            builder.snapshot.parse_warnings = prev.parse_warnings.clone();
+            builder.snapshot.lint_passed = prev.lint_passed;
+            builder.snapshot.lint_warnings = prev.lint_warnings;
+            builder.snapshot.lint_errors = prev.lint_errors;
+            builder.snapshot.synth_cell_count = prev.synth_cell_count;
+            builder.snapshot.synth_dff_count = prev.synth_dff_count;
+            builder.snapshot.synth_wire_count = prev.synth_wire_count;
+            builder.snapshot.synth_port_count = prev.synth_port_count;
+            builder.snapshot.synth_area_ge = prev.synth_area_ge;
+            builder.snapshot.synth_area_um2 = prev.synth_area_um2;
+            builder.snapshot.synth_logic_depth = prev.synth_logic_depth;
+            builder.snapshot.synth_cell_breakdown = prev.synth_cell_breakdown.clone();
+            builder.snapshot.synth_lib_name = prev.synth_lib_name.clone();
+            builder.snapshot.synth_from_lib = prev.synth_from_lib;
+            builder.snapshot.timing_max_freq_mhz = prev.timing_max_freq_mhz;
+            builder.snapshot.timing_slack_ns = prev.timing_slack_ns;
+            builder.snapshot.timing_arrival_ns = prev.timing_arrival_ns;
+            builder.snapshot.timing_required_ns = prev.timing_required_ns;
+            builder.snapshot.timing_met = prev.timing_met;
+            builder.snapshot.timing_critical_path = prev.timing_critical_path.clone();
+            builder.snapshot.sim_passed = prev.sim_passed;
+            builder.snapshot.sim_cycles = prev.sim_cycles;
+            builder.snapshot.sim_errors = prev.sim_errors.clone();
+            builder.snapshot.power_total_mw = prev.power_total_mw;
+            builder.snapshot.power_static_mw = prev.power_static_mw;
+            builder.snapshot.power_dynamic_mw = prev.power_dynamic_mw;
+            builder.snapshot.power_internal_mw = prev.power_internal_mw;
+            builder.snapshot.power_clock_mw = prev.power_clock_mw;
+            builder.snapshot.power_leakage_mw = prev.power_leakage_mw;
+            builder.snapshot.formal_equivalent = prev.formal_equivalent;
+            builder.snapshot.formal_checks = prev.formal_checks;
+            builder.snapshot.previous_decisions = prev.previous_decisions.clone();
+            builder.snapshot.error_history = prev.error_history.clone();
+        }
 
         // Parse data tuples into snapshot fields
         let mut cell_count = 0usize;
@@ -5775,10 +6762,85 @@ sim_passed = true;
                         dff_count = dff;
                     }
                 }
+                "wire_count" | "wires" => {
+                    if let Ok(wires) = v.parse::<usize>() {
+                        builder.snapshot.synth_wire_count = wires;
+                    }
+                }
+                "port_count" | "ports" => {
+                    if let Ok(ports) = v.parse::<usize>() {
+                        builder.snapshot.synth_port_count = ports;
+                    }
+                }
                 "logic_depth" => {
                     if let Ok(depth) = v.parse::<usize>() {
                         builder.snapshot.synth_logic_depth = depth as i32;
                         logic_depth = depth;
+                    }
+                }
+                "area_um2" => {
+                    if let Ok(area) = v.parse::<f64>() {
+                        builder.snapshot.synth_area_um2 = area;
+                    }
+                }
+                "lib_name" => {
+                    builder.snapshot.synth_lib_name = v.to_string();
+                }
+                "sim_passed" => {
+                    builder.snapshot.sim_passed = matches!(v.to_ascii_lowercase().as_str(), "true" | "pass" | "passed" | "1");
+                }
+                "cycles" | "time_steps" => {
+                    if let Ok(cycles) = v.parse::<i32>() {
+                        builder.snapshot.sim_cycles = cycles;
+                    }
+                }
+                "max_freq_mhz" => {
+                    if let Ok(freq) = v.parse::<f64>() {
+                        builder.snapshot.timing_max_freq_mhz = freq;
+                    }
+                }
+                "slack_ns" => {
+                    if let Ok(slack) = v.parse::<f64>() {
+                        builder.snapshot.timing_slack_ns = slack;
+                    }
+                }
+                "arrival_ns" => {
+                    if let Ok(arrival) = v.parse::<f64>() {
+                        builder.snapshot.timing_arrival_ns = arrival;
+                    }
+                }
+                "required_ns" => {
+                    if let Ok(required) = v.parse::<f64>() {
+                        builder.snapshot.timing_required_ns = required;
+                    }
+                }
+                "timing_met" => {
+                    builder.snapshot.timing_met = matches!(v.to_ascii_lowercase().as_str(), "true" | "met" | "1");
+                }
+                "critical_path" => {
+                    builder.snapshot.timing_critical_path = v.to_string();
+                }
+                "power_total_uw" => {
+                    if let Ok(power) = v.parse::<f64>() {
+                        builder.snapshot.power_total_mw = power / 1000.0;
+                    }
+                }
+                "power_static_uw" => {
+                    if let Ok(power) = v.parse::<f64>() {
+                        builder.snapshot.power_static_mw = power / 1000.0;
+                    }
+                }
+                "power_dynamic_uw" => {
+                    if let Ok(power) = v.parse::<f64>() {
+                        builder.snapshot.power_dynamic_mw = power / 1000.0;
+                    }
+                }
+                "formal_equivalent" => {
+                    builder.snapshot.formal_equivalent = matches!(v.to_ascii_lowercase().as_str(), "true" | "pass" | "equivalent" | "1");
+                }
+                "formal_checks" => {
+                    if let Ok(checks) = v.parse::<usize>() {
+                        builder.snapshot.formal_checks = checks;
                     }
                 }
                 _ => {}
@@ -5791,76 +6853,63 @@ sim_passed = true;
         }
         self.data_api.add_snapshot(snapshot.clone());
 
-        let data_str: String = data.iter()
-            .map(|(k, v)| format!("  {}: {}", k, v))
-            .collect::<Vec<_>>().join("\n");
-        let context_block = match context {
-            Some(ctx) if !ctx.is_empty() => format!("\nContext:\n{}\n", ctx),
-            _ => String::new(),
-        };
-
-        // ── Design type classification and reference ranges ──
-        let (design_type, reference_ranges_str, suspicious_note) = if let Some(ref rtl) = self.current_rtl {
-            let dt = classify_design_type(rtl);
-            let lines = rtl.lines().count();
-            let ports = rtl.matches("input").count() + rtl.matches("output").count() + rtl.matches("inout").count();
-            let ranges = get_typical_ranges(dt, lines, ports);
-            let ref_str = format_typical_ranges(&ranges, dt);
-
-            // Check reasonableness
-            let (reasonable, issues) = is_result_reasonable(&ranges, cell_count, dff_count, area_ge, logic_depth);
-
-            // is_suspicious note
-            let is_suspicious = cell_count == 0
-                || (dff_count > 0 && cell_count == dff_count && logic_depth <= 1 && cell_count > 4);
-            let susp_note = if is_suspicious {
-                format!("\n⚠ SUSPICIOUS RESULT: {} cells, {} DFFs, depth {} — likely a skeleton/stub design or synthesis failure.\n", cell_count, dff_count, logic_depth)
-            } else if !reasonable {
-                format!("\n⚠ UNUSUAL RESULT: {} — double-check these values.\n", issues)
+        let context_block = context.unwrap_or("").replace('\n', " ");
+        let design_type = self.current_rtl
+            .as_ref()
+            .map(|rtl| classify_design_type(rtl));
+        let has_synth_metrics = data.iter().any(|(k, _)| matches!(
+            *k,
+            "cells" | "area_ge" | "dff" | "logic_depth"
+        ));
+        let synth_range_applicable = has_synth_metrics && !matches!(step_name, "Simulation");
+        let reason_code = if synth_range_applicable {
+            if let Some(ref rtl) = self.current_rtl {
+                let dt = design_type.unwrap_or_else(|| classify_design_type(rtl));
+                let lines = rtl.lines().count();
+                let ports = rtl.matches("input").count() + rtl.matches("output").count() + rtl.matches("inout").count();
+                let ranges = get_typical_ranges(dt, lines, ports);
+                let (reasonable, issues) = is_result_reasonable(&ranges, cell_count, dff_count, area_ge, logic_depth);
+                if !reasonable {
+                    format!("range_{}", compact_token(&issues.replace(' ', "_")))
+                } else {
+                    "metrics_ok".to_string()
+                }
             } else {
-                String::new()
-            };
-
-            (Some(dt), format!("\n\nDesign type: {}\n{}", dt.as_str(), ref_str), susp_note)
+                "metrics_only".to_string()
+            }
+        } else if matches!(step_name, "Simulation") {
+            if snapshot.sim_passed { "sim_ok".to_string() } else { "sim_fail".to_string() }
         } else {
-            (None, String::new(), String::new())
+            "step_only".to_string()
         };
-
-        // Build enhanced prompt with design classification and reference ranges
+        let data_line = data.iter()
+            .map(|(k, v)| format!("{}={}", k, compact_token_limited(v, 80)))
+            .collect::<Vec<_>>()
+            .join(" ");
         let prompt = format!(
-            "Review '{}' @{}MHz. {}Step={}, Result={}.",
+            "step={} result={} module={} design={} data=[{}] ctx=[{}] hint={}",
+            step_name,
+            step_result,
             self.current_module.as_deref().unwrap_or("unknown"),
-            self.constraint_freq,
-            if let Some(dt) = design_type { format!("Type={}. ", dt.as_str()) } else { String::new() },
-            step_name, step_result
+            design_type.map(|d| d.as_str()).unwrap_or("unknown"),
+            data_line,
+            compact_token_limited(&context_block, 240),
+            compact_token_limited(&reason_code, 80),
         );
-        // Append data efficiently
-        let data_lines: Vec<String> = data.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-        let prompt = format!("{}\nData: {}\n{}", prompt, data_lines.join(" "), context_block);
-        let prompt = format!("{}\n{}\n{}\n", prompt, reference_ranges_str, suspicious_note);
-        let prompt = format!("{}{}\n", prompt,
-            "Evaluate: 1) Within expected ranges? 2) Valid reason for outliers? 3) Cell count matches complexity? 4) Action?\n\
-             Cite SPECIFIC numbers. Output JSON: {{\"action\":\"proceed|retry|back|abort\",\"target\":\"<step>\",\"reason\":\"<why>\",\"suggestions\":\"<fix>\"}}");
 
         if let Some(ref mut logger) = self.detail_logger {
             logger.log_llm_request("decision", 1);
-            let data_summary: String = data.iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect::<Vec<_>>().join(", ");
             logger.log("LLM", "DECISION_PROMPT", &format!("\"step\":\"{}\",\"result\":\"{}\",\"data\":\"{}\",\"design_type\":\"{}\"",
-                step_name, step_result, data_summary,
+                step_name, step_result, data_line,
                 design_type.map(|d| d.as_str()).unwrap_or("unknown")));
         }
 
         let system_prompt = format!(
-            "You are an RTL design supervisor for a {} MHz design flow. \
-             Analyze the state snapshot and decide the next action. \
-             Output ONLY a JSON object (no markdown, no extra text): \
-             {{\"action\":\"proceed|retry|back|abort\",\"target\":\"<step>\",\"reason\":\"<data-based reason>\",\"suggestions\":\"<optional fix>\"}}\n\
-             Rules: judge whether data is within expected ranges for this design type. \
-             Area should scale with complexity. Timing slack should be positive. \
-             Simulation output should match expected behavior. \
-             A design with 0 combinational cells and all DFFs is likely a skeleton/stub — RETRY in that case.",
+            "EDA flow gatekeeper for {} MHz. Reply exactly one short line, no JSON, no prose, no markdown. \
+             Format: p|ok, r|reason, o|direction, x|reason, or b|Simulation|reason / b|Synthesis|reason / b|Timing|reason / b|Power|reason / b|Formal|reason. \
+             Use short snake_case codes only. Judge only explicit current-step data. \
+             PASS/MET/complete with sane metrics => p|ok. Failed simulation/formal/timing/power => r or b. \
+             Never continue after explicit failure.",
             self.constraint_freq
         );
 
@@ -5869,115 +6918,84 @@ sim_passed = true;
             role: "system".into(),
             content: system_prompt,
         });
-        // Only include user↔assistant exchanges (skip stat messages), last 2 exchanges max
-        let relevant: Vec<&Message> = self.conversation.iter()
-            .filter(|m| !m.content.starts_with("[Synthesis done]")
-                && !m.content.starts_with("[Timing done]"))
-            .collect();
-        let rl = relevant.len();
-        let start = if rl > 6 { rl - 6 } else { 0 };
-        for m in &relevant[start..] {
-            msgs.push((*m).clone());
-        }
+        // Automated step decisions must be isolated from old conversation state;
+        // otherwise stale failures from earlier runs can incorrectly influence the API.
         msgs.push(Message { role: "user".into(), content: prompt });
 
+        // A completed local verification step must not become a failed flow
+        // solely because an optional remote adviser is unavailable.  The EDA
+        // result remains authoritative: retain strict stop/iterate handling
+        // for explicit failures, while a verified PASS/MET/complete/equivalent
+        // result advances with a traceable local decision.
+        let locally_verified_success = matches!(
+            step_result.trim().to_ascii_lowercase().as_str(),
+            "pass" | "met" | "complete" | "equivalent" | "ok"
+        );
         if !self.llm.is_optionally_configured() {
             let message = "LLM advisory is required, but no API key is configured";
             if let Some(ref mut logger) = self.detail_logger {
                 logger.log("LLM_DECISION", "ERROR", message);
             }
             self.log(&format!("  > LLM decision failed: {}", message));
+            if locally_verified_success {
+                let fallback = "local_verified_pass_llm_unavailable".to_string();
+                oprintln!("  {} LLM unavailable; local verification result accepted", "●".yellow());
+                if let Some(ref mut logger) = self.detail_logger {
+                    logger.log_llm_decision(step_name, "LOCAL_PROCEED", &fallback);
+                }
+                return LlmDecision::Proceed(fallback);
+            }
             oprintln!("  {} {}", "✗".red(), message);
             return LlmDecision::Abort(message.to_string());
         }
 
-        match self.llm.chat(&msgs) {
-            Ok(response) => {
-                // Try to parse as JSON first (new format)
-                if let Ok(decision) = crate::data_api::parse_llm_decision(&response) {
-                    self.data_api.add_decision(decision.clone());
-                    match decision.action {
-                        FlowAction::Proceed => {
-                            let mut detail = decision.reason.clone();
-                            if let Some(ref suggestions) = decision.suggestions {
-                                if !suggestions.trim().is_empty() {
-                                    detail.push_str(&format!(" | suggestions: {}", suggestions));
-                                }
-                            }
-                            self.log(&format!("  > LLM Proceed: {}", detail));
-                            if let Some(ref mut logger) = self.detail_logger {
-                                logger.log_llm_decision(step_name, "PROCEED", &detail);
-                            }
-                            LlmDecision::Proceed(detail)
-                        }
-                        FlowAction::Retry | FlowAction::Optimize => {
-                            let mut detail = decision.reason.clone();
-                            if let Some(ref suggestions) = decision.suggestions {
-                                if !suggestions.trim().is_empty() {
-                                    detail.push_str(&format!(" | suggestions: {}", suggestions));
-                                }
-                            }
-                            oprintln!("  {} {}", "LLM suggests iteration:".yellow(), detail.dimmed());
-                            self.log(&format!("  > LLM Iterate: {}", detail));
-                            if let Some(ref mut logger) = self.detail_logger {
-                                logger.log_llm_decision(step_name, "ITERATE", &detail);
-                            }
-                            LlmDecision::Iterate(detail)
-                        }
-                        FlowAction::Back => {
-                            let mut detail = format!("Back to {}: {}", decision.target, decision.reason);
-                            if let Some(ref suggestions) = decision.suggestions {
-                                if !suggestions.trim().is_empty() {
-                                    detail.push_str(&format!(" | suggestions: {}", suggestions));
-                                }
-                            }
-                            oprintln!("  {} {} (go back to {})", "LLM suggests iteration:".yellow(), decision.reason.dimmed(), decision.target.dimmed());
-                            self.log(&format!("  > LLM {}", detail));
-                            if let Some(ref mut logger) = self.detail_logger {
-                                logger.log_llm_decision(step_name, "BACK", &detail);
-                            }
-                            LlmDecision::Iterate(detail)
-                        }
-                        FlowAction::Abort => {
-                            let mut detail = decision.reason.clone();
-                            if let Some(ref suggestions) = decision.suggestions {
-                                if !suggestions.trim().is_empty() {
-                                    detail.push_str(&format!(" | suggestions: {}", suggestions));
-                                }
-                            }
-                            oprintln!("  {} {}", "LLM suggests abort:".red(), detail.dimmed());
-                            self.log(&format!("  > LLM Abort: {}", detail));
-                            if let Some(ref mut logger) = self.detail_logger {
-                                logger.log_llm_decision(step_name, "ABORT", &detail);
-                            }
-                            LlmDecision::Abort(detail)
-                        }
+        match self.llm.chat_compact(&msgs, 48) {
+            Ok((response, _usage)) => {
+                // Step decisions use one compact protocol only. In particular,
+                // do not fall back to the legacy JSON parser here: accepting a
+                // JSON object embedded in prose would let non-compliant model
+                // output steer a safety-critical flow transition.
+                let decision = parse_compact_llm_decision(&response)
+                    .unwrap_or_else(|| guarded_decision_after_bad_llm_format(step_name, step_result, data, &response));
+                self.data_api.add_decision(decision.clone());
+                let mut detail = decision.reason.clone();
+                if let Some(ref suggestions) = decision.suggestions {
+                    if !suggestions.trim().is_empty() {
+                        detail.push_str(&format!("|{}", suggestions));
                     }
-                } else {
-                    // Fall back to legacy text parsing
-                    let upper = response.trim().to_uppercase();
-                    let reason = if response.len() > 8 { response[7..].trim().to_string() } else { String::new() };
-
-                    if upper.starts_with("ITERATE") {
-                        oprintln!("  {} {}", "LLM suggests iteration:".yellow(), reason.dimmed());
-                        self.log(&format!("  > LLM Iterate: {}", reason));
+                }
+                match decision.action {
+                    FlowAction::Proceed => {
+                        self.log(&format!("  > LLM Proceed: {}", detail));
                         if let Some(ref mut logger) = self.detail_logger {
-                            logger.log_llm_decision(step_name, "ITERATE", &reason);
+                            logger.log_llm_decision(step_name, "PROCEED", &detail);
                         }
-                        LlmDecision::Iterate(reason)
-                    } else if upper.starts_with("ABORT") {
-                        oprintln!("  {} {}", "LLM suggests abort:".red(), reason.dimmed());
-                        self.log(&format!("  > LLM Abort: {}", reason));
+                        LlmDecision::Proceed(detail)
+                    }
+                    FlowAction::Retry | FlowAction::Optimize => {
+                        oprintln!("  {} {}", "LLM suggests iteration:".yellow(), detail.dimmed());
+                        self.log(&format!("  > LLM Iterate: {}", detail));
                         if let Some(ref mut logger) = self.detail_logger {
-                            logger.log_llm_decision(step_name, "ABORT", &reason);
+                            logger.log_llm_decision(step_name, "ITERATE", &detail);
                         }
-                        LlmDecision::Abort(reason)
-                    } else {
-                        self.log(&format!("  > LLM Proceed: {}", reason));
+                        LlmDecision::Iterate(detail)
+                    }
+                    FlowAction::Back => {
+                        let back_detail = format!("back:{}:{}", decision.target, detail);
+                        oprintln!("  {} {} (go back to {})", "LLM suggests iteration:".yellow(), detail.dimmed(), decision.target.dimmed());
+                        self.log(&format!("  > LLM {}", back_detail));
                         if let Some(ref mut logger) = self.detail_logger {
-                            logger.log_llm_decision(step_name, "PROCEED", &reason);
+                            logger.log_llm_decision(step_name, "BACK", &back_detail);
                         }
-                        LlmDecision::Proceed(reason)
+                        LlmDecision::Iterate(back_detail)
+                    }
+                    FlowAction::Abort => {
+                        oprintln!("  {} {}", "LLM suggests abort:".red(), detail.dimmed());
+                        self.log(&format!("  > LLM Abort: {}", detail));
+                        if let Some(ref mut logger) = self.detail_logger {
+                            logger.log_llm_decision(step_name, "ABORT", &detail);
+                        }
+                        LlmDecision::Abort(detail)
                     }
                 }
             }
@@ -5985,6 +7003,14 @@ sim_passed = true;
                 self.log(&format!("  > LLM decision failed: {}", e));
                 if let Some(ref mut logger) = self.detail_logger {
                     logger.log_error("LLM_DECISION", &format!("failed: {}", e));
+                }
+                if locally_verified_success {
+                    let fallback = "local_verified_pass_llm_unavailable".to_string();
+                    oprintln!("  {} LLM unavailable; local verification result accepted", "●".yellow());
+                    if let Some(ref mut logger) = self.detail_logger {
+                        logger.log_llm_decision(step_name, "LOCAL_PROCEED", &fallback);
+                    }
+                    return LlmDecision::Proceed(fallback);
                 }
                 oprintln!("  {} LLM decision failed: {}", "✗".red(), e);
                 LlmDecision::Abort(format!("LLM unavailable: {}", e))
@@ -6009,7 +7035,7 @@ sim_passed = true;
         };
         let liberty = self.corner_db.get_default_liberty()
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "libs/cmos_cells.lib".to_string());
+            .unwrap_or_else(|| "libs/demo/cmos_cells.lib".to_string());
 
         // === Set up project directory (use project_manager if available) ===
         let project_dir = if let Some(pm_dir) = self.project_manager.current_project() {
@@ -6200,6 +7226,7 @@ sim_passed = true;
                     if report.contains("FAIL") || !report.contains("PASS") {
                         steps.step_fail(&format!("Simulation FAILED ({}ms)", sim_elapsed.as_millis()));
                         self.log_file_only(&format!("--- Simulation FAIL (attempt {}/{}) ---\n{}", attempt, MAX_RETRIES, report));
+                        let _ = fs::write(sim_dir.join("sim_report.txt"), &report);
 
                         if attempt >= MAX_RETRIES {
                             oprintln!("  {} Auto-fix exhausted ({} attempts). Please modify manually.", "✗".red(), MAX_RETRIES);
@@ -6246,7 +7273,37 @@ sim_passed = true;
                             }
                         }
                     }
-                    // Simulation passed
+                    if let Some(issue) = Self::simulation_report_issue(&report) {
+                        steps.step_fail(&format!("Simulation invalid: {} ({}ms)", issue, sim_elapsed.as_millis()));
+                        self.log_file_only(&format!("--- Simulation INVALID (attempt {}/{}) ---\n{}", attempt, MAX_RETRIES, report));
+                        let _ = fs::write(sim_dir.join("sim_report.txt"), &report);
+
+                        if attempt >= MAX_RETRIES {
+                            oprintln!("  {} Auto-fix exhausted ({} attempts). Please modify manually.", "✗".red(), MAX_RETRIES);
+                            return;
+                        }
+
+                        oprintln!();
+                        oprintln!("  {} Auto-fix attempt {}/{}...", "●".yellow(), attempt, MAX_RETRIES);
+                        match self.auto_fix_on_error(&current_rtl, current_tb.as_deref(),
+                                                     current_sdc.as_deref(), &module_name, &report,
+                                                     attempt, MAX_RETRIES, &previous_attempts) {
+                            Ok(Some((new_rtl, new_tb, new_sdc))) => {
+                                let diagnosis = new_rtl.lines().take(3).collect::<Vec<_>>().join(" ");
+                                previous_attempts.push(diagnosis);
+                                current_rtl = new_rtl;
+                                current_tb = new_tb;
+                                current_sdc = new_sdc;
+                                continue;
+                            }
+                            Ok(None) => continue,
+                            Err(e) => {
+                                self.stop_status("LLM unavailable", false);
+                                self.gui_set_error(&e);
+                                return;
+                            }
+                        }
+                    }
                     sim_passed = true;
                     steps.step_ok(&format!("Simulation PASSED ({}ms)", sim_elapsed.as_millis()));
                     steps.substep("Simulation completed successfully");
@@ -6325,6 +7382,22 @@ sim_passed = true;
             return;
         }
 
+        // Continue with the design which actually passed simulation, not the
+        // stale source passed to process_all before an auto-fix.
+        let rtl_code = current_rtl;
+        let tb_code = current_tb;
+        let sdc_code = current_sdc;
+        self.current_rtl = Some(rtl_code.clone());
+        if let Some(ref project_dir) = self.current_project {
+            let _ = fs::write(project_dir.join("src").join(format!("{}.v", module_name)), &rtl_code);
+            if let Some(ref tb) = tb_code {
+                let _ = fs::write(project_dir.join("tb").join(format!("{}_tb.v", module_name)), tb);
+            }
+            if let Some(ref sdc) = sdc_code {
+                let _ = fs::write(project_dir.join("sdc").join(format!("{}.sdc", module_name)), sdc);
+            }
+        }
+
         // === Step 7: Synthesize ===
         steps.step("Running synthesis (AST → RTLIL → Gate-level)");
         steps.substep("[1/5] Parsing Verilog AST and building module hierarchy");
@@ -6334,7 +7407,7 @@ sim_passed = true;
         steps.substep("[5/5] Mapping to CMOS standard cells ($_AND_, $_OR_, $_DFF_P_, etc.)");
         steps.update_log("Building gate-level netlist, estimating area & delay...");
         let synth_start = std::time::Instant::now();
-        let synth_result = self.run_yosys_synthesis(rtl_code, &module_name, &syn_dir);
+        let synth_result = self.run_yosys_synthesis(&rtl_code, &module_name, &syn_dir);
         match synth_result {
             Ok(synth_info) => {
                 let synth_elapsed = synth_start.elapsed();
@@ -6377,7 +7450,7 @@ sim_passed = true;
                         oprintln!("  {} LLM recommends iteration: {}", "●".yellow(), reason);
                         self.log_file_only(&format!("--- LLM Iterate: {} ---", reason));
                         self.last_iteration_reason = format!("Synthesis: LLM suggests iteration - {}", reason);
-                        match self.auto_fix_on_error(rtl_code, tb_code, sdc_code,
+                        match self.auto_fix_on_error(&rtl_code, tb_code.as_deref(), sdc_code.as_deref(),
                             &module_name,
                             &format!("LLM supervisor requested synthesis iteration before timing analysis: {}", reason),
                             1, 3, &[]) {
@@ -6479,6 +7552,9 @@ sim_passed = true;
                 // Declare timing variables
                 let mut corner_timings: Vec<(LibCorner, TimingReport)> = Vec::new();
                 let mut scan_results: Vec<TimingReport> = Vec::new();
+                let mut constraint_corner_powers: Vec<CornerPowerResult> = Vec::new();
+                let mut max_corner_powers: Vec<CornerPowerResult> = Vec::new();
+                let mut llm_stage_decisions: Vec<String> = Vec::new();
                 let mut max_found = self.constraint_freq;
 
                 // === Step 8: Timing analysis ===
@@ -6491,17 +7567,25 @@ sim_passed = true;
                     steps.step("Multi-corner Static Timing Analysis");
                     steps.substep("Algorithm: Graph-based STA with per-corner PVT delay scaling");
                     steps.substep(&format!("Constraint: {} MHz, {} corners (TT/FF/SS)", self.constraint_freq, corners.len()));
-                    steps.update_log("Multi-corner STA: computing per-corner timing...");
+                    steps.update_log(&format!(
+                        "Multi-corner STA: computing {} corners in parallel...",
+                        corners.len()
+                    ));
 
                     let corner_type_str = |ct: CornerType| -> &str {
                         match ct { CornerType::TT => "tt", CornerType::FF => "ff", CornerType::SS => "ss" }
                     };
-for corner in &corners {
-                        steps.update_log(&format!("  {}: {}V {}C ...", corner.short_name, corner.voltage, corner.temperature));
-                        let timing = self.design.timing_analysis_corner(
-                            &synth_output, &module_name,
-                            corner_type_str(corner.corner_type),
-                            corner.voltage, corner.temperature, constraint_period);
+                    corner_timings = self.estimate_corner_timings_fast(
+                        &synth_output,
+                        &module_name,
+                        &corners,
+                        constraint_period,
+                    );
+                    for (corner, timing) in &corner_timings {
+                        steps.update_log(&format!(
+                            "  {}: arrival={:.3}ns slack={:.3}ns",
+                            corner.short_name, timing.arrival_time_ns, timing.slack_ns
+                        ));
                         if let Some(ref mut logger) = self.detail_logger {
                             logger.log_timing_corner(&corner.short_name, timing.arrival_time_ns, timing.required_time_ns, timing.slack_ns);
                             logger.log("TIMING", "CORNER_DETAIL", &format!(
@@ -6515,27 +7599,11 @@ for corner in &corners {
                             let derate = match corner.corner_type { CornerType::SS => 1.15, CornerType::FF => 0.85, CornerType::TT => 1.0 };
                             logger.log_timing_aocv(synth_info.logic_depth, derate, timing.arrival_time_ns, timing.arrival_time_ns * derate);
                         }
-                        corner_timings.push((corner.clone(), timing));
                     }
 
-                    // Clock scan on worst SS corner
-                    let worst_corner = corners.iter()
-                        .filter(|c| c.corner_type == CornerType::SS)
-                        .max_by(|a, b| a.temperature.partial_cmp(&b.temperature).unwrap_or(std::cmp::Ordering::Equal));
-                    if let Some(wc) = worst_corner {
-                        let mut freq = self.constraint_freq;
-                        let max_scan_freq = 5000;
-                        loop {
-                            let period = 1000.0 / freq as f64;
-                            let timing = self.design.timing_analysis_corner(
-                                &synth_output, &module_name,
-                                "ss", wc.voltage, wc.temperature, period);
-                            if !timing.timing_met || freq >= max_scan_freq { break; }
-                            freq += 10;
-                        }
-                        max_found = freq;
-                        let cc = synth_info.cell_count.saturating_sub(synth_info.dff_count);
-                        if synth_info.logic_depth <= 1 && cc == 0 && max_found > 2000 { max_found = 2000; } else if max_found > 5000 { max_found = 5000; }
+                    // Derive max frequency from the already analyzed worst corner.
+                    if let Some((_wc, wt)) = self.pick_worst_timing(&corner_timings) {
+                        max_found = self.estimate_max_frequency_from_timing(wt, &synth_info);
                     }
                     steps.step_ok(&format!("{} corners analyzed, max MET = {} MHz", corners.len(), max_found));
 
@@ -6563,7 +7631,7 @@ for corner in &corners {
 
                     // Multi-corner power report — use real liberty NLDM power analysis
                     terminal::status_update("Generating multi-corner power analysis...");
-                    self.print_multi_corner_power(&corner_timings, &syn_dir, &module_name, self.constraint_freq,
+                    constraint_corner_powers = self.print_multi_corner_power(&corner_timings, &syn_dir, &module_name, self.constraint_freq,
                         &format!("Multi-Corner Power Analysis"));
 
                     // Update status bar for remaining steps
@@ -6575,26 +7643,33 @@ for corner in &corners {
                     steps.substep("Building timing graph: DFF clk-to-q + gate delays + interconnect");
                     steps.substep(&format!("Constraint: {} MHz (period={:.2} ns)", self.constraint_freq, constraint_period));
                     steps.update_log("Graph-based STA: computing arrival times, checking setup/hold...");
-                    steps.substep(&format!("Scanning from {} MHz in 10 MHz steps...", self.constraint_freq));
+                    steps.substep(&format!("Scanning from {} MHz with coarse/binary search...", self.constraint_freq));
 
-                    let mut freq = self.constraint_freq;
                     let max_scan_freq = 5000;
-                    loop {
-                        let period = 1000.0 / freq as f64;
-                        let timing = self.design.timing_analysis(
-                            &synth_output, &module_name, Some(&liberty), period);
-                        let is_met = timing.timing_met;
-                        scan_results.push(timing);
-                        if !is_met || freq >= max_scan_freq { break; }
-                        freq += 10;
+                    let constraint_scan_timing = self.design.timing_analysis(
+                        &synth_output, &module_name, Some(&liberty), constraint_period);
+                    scan_results.push(constraint_scan_timing);
+                    max_found = self.scan_single_corner_max_frequency(
+                        &synth_output,
+                        &module_name,
+                        &liberty,
+                        self.constraint_freq,
+                        synth_info.logic_depth,
+                        synth_info.cell_count,
+                        synth_info.dff_count,
+                    );
+                    if max_found > 0 && max_found != self.constraint_freq {
+                        scan_results.push(self.design.timing_analysis(
+                            &synth_output,
+                            &module_name,
+                            Some(&liberty),
+                            1000.0 / max_found as f64,
+                        ));
                     }
-                    max_found = freq;
-                    let cc = synth_info.cell_count.saturating_sub(synth_info.dff_count);
-                    if synth_info.logic_depth <= 1 && cc == 0 && max_found > 2000 { max_found = 2000; } else if max_found > 5000 { max_found = 5000; }
                     if let Some(ref mut logger) = self.detail_logger {
                         logger.log_timing_scan_end(max_found);
                     }
-                    steps.step_ok(&format!("Scanned {}-{} MHz, max MET = {} MHz", self.constraint_freq, max_found, max_found));
+                    steps.step_ok(&format!("Scanned {}-{} MHz, max MET = {} MHz", self.constraint_freq, max_scan_freq, max_found));
 
                     let constraint_timing = self.design.timing_analysis(
                         &synth_output, &module_name, Some(&liberty), constraint_period);
@@ -6627,25 +7702,26 @@ for corner in &corners {
                                 &rtl_code, &module_name, Some(&liberty), self.constraint_freq, 3.0);
                             if opt_result.success {
                                 let result = opt_result;
-                                    let mut fs = self.constraint_freq;
-                                    loop {
-                                        let timing = self.design.timing_analysis(
-                                            &result.to_stat_output(), &module_name, Some(&liberty), 1000.0 / fs as f64);
-                                        if !timing.timing_met || fs >= 5000 { break; }
-                                        fs += 10;
-                                    }
-                                    new_max_found = fs;
-                                    new_freq_ratio = new_max_found as f64 / self.constraint_freq as f64;
-                                    oprintln!("  {} Iter {}: max={}MHz, ratio={:.1}x, cells={}, depth={}",
-                                        "●".cyan(), freq_iter, new_max_found, new_freq_ratio, result.cell_count, result.logic_depth);
-                                    if let Some(ref mut logger) = self.detail_logger {
-                                        logger.log_synth_freq_optimization(freq_iter, self.constraint_freq, new_max_found as f64, new_freq_ratio, "result", "");
-                                    }
-                                    if new_freq_ratio >= 3.0 || new_freq_ratio <= freq_ratio * 1.05 || freq_iter >= MAX_FREQ_ITERS {
-                                        max_found = new_max_found;
-                                        steps.step_ok(&format!("Freq opt: {:.1}x → {:.1}x in {} iters", freq_ratio, new_freq_ratio, freq_iter));
-                                        break;
-                                    }
+                                new_max_found = self.scan_single_corner_max_frequency(
+                                    &result.to_stat_output(),
+                                    &module_name,
+                                    &liberty,
+                                    self.constraint_freq,
+                                    result.logic_depth as usize,
+                                    result.cell_count,
+                                    result.dff_count,
+                                );
+                                new_freq_ratio = new_max_found as f64 / self.constraint_freq as f64;
+                                oprintln!("  {} Iter {}: max={}MHz, ratio={:.1}x, cells={}, depth={}",
+                                    "●".cyan(), freq_iter, new_max_found, new_freq_ratio, result.cell_count, result.logic_depth);
+                                if let Some(ref mut logger) = self.detail_logger {
+                                    logger.log_synth_freq_optimization(freq_iter, self.constraint_freq, new_max_found as f64, new_freq_ratio, "result", "");
+                                }
+                                if new_freq_ratio >= 3.0 || new_freq_ratio <= freq_ratio * 1.05 || freq_iter >= MAX_FREQ_ITERS {
+                                    max_found = new_max_found;
+                                    steps.step_ok(&format!("Freq opt: {:.1}x → {:.1}x in {} iters", freq_ratio, new_freq_ratio, freq_iter));
+                                    break;
+                                }
                             } else {
                                 oprintln!("  {} Freq opt iter {} failed", "✗".red(), freq_iter);
                                 break;
@@ -6654,59 +7730,104 @@ for corner in &corners {
                     }
                 }
 
+                let timing_review = if self.corner_db.multi_corner && !corner_timings.is_empty() {
+                    self.pick_worst_timing(&corner_timings).map(|(_, timing)| timing)
+                } else {
+                    scan_results.iter().rev().find(|t| t.timing_met).or_else(|| scan_results.last())
+                };
+                let timing_decision = self.consult_timing_review(&module_name, &synth_info, timing_review, &corner_timings, max_found);
+                llm_stage_decisions.push(Self::llm_decision_summary("Timing", &timing_decision));
+                match timing_decision {
+                    LlmDecision::Proceed(_) => {}
+                    LlmDecision::Iterate(reason) => {
+                        self.last_iteration_reason = format!("Timing: LLM requested iteration - {}", reason);
+                        steps.step_fail(&format!("Timing API advisory required: {}", reason));
+                        self.auto_optimize(&synth_info, &[reason], &rtl_code, tb_code.as_deref(), sdc_code.as_deref(), &module_name);
+                        return;
+                    }
+                    LlmDecision::Abort(reason) => {
+                        self.last_iteration_reason = format!("Timing: LLM requested abort - {}", reason);
+                        steps.step_fail(&format!("Timing API advisory abort: {}", reason));
+                        self.gui_set_error(&reason);
+                        return;
+                    }
+                }
+
                 // === Step 9: Formal verification ===
                 steps.step("Running formal verification (RTL vs Gate-level)");
                 steps.substep("Algorithm: Port structure equivalence checking");
                 steps.substep("[1/3] Extracting port signatures from RTL and gate-level netlist");
                 steps.substep("[2/3] Comparing input/output port names and widths");
-                steps.substep("[3/3] Verifying logic equivalence (BDD-based or SAT-based)");
-                let formal_result = self.run_formal_verification(rtl_code, &module_name, &syn_dir, &formal_dir);
+                steps.substep("[3/3] Running built-in functional equivalence comparison");
+                let mut formal_ok = None;
+                let mut formal_report_text = String::new();
+                let formal_result = self.run_formal_verification(&rtl_code, &module_name, &syn_dir, &formal_dir);
                 match formal_result {
                     Ok(result) => {
-                        if result.contains("PASS") {
+                        if matches!(FormalVerdict::from_report(&result), Some(FormalVerdict::Equivalent)) {
+                            formal_ok = Some(true);
                             steps.step_ok("RTL vs gate-level: EQUIVALENT");
                             steps.substep("All ports match, logic function preserved after synthesis");
-                        } else {
+                        } else if matches!(FormalVerdict::from_report(&result), Some(FormalVerdict::Different)) {
+                            formal_ok = Some(false);
                             steps.step_fail("RTL vs gate-level: DIFFERENT");
                             steps.substep("Formal equivalence check found differences");
-                            // Trigger auto-fix: formal verification failure should cause iteration
-                            oprintln!("  {} Formal verification found differences. Triggering auto-fix...", "●".yellow());
+                            oprintln!("  {} Formal verification found differences. Requesting API review...", "●".yellow());
                             self.log_file_only(&format!("--- Formal Verification FAIL ---"));
                             self.log(&result);
 
                             if let Some(ref mut logger) = self.detail_logger {
                                 logger.log_autofix(1, 3, "formal_diff");
                             }
-
-                            // Attempt to fix by re-synthesizing with different optimization
-                            // or asking LLM to review
-                            let fix_prompt = format!(
-                                "Formal verification FAILED: RTL and gate-level netlist are DIFFERENT for module '{}'.\n\
-                                 This means the synthesis produced a netlist that is NOT functionally equivalent to the RTL.\n\
-                                 Please review the RTL code and identify potential synthesis issues:\n\
-                                 - Unsupported constructs (e.g., #delays, $display in always blocks)\n\
-                                 - Race conditions or incomplete sensitivity lists\n\
-                                 - Multi-driver conflicts\n\
-                                 - Latched vs flip-flop inference issues\n\n\
-                                 RTL:\n```verilog\n{}\n```\n\n\
-                                 Output CORRECTED RTL in ```verilog block.",
-                                module_name, rtl_code
-                            );
-                            self.conversation.push(Message {
-                                role: "user".into(),
-                                content: fix_prompt,
-                            });
-                            // Don't stop the flow — just log the warning and continue
-                            // The user can review and iterate
+                        } else {
+                            steps.step_fail("Formal verification returned an unrecognized verdict");
+                            self.gui_set_error("Formal verification returned an unrecognized verdict");
+                            return;
                         }
                         self.log_file_only(&format!("--- Formal Verification ---"));
                         self.log(&result);
                         self.log("");
                         let _ = fs::write(formal_dir.join("formal_report.txt"), &result);
+                        formal_report_text = result;
                     }
                     Err(e) => {
                         steps.step_fail(&format!("Formal verification failed: {}", e));
                         oprintln!("  {} {}", "⚠".yellow(), e);
+                        self.gui_set_error(&e);
+                        return;
+                    }
+                }
+
+                let formal_decision = self.consult_formal_review(
+                    &module_name,
+                    &synth_info,
+                    timing_review,
+                    formal_ok.unwrap_or(false),
+                    &formal_report_text,
+                );
+                llm_stage_decisions.push(Self::llm_decision_summary("Formal", &formal_decision));
+                match formal_decision {
+                    LlmDecision::Proceed(_) if formal_ok == Some(true) => {}
+                    LlmDecision::Proceed(reason) => {
+                        steps.step_fail(&format!("Formal failed despite API proceed: {}", reason));
+                        self.gui_set_error("Formal verification failed");
+                        return;
+                    }
+                    LlmDecision::Iterate(reason) => {
+                        self.last_iteration_reason = format!("Formal: LLM requested iteration - {}", reason);
+                        steps.step_fail(&format!("Formal API advisory required: {}", reason));
+                        match self.auto_fix_on_error(&rtl_code, tb_code.as_deref(), sdc_code.as_deref(), &module_name, &formal_report_text, 1, 3, &[]) {
+                            Ok(Some((new_rtl, new_tb, new_sdc))) => self.process_all("", &new_rtl, new_tb.as_deref(), new_sdc.as_deref()),
+                            Ok(None) => self.gui_set_error(&reason),
+                            Err(e) => self.gui_set_error(&e),
+                        }
+                        return;
+                    }
+                    LlmDecision::Abort(reason) => {
+                        self.last_iteration_reason = format!("Formal: LLM requested abort - {}", reason);
+                        steps.step_fail(&format!("Formal API advisory abort: {}", reason));
+                        self.gui_set_error(&reason);
+                        return;
                     }
                 }
 
@@ -6716,7 +7837,7 @@ for corner in &corners {
                     self.print_max_freq_timing(&synth_output, &module_name, &corner_timings, max_found);
 
                     // Max frequency power — uses engine::analyze_power for each corner's liberty
-                    self.print_multi_corner_power(&corner_timings, &syn_dir, &module_name, max_found,
+                    max_corner_powers = self.print_multi_corner_power(&corner_timings, &syn_dir, &module_name, max_found,
                         &format!("Max Frequency Power"));
 
                     let worst = corner_timings.iter()
@@ -6758,6 +7879,48 @@ for corner in &corners {
                     // Design quality score card
                     let freq_ratio = if max_found > self.constraint_freq { max_found as f64 / self.constraint_freq as f64 } else { 1.0 };
                     print_design_quality(&synth_info, self.constraint_freq, max_found, freq_ratio);
+                }
+
+                if !constraint_corner_powers.is_empty() || !max_corner_powers.is_empty() {
+                    let power_liberty_ok = Self::all_power_results_use_liberty(&constraint_corner_powers)
+                        && Self::all_power_results_use_liberty(&max_corner_powers);
+                    let power_decision = self.consult_power_review(
+                        &module_name,
+                        &synth_info,
+                        timing_review,
+                        self.constraint_freq,
+                        max_found,
+                        &constraint_corner_powers,
+                        &max_corner_powers,
+                    );
+                    llm_stage_decisions.push(Self::llm_decision_summary("Power", &power_decision));
+                    match power_decision {
+                        LlmDecision::Proceed(_) if power_liberty_ok => {}
+                        LlmDecision::Proceed(reason) => {
+                            let detail = format!(
+                                "Power analysis did not use liberty for all corners: constraint={}, max={}; API returned proceed: {}",
+                                Self::power_source_summary(&constraint_corner_powers),
+                                Self::power_source_summary(&max_corner_powers),
+                                reason
+                            );
+                            self.last_iteration_reason = detail.clone();
+                            steps.step_fail(&detail);
+                            self.gui_set_error(&detail);
+                            return;
+                        }
+                        LlmDecision::Iterate(reason) => {
+                            self.last_iteration_reason = format!("Power: LLM requested iteration - {}", reason);
+                            steps.step_fail(&format!("Power API advisory required: {}", reason));
+                            self.auto_optimize(&synth_info, &[reason], &rtl_code, tb_code.as_deref(), sdc_code.as_deref(), &module_name);
+                            return;
+                        }
+                        LlmDecision::Abort(reason) => {
+                            self.last_iteration_reason = format!("Power: LLM requested abort - {}", reason);
+                            steps.step_fail(&format!("Power API advisory abort: {}", reason));
+                            self.gui_set_error(&reason);
+                            return;
+                        }
+                    }
                 }
 
                 // === Step 10: Save snapshot for history ===
@@ -6813,7 +7976,7 @@ for corner in &corners {
                         let mut prev_attempts: Vec<String> = Vec::new();
                         for attempt in 1..=3 {
                             oprintln!("  {} Auto-fix attempt {}/3...", "●".yellow(), attempt);
-                            match self.auto_fix_on_error(rtl_code, tb_code, sdc_code,
+                            match self.auto_fix_on_error(&rtl_code, tb_code.as_deref(), sdc_code.as_deref(),
                                 &module_name, &error_desc, attempt, 3, &prev_attempts) {
                                 Ok(Some((new_rtl, _, _))) => {
                                     let diagnosis = new_rtl.lines().take(3).collect::<Vec<_>>().join(" ");
@@ -6857,7 +8020,7 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
                             oprintln!("    {}", v.yellow());
                         }
                         oprintln!();
-                        self.auto_optimize(&synth_info, &violations, rtl_code, tb_code, sdc_code, &module_name);
+                        self.auto_optimize(&synth_info, &violations, &rtl_code, tb_code.as_deref(), sdc_code.as_deref(), &module_name);
                     }
                 }
 
@@ -6874,8 +8037,48 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
                     max_found);
                 self.last_flow_result = Some(flow_summary_msg);
 
+                let max_power_total_uw = max_corner_powers.iter()
+                    .map(|result| result.power.total_power_uw)
+                    .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let final_decision = self.consult_final_report_review(
+                    &module_name,
+                    &synth_info,
+                    Some(final_timing),
+                    formal_ok,
+                    max_found,
+                    max_power_total_uw,
+                );
+                llm_stage_decisions.push(Self::llm_decision_summary("FinalReport", &final_decision));
+                match final_decision {
+                    LlmDecision::Proceed(_) => {}
+                    LlmDecision::Iterate(reason) => {
+                        self.last_iteration_reason = format!("Final report: LLM requested iteration - {}", reason);
+                        steps.step_fail(&format!("Final report API advisory required: {}", reason));
+                        self.gui_set_error(&reason);
+                        return;
+                    }
+                    LlmDecision::Abort(reason) => {
+                        self.last_iteration_reason = format!("Final report: LLM requested abort - {}", reason);
+                        steps.step_fail(&format!("Final report API advisory abort: {}", reason));
+                        self.gui_set_error(&reason);
+                        return;
+                    }
+                }
+
                 // Flow summary tables
-                print_flow_summary_tables(&synth_info, self.constraint_freq, max_found, Some(sim_passed), lint.passed, summary_timing, None, None);
+                print_flow_summary_tables(
+                    &synth_info,
+                    self.constraint_freq,
+                    max_found,
+                    Some(sim_passed),
+                    lint.passed,
+                    summary_timing,
+                    formal_ok,
+                    Some(&corner_timings),
+                    if constraint_corner_powers.is_empty() { None } else { Some(constraint_corner_powers.as_slice()) },
+                    if max_corner_powers.is_empty() { None } else { Some(max_corner_powers.as_slice()) },
+                    self.corner_db.get_synthesis_corner(),
+                );
 
                 self.gui_set_step(
                     "summary",
@@ -6916,10 +8119,20 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
                 // Generate report.rpt in report/ folder
                 let project_dir = self.current_project.as_ref().unwrap().to_path_buf();
                 let freq_ratio_final = max_found as f64 / self.constraint_freq as f64;
-                let _ = generate_report_rpt(&project_dir, &module_name, &synth_info,
+                let final_llm_summary = llm_stage_decisions.join(" | ");
+                let constraint_power_slice = if constraint_corner_powers.is_empty() { None } else { Some(constraint_corner_powers.as_slice()) };
+                let max_power_slice = if max_corner_powers.is_empty() { None } else { Some(max_corner_powers.as_slice()) };
+                let report_extras = self.build_report_extras(
+                    constraint_power_slice,
+                    max_power_slice,
+                    Some(final_llm_summary.as_str()),
+                    Some(formal_report_text.as_str()),
+                );
+                let _ = generate_report_rpt_with_extras(&project_dir, &module_name, &synth_info,
                     Some(final_timing), None, self.constraint_freq, max_found, freq_ratio_final,
                     "complete",
-                    Some(&scan_results), Some(&corner_timings), Some(sim_passed), lint.passed, None);
+                    Some(&scan_results), Some(&corner_timings), Some(sim_passed), lint.passed, formal_ok,
+                    report_extras);
                 self.gui_set_step(
                     "summary",
                     "passed",
@@ -6952,7 +8165,7 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
                     if let Some(ref mut logger) = self.detail_logger {
                         logger.log_autofix(attempt, 3, "synth_zero_cells");
                     }
-                    match self.auto_fix_on_error(rtl_code, tb_code.as_deref(), sdc_code.as_deref(),
+                    match self.auto_fix_on_error(&rtl_code, tb_code.as_deref(), sdc_code.as_deref(),
                         &module_name, &format!("Synthesis failed: {}. The RTL must be valid synthesizable Verilog WITHOUT any 'signed' keyword in port declarations. Use plain 'input [7:0] a' instead of 'input signed [7:0] a'.", synth_error),
                         attempt, 3, &synth_prev_attempts) {
                         Ok(Some((new_rtl, _, _))) => {
@@ -7030,45 +8243,11 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
                           sdc_code: Option<&str>, module_name: &str, error_msg: &str,
                           attempt: usize, max_attempts: usize,
                           previous_attempts: &[String]) -> Result<Option<(String, Option<String>, Option<String>)>, String> {
-        // Collect all source files for context
-        let mut all_source = String::new();
-        if let Some(ref proj) = self.current_project {
-            let src_dir = proj.join("src");
-            if let Ok(entries) = fs::read_dir(&src_dir) {
-                for entry in entries.flatten() {
-                    let fname = entry.file_name().to_string_lossy().to_string();
-                    if fname.ends_with(".v") || fname.ends_with(".sv") {
-                        if let Ok(content) = fs::read_to_string(entry.path()) {
-                            all_source.push_str(&format!("// === {} ===\n{}\n\n", fname, content));
-                        }
-                    }
-                }
-            }
-            // Collect synthesis reports for context
-            let syn_dir = proj.join("syn");
-            if let Ok(entries) = fs::read_dir(&syn_dir) {
-                for entry in entries.flatten() {
-                    let fname = entry.file_name().to_string_lossy().to_string();
-                    if fname.ends_with("_report.txt") {
-                        if let Ok(content) = fs::read_to_string(entry.path()) {
-                            all_source.push_str(&format!("// --- Synthesis Report ({}) ---\n{}\n\n", fname, content));
-                        }
-                    }
-                }
-            }
-            // Collect timing reports
-            let timing_dir = proj.join("syn");
-            if let Ok(entries) = fs::read_dir(&timing_dir) {
-                for entry in entries.flatten() {
-                    let fname = entry.file_name().to_string_lossy().to_string();
-                    if fname.contains("timing_report") {
-                        if let Ok(content) = fs::read_to_string(entry.path()) {
-                            all_source.push_str(&format!("// --- Timing Report ({}) ---\n{}\n\n", fname, content));
-                        }
-                    }
-                }
-            }
-        }
+        // Feed a repair only the failing module plus its concise diagnostics.
+        // Historical reports are stale for a local fix and previously caused
+        // multi-thousand-token requests on every retry.
+        let all_source = llm_excerpt(rtl_code, 16_000);
+        let error_excerpt = llm_excerpt(error_msg, 4_000);
 
         // Classify the error type for better diagnosis
         let (error_type, is_synth_error) = if error_msg.contains("Synthesis produced 0 cells") ||
@@ -7088,7 +8267,7 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
         let mut fix_prompt = if is_synth_error {
             let mut p = format!(
                 "ERROR TYPE: {}\n=== Synthesis of module {} FAILED -- 0 cells produced ===\n=== Error Details ===\n{}\n\n",
-                error_type, module_name, error_msg
+                error_type, module_name, error_excerpt
             );
             p.push_str("Synthesis produced 0 cells. This ALWAYS means the RTL uses unsupported Verilog syntax.\n");
             p.push_str("Most common causes (CHECK YOUR CODE FOR THESE):\n");
@@ -7108,7 +8287,7 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
                  {}\n\n\
                  === All RTL Source Files & Reports ===\n\
                  ```verilog\n{}\n```\n\n",
-                error_type, module_name, error_msg, all_source
+                error_type, module_name, error_excerpt, all_source
             )
         };
 
@@ -7162,13 +8341,8 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
             ));
         }
 
-        self.conversation.push(Message {
-            role: "user".into(),
-            content: fix_prompt.clone(),
-        });
-
         if let Some(ref mut logger) = self.detail_logger {
-            logger.log_llm_request(&self.llm.config_summary(), self.conversation.len());
+            logger.log_llm_request(&self.llm.config_summary(), 2);
         }
 
         let mut messages: Vec<Message> = Vec::new();
@@ -7179,14 +8353,7 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
             SYSTEM_LINT_FIXER.to_string()
         };
         messages.push(Message { role: "system".into(), content: system_prompt });
-        // Only last 6 non-stat messages for auto-fix context
-        let af_rel: Vec<&Message> = self.conversation.iter()
-            .filter(|m| !m.content.starts_with("[Synthesis done]")
-                && !m.content.starts_with("[Timing done]"))
-            .collect();
-        let af_rl = af_rel.len();
-        let af_s = if af_rl > 6 { af_rl - 6 } else { 0 };
-        for m in &af_rel[af_s..] { messages.push((*m).clone()); }
+        messages.push(Message { role: "user".into(), content: fix_prompt });
 
         let llm_start = std::time::Instant::now();
         match self.llm.chat_with_usage(&messages) {
@@ -7243,6 +8410,30 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
             }
         }
         Ok(None)
+    }
+
+    fn simulation_report_issue(report: &str) -> Option<String> {
+        let upper = report.to_ascii_uppercase();
+        if !upper.contains("STATUS: PASS") {
+            return Some("simulation_not_pass".to_string());
+        }
+        if upper.contains("STATUS: FAIL")
+            || upper.contains("ASSERTION FAILED")
+            || upper.contains("ERROR:")
+            || upper.contains("TIMEOUT")
+        {
+            return Some("simulation_fatal".to_string());
+        }
+        None
+    }
+
+    fn simulation_report_time_steps(report: &str) -> i32 {
+        report
+            .lines()
+            .find(|line| line.starts_with("Time steps:"))
+            .and_then(|line| line.split(':').nth(1))
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .unwrap_or(0)
     }
 
     /// Run simulation using existing testbench
@@ -7623,7 +8814,18 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
         if let Some(ref mut logger) = self.detail_logger {
             logger.log("SYNTH", "RESULT", &format!("cells={} wires={} dff={} area={:.0} GE",
                 synth_result.cell_count, synth_result.wire_count, synth_result.dff_count, synth_result.area_ge));
-            logger.log_synth_liberty(&liberty_path.as_deref().unwrap_or("none"), 0);
+            let liberty_cell_count = liberty_path
+                .as_deref()
+                .and_then(engine::parse_liberty_info)
+                .map(|info| info.cell_count.max(0) as usize)
+                .filter(|count| *count > 0)
+                .or_else(|| {
+                    self.corner_db
+                        .get_synthesis_corner()
+                        .map(|corner| corner.cell_count.max(0) as usize)
+                })
+                .unwrap_or(0);
+            logger.log_synth_liberty(&liberty_path.as_deref().unwrap_or("none"), liberty_cell_count);
             logger.log_synth_cells(&synth_result.cell_counts.iter().map(|(t,c)| (t.clone(), *c)).collect::<Vec<_>>());
             // Log per-pass intermediate synthesis detail
             logger.log_synth_intermediate("techmap", &format!("mapped {} cells to library gates", synth_result.cell_count));
@@ -7941,12 +9143,42 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
 
     /// Estimate circuit scale via LLM and compare with actual results
     fn estimate_circuit_scale(&mut self, rtl_code: &str, module_name: &str, synth_info: &SynthInfo) -> Result<bool, String> {
-        if !self.llm.is_optionally_configured() {
-            let message = "LLM scale advisory is required, but no API key is configured".to_string();
-            if let Some(ref mut logger) = self.detail_logger {
-                logger.log("SCALE", "ERROR", &message);
+        // Scale sanity is deterministic from parsed RTL and mapped netlist.
+        // Sending the full source to an LLM consumes disproportionate tokens
+        // and must never gate a completed local synthesis.  Remote advice is
+        // retained as an explicit opt-in diagnostic for users who want it.
+        let remote_scale_advisory = matches!(
+            std::env::var("AI_DIGITAL_ENABLE_REMOTE_SCALE_ADVISORY").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE")
+        );
+        if !remote_scale_advisory {
+            let source_lines = rtl_code.lines().count();
+            let has_logic_construct = rtl_code.contains("assign") || rtl_code.contains("always") ||
+                rtl_code.contains("case") || rtl_code.contains("function") || rtl_code.contains("generate");
+            if has_logic_construct && synth_info.cell_count == 0 {
+                let message = format!(
+                    "native scale check failed for {}: behavioral RTL ({} lines) produced an empty gate netlist",
+                    module_name, source_lines
+                );
+                if let Some(ref mut logger) = self.detail_logger {
+                    logger.log("SCALE", "ERROR", &message);
+                }
+                return Err(message);
             }
-            return Err(message);
+            if let Some(ref mut logger) = self.detail_logger {
+                logger.log("SCALE", "NATIVE_OK", &format!(
+                    "module={} lines={} cells={} dff={} ge={:.0}; remote_advisory=disabled",
+                    module_name, source_lines, synth_info.cell_count, synth_info.dff_count, synth_info.area_ge
+                ));
+            }
+            return Ok(false);
+        }
+        if !self.llm.is_optionally_configured() {
+            let message = "remote LLM scale advisory unavailable; retaining native synthesis result".to_string();
+            if let Some(ref mut logger) = self.detail_logger {
+                logger.log("SCALE", "SKIPPED", &message);
+            }
+            return Ok(false);
         }
 
         // Build prompt for LLM estimation
@@ -8136,7 +9368,8 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
                 if let Some(ref mut logger) = self.detail_logger {
                     logger.log("SCALE", "ERROR", &format!("LLM request failed: {}", e));
                 }
-                return Err(format!("LLM scale advisory request failed: {}", e));
+                self.log(&format!("  > Remote scale advisory unavailable: {}; retaining native synthesis result", e));
+                return Ok(false);
             }
         }
         Ok(false) // No fix needed
@@ -8519,6 +9752,26 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
                             continue;
                         }
 
+                        let sim_dir = self.current_project.as_ref().unwrap().join("sim");
+                        match self.run_simulation(&new_rtl, module_name, &sim_dir) {
+                            Ok(sim_report) => {
+                                if let Some(issue) = Self::simulation_report_issue(&sim_report) {
+                                    oprintln!("  {} Rejecting optimized RTL: {}", "⚠".yellow(), issue);
+                                    if let Some(ref mut logger) = self.detail_logger {
+                                        logger.log("OPT", "SIM_REJECT", &format!("\"reason\":\"{}\"", issue));
+                                    }
+                                    continue;
+                                }
+                            }
+                            Err(error) => {
+                                oprintln!("  {} Rejecting optimized RTL: simulation error {}", "⚠".yellow(), error);
+                                if let Some(ref mut logger) = self.detail_logger {
+                                    logger.log("OPT", "SIM_REJECT", &format!("\"reason\":\"{}\"", error.replace('"', "'")));
+                                }
+                                continue;
+                            }
+                        }
+
                         oprintln!("  {} Optimized RTL received ({} lines), re-synthesizing...", "✓".green(), new_rtl.lines().count());
 
                         // Save updated RTL to workspace
@@ -8610,7 +9863,8 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
             .map_err(|e| format!("Failed to read gate-level netlist: {}", e))?;
 
         // Run formal verification using built-in checker
-        let equiv = engine::formal_check(rtl_code, &gate_code, module_name);
+        let equiv = engine::formal_check(rtl_code, &gate_code, module_name)
+            .map_err(|e| format!("Formal verification did not produce a proof verdict: {}", e))?;
 
         // Save result
         let (result_str, points_str) = build_formal_reports(equiv, rtl_code, &gate_code, module_name);
@@ -8657,6 +9911,44 @@ struct FormalPortInfo {
     name: String,
     msb: i32,
     lsb: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FormalVerdict {
+    Equivalent,
+    Different,
+}
+
+impl FormalVerdict {
+    fn from_report(report: &str) -> Option<Self> {
+        let upper = report.to_ascii_uppercase();
+        if upper.contains("FORMAL VERIFICATION: FAIL")
+            || upper.contains("RTL AND GATE-LEVEL NETLIST DIFFER")
+            || upper.contains("RTL != GATE-LEVEL")
+            || upper.contains("RTL VS GATE-LEVEL: DIFFERENT")
+        {
+            Some(Self::Different)
+        } else if upper.contains("FORMAL VERIFICATION: PASS")
+            || upper.contains("RTL AND GATE-LEVEL NETLIST ARE EQUIVALENT")
+            || upper.contains("RTL == GATE-LEVEL")
+            || upper.contains("RTL VS GATE-LEVEL: EQUIVALENT")
+        {
+            Some(Self::Equivalent)
+        } else {
+            None
+        }
+    }
+
+    fn is_equivalent(self) -> bool {
+        matches!(self, Self::Equivalent)
+    }
+
+    fn cli_label(self) -> &'static str {
+        match self {
+            Self::Equivalent => "EQUIVALENT",
+            Self::Different => "DIFFERENT",
+        }
+    }
 }
 
 fn build_timing_input(
@@ -8937,6 +10229,42 @@ fn estimate_timing_from_yosys(info: &SynthInfo, _module_name: &str) -> TimingRep
 
 /// Extract Verilog code from markdown code block
 pub fn extract_verilog(text: &str) -> Option<String> {
+    fn valid_module_start(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("module") else { return false; };
+        if !rest.starts_with(char::is_whitespace) {
+            return false;
+        }
+        let rest = rest.trim_start();
+        let name_len = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .map(|c| c.len_utf8())
+            .sum::<usize>();
+        if name_len == 0 {
+            return false;
+        }
+        let after = rest[name_len..].trim_start();
+        after.is_empty() || after.starts_with('(') || after.starts_with('#') || after.starts_with(';')
+    }
+
+    fn sanitize_candidate(code: &str) -> Option<String> {
+        if !code.lines().any(valid_module_start) {
+            return None;
+        }
+        let modules = extract_all_modules(code);
+        if modules.is_empty() {
+            return None;
+        }
+        let joined = modules
+            .into_iter()
+            .filter(|(_, module_code)| module_code.lines().next().map(valid_module_start).unwrap_or(false))
+            .map(|(_, module_code)| module_code)
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if joined.contains("endmodule") { Some(joined) } else { None }
+    }
+
     // Strategy 1: Try ```verilog ... ``` (with possible whitespace after tag)
     if let Some(start) = text.find("```verilog") {
         let code_start = start + "```verilog".len();
@@ -8948,8 +10276,8 @@ pub fn extract_verilog(text: &str) -> Option<String> {
         };
         if let Some(end) = text[actual_start..].find("```") {
             let code = text[actual_start..actual_start + end].trim().to_string();
-            if !code.is_empty() && (code.contains("module") || code.contains("endmodule") || code.contains("input") || code.contains("output")) {
-                return Some(code);
+            if let Some(clean) = sanitize_candidate(&code) {
+                return Some(clean);
             }
         }
     }
@@ -8965,8 +10293,8 @@ pub fn extract_verilog(text: &str) -> Option<String> {
             };
             if let Some(end) = text[actual_start..].find("```") {
                 let code = text[actual_start..actual_start + end].trim().to_string();
-                if !code.is_empty() && (code.contains("module") || code.contains("endmodule") || code.contains("input") || code.contains("output")) {
-                    return Some(code);
+                if let Some(clean) = sanitize_candidate(&code) {
+                    return Some(clean);
                 }
             }
         }
@@ -8985,43 +10313,19 @@ pub fn extract_verilog(text: &str) -> Option<String> {
         };
         if let Some(end) = text[actual_start..].find("```") {
             let code = text[actual_start..actual_start + end].trim().to_string();
-            // Check if this looks like Verilog code
-            if code.contains("module") || code.contains("endmodule") ||
-               (code.contains("input") && code.contains("output")) ||
-               code.contains("always") || code.contains("assign") {
-                return Some(code);
+            if let Some(clean) = sanitize_candidate(&code) {
+                return Some(clean);
             }
         }
         search_start = abs_start + 3;
         if search_start >= text.len() { break; }
     }
 
-    // Strategy 4: Try finding module...endmodule directly (no code block)
-    if let Some(start) = text.find("module ") {
-        // Find the endmodule that matches this module
-        let rest = &text[start..];
-        if let Some(end) = rest.find("endmodule") {
-            let code = rest[..end + "endmodule".len()].trim().to_string();
-            // Verify it's not inside a code block (already tried above)
-            if !code.starts_with("```") {
-                return Some(code);
-            }
-        }
-    }
-
-    // Strategy 5: Try finding module...endmodule with relaxed matching
-    // Handle cases where endmodule is on a new line with extra whitespace
-    if let Some(start) = text.find("module ") {
-        let rest = &text[start..];
-        // Look for "endmodule" with possible trailing whitespace/comment
-        for pattern in &["endmodule", "endmodule ", "endmodule\n", "endmodule//"] {
-            if let Some(end) = rest.find(pattern) {
-                let code = rest[..end + pattern.len()].trim().to_string();
-                if code.contains("module") && code.len() > 20 {
-                    return Some(code);
-                }
-            }
-        }
+    // Strategy 4: plain Verilog without fences. Only accept line-anchored,
+    // syntactically plausible module declarations, never prose containing
+    // words such as "module has a bug".
+    if let Some(clean) = sanitize_candidate(text) {
+        return Some(clean);
     }
 
     None
@@ -9399,8 +10703,10 @@ fn build_formal_reports(equivalent: bool, rtl_code: &str, gate_code: &str, modul
 
     points.push_str("\nVerification Method:\n");
     points.push_str("  - Port signature consistency check (name / direction / width)\n");
-    points.push_str("  - Built-in RTL vs gate-level equivalence check\n");
-    points.push_str("  - Functional compare on synthesized netlist under the formal engine\n");
+    points.push_str("  - Internal RTL vs gate-level equivalence engine\n");
+    points.push_str("  - Exhaustive combinational vectors where state space is bounded\n");
+    points.push_str("  - Bounded sequential vectors for clocked logic and enable/reset behavior\n");
+    points.push_str("  - No external commercial formal tool is invoked; failures trigger API-guided iteration\n");
 
     let headline = if equivalent {
         "Formal Verification: PASS - RTL and gate-level netlist are equivalent"
@@ -9430,10 +10736,30 @@ fn extract_all_modules(code: &str) -> Vec<(String, String)> {
             continue;
         }
 
-        // Check for module declaration (handle various formats)
-        let is_module_start = trimmed.starts_with("module ") ||
-                              trimmed.starts_with("module\t") ||
-                              (trimmed.starts_with("module") && trimmed.len() > 6 && trimmed.as_bytes()[6] == b' ');
+        // Check for a real module declaration. Prose like "module has a bug"
+        // must not be treated as RTL during LLM auto-fix extraction.
+        let is_module_start = {
+            if let Some(rest) = trimmed.strip_prefix("module") {
+                if !rest.starts_with(char::is_whitespace) {
+                    false
+                } else {
+                let rest = rest.trim_start();
+                let name_len = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .map(|c| c.len_utf8())
+                    .sum::<usize>();
+                if name_len == 0 {
+                    false
+                } else {
+                    let after = rest[name_len..].trim_start();
+                    after.is_empty() || after.starts_with('(') || after.starts_with('#') || after.starts_with(';')
+                }
+                }
+            } else {
+                false
+            }
+        };
 
         if is_module_start {
             // Extract module name
@@ -9901,9 +11227,9 @@ fn print_power_report(info: &SynthInfo, constraint_freq: i32, max_freq: Option<i
 }
 
 /// Print design quality score card
-fn cap_max_frequency(max_freq: i32, info: &SynthInfo) -> i32 {
-    let comb_cells = info.cell_count.saturating_sub(info.dff_count);
-    if info.logic_depth <= 1 && comb_cells == 0 && max_freq > 2000 {
+fn cap_max_frequency_with_profile(max_freq: i32, logic_depth: usize, cell_count: usize, dff_count: usize) -> i32 {
+    let comb_cells = cell_count.saturating_sub(dff_count);
+    if logic_depth <= 1 && comb_cells == 0 && max_freq > 2000 {
         2000
     } else if max_freq > 5000 {
         5000
@@ -9912,12 +11238,19 @@ fn cap_max_frequency(max_freq: i32, info: &SynthInfo) -> i32 {
     }
 }
 
+fn cap_max_frequency(max_freq: i32, info: &SynthInfo) -> i32 {
+    cap_max_frequency_with_profile(max_freq, info.logic_depth, info.cell_count, info.dff_count)
+}
+
 /// Print flow summary tables at end of flow
 fn print_flow_summary_tables(info: &SynthInfo, constraint_mhz: i32, max_freq_mhz: i32,
                               sim_passed: Option<bool>, lint_passed: bool,
                               timing: Option<&TimingReport>,
                               formal_ok: Option<bool>,
-                              corner_timings: Option<&[(LibCorner, TimingReport)]>) {
+                              corner_timings: Option<&[(LibCorner, TimingReport)]>,
+                              constraint_corner_powers: Option<&[CornerPowerResult]>,
+                              max_corner_powers: Option<&[CornerPowerResult]>,
+                              synthesis_corner: Option<&LibCorner>) {
     oprintln!();
     oprintln!("{}", "=============================== FLOW SUMMARY TABLES ===============================".bright_cyan().bold());
     oprintln!();
@@ -10053,9 +11386,15 @@ fn print_flow_summary_tables(info: &SynthInfo, constraint_mhz: i32, max_freq_mhz
     // === 4. POWER ANALYSIS ===
     oprintln!("  {}:", "4. POWER ANALYSIS".bright_cyan().bold());
     let max_ghz = max_freq_mhz as f64 / 1000.0;
+    let selected_constraint_power = select_report_power(constraint_corner_powers, synthesis_corner);
+    let selected_max_power = select_report_power(max_corner_powers, synthesis_corner);
+    let worst_constraint_power = worst_report_power(constraint_corner_powers);
+    let worst_max_power = worst_report_power(max_corner_powers);
     if !info.cells.is_empty() {
         oprintln!("  {:<30} {:>10} {:>12} {:>12} {:>12}", "Cell Type", "Count", "Static(uW)", "Dyn(uW)", "Total(uW)");
         oprintln!("  {:-<30} {:-<10} {:-<12} {:-<12} {:-<12}", "", "", "", "", "");
+        let have_real_constraint_power = selected_constraint_power.is_some();
+        let have_real_max_power = selected_max_power.is_some();
         let mut c_static = 0.0;
         let mut c_dynamic = 0.0;
         for (ct, cnt) in &info.cells {
@@ -10065,22 +11404,76 @@ fn print_flow_summary_tables(info: &SynthInfo, constraint_mhz: i32, max_freq_mhz
             c_dynamic += dp;
             oprintln!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}", ct, cnt.to_string(), sp, dp, sp + dp);
         }
-        oprintln!("  {:-<30} {:-<10} {:-<12} {:-<12} {:-<12}", "", "", "", "", "");
-        oprintln!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}", "Subtotal @ Constraint", "", c_static, c_dynamic, c_static + c_dynamic);
+        let fallback_total = c_static + c_dynamic;
+        let mut fallback_max_static = 0.0;
+        let mut fallback_max_dynamic = 0.0;
         if max_freq_mhz > 0 && max_freq_mhz != constraint_mhz {
-            let mut m_static = 0.0;
-            let mut m_dynamic = 0.0;
             for (ct, cnt) in &info.cells {
-                m_static += get_static_power(ct) * *cnt as f64;
-                m_dynamic += get_dynamic_power(ct) * *cnt as f64 * max_ghz;
+                fallback_max_static += get_static_power(ct) * *cnt as f64;
+                fallback_max_dynamic += get_dynamic_power(ct) * *cnt as f64 * max_ghz;
             }
-            oprintln!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}", "Subtotal @ Max Freq", "", m_static, m_dynamic, m_static + m_dynamic);
         }
-        let total = c_static + c_dynamic;
+        let fallback_max_total = fallback_max_static + fallback_max_dynamic;
+        let (total, total_static, total_dynamic) = selected_constraint_power
+            .map(|result| (
+                result.power.total_power_uw,
+                result.power.static_power_uw,
+                result.power.dynamic_power_uw,
+            ))
+            .unwrap_or((fallback_total, c_static, c_dynamic));
+        let (max_total, max_static, max_dynamic) = selected_max_power
+            .map(|result| (
+                result.power.total_power_uw,
+                result.power.static_power_uw,
+                result.power.dynamic_power_uw,
+            ))
+            .unwrap_or((fallback_max_total, fallback_max_static, fallback_max_dynamic));
+        oprintln!("  {:-<30} {:-<10} {:-<12} {:-<12} {:-<12}", "", "", "", "", "");
+        if !have_real_constraint_power {
+            oprintln!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}", "Fallback Est. @ Constraint", "", c_static, c_dynamic, fallback_total);
+        }
+        if !have_real_max_power && max_freq_mhz > 0 && max_freq_mhz != constraint_mhz {
+            oprintln!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}", "Fallback Est. @ Max Freq", "", fallback_max_static, fallback_max_dynamic, fallback_max_total);
+        }
+        if let Some(result) = selected_constraint_power {
+            oprintln!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}",
+                format!("Liberty {} @ Constr.", shorten_table_text(&result.corner.short_name, 14)),
+                "corner",
+                result.power.static_power_uw,
+                result.power.dynamic_power_uw,
+                result.power.total_power_uw);
+        }
+        if let Some(result) = selected_max_power {
+            oprintln!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}",
+                format!("Liberty {} @ Max", shorten_table_text(&result.corner.short_name, 18)),
+                "corner",
+                result.power.static_power_uw,
+                result.power.dynamic_power_uw,
+                result.power.total_power_uw);
+        }
+        if let Some(result) = worst_constraint_power {
+            oprintln!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}",
+                format!("Worst {} @ Constr.", shorten_table_text(&result.corner.short_name, 17)),
+                "corner",
+                result.power.static_power_uw,
+                result.power.dynamic_power_uw,
+                result.power.total_power_uw);
+        }
+        if let Some(result) = worst_max_power {
+            oprintln!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}",
+                format!("Worst {} @ Max", shorten_table_text(&result.corner.short_name, 21)),
+                "corner",
+                result.power.static_power_uw,
+                result.power.dynamic_power_uw,
+                result.power.total_power_uw);
+        }
         let energy_per_cycle = if constraint_mhz > 0 { total / constraint_mhz as f64 * 1e-3 } else { 0.0 };
-        let s_d_ratio = if c_dynamic > 0.0 { c_static / c_dynamic * 100.0 } else { 0.0 };
+        let s_d_ratio = if total_dynamic > 0.0 { total_static / total_dynamic * 100.0 } else { 0.0 };
         let power_density = if info.area_ge > 0.0 { total / info.area_ge } else { 0.0 };
-        oprintln!("  {:<30} {:>10.2} {:>12} {:>12} {:>12}", "Total @ Constraint", total, "uW", "", "");
+        oprintln!("  {:<30} {:>10.2} {:>12} {:>12} {:>12}", "Selected @ Constraint", total, "uW", "", "");
+        if max_freq_mhz > 0 && max_freq_mhz != constraint_mhz {
+            oprintln!("  {:<30} {:>10.2} {:>12} {:>12} {:>12}", "Selected @ Max Freq", max_total, "uW", "", "");
+        }
         oprintln!("  {:<30} {:>10.4} {:>12} {:>12} {:>12}", "Energy/Cycle", energy_per_cycle, "nJ", "", "");
         oprintln!("  {:<30} {:>10.1} {:>12} {:>12} {:>12}", "S/D Ratio", s_d_ratio, "%", "", "");
         oprintln!("  {:<30} {:>10.2} {:>12} {:>12} {:>12}", "Power Density", power_density, "uW/GE", "", "");
@@ -10454,6 +11847,15 @@ fn parse_timing_report_paths(report: &str) -> Vec<CriticalPathInfo> {
         paths.push(path);
     }
 
+    for path in &mut paths {
+        if path.available
+            && path.startpoint == path.endpoint
+            && path.total_delay_ns.abs() < 1.0e-12
+        {
+            path.available = false;
+        }
+    }
+
     paths.sort_by(|a, b| {
         if a.available != b.available {
             return b.available.cmp(&a.available);
@@ -10590,12 +11992,20 @@ fn print_timing_report(timing: &TimingReport) {
 }
 
 fn normalize_timing_report(mut timing: TimingReport, clock_period_ns: f64) -> TimingReport {
-    if clock_period_ns <= 0.0 || (timing.required_time_ns <= 1.0e12 && timing.slack_ns <= 1.0e12) {
+    let report_has_unbounded_slack = timing.report.contains("1e+18")
+        || timing.report.contains("1000000000000000000");
+    if clock_period_ns <= 0.0
+        || (!report_has_unbounded_slack
+            && timing.required_time_ns <= 1.0e12
+            && timing.slack_ns <= 1.0e12)
+    {
         return timing;
     }
 
-    timing.required_time_ns = clock_period_ns;
-    timing.slack_ns = (clock_period_ns - timing.arrival_time_ns).max(0.0);
+    if timing.required_time_ns > 1.0e12 || timing.slack_ns > 1.0e12 {
+        timing.required_time_ns = clock_period_ns;
+        timing.slack_ns = (clock_period_ns - timing.arrival_time_ns).max(0.0);
+    }
 
     let mut lines = Vec::new();
     let mut current_path_delay = 0.0f64;
@@ -10628,18 +12038,79 @@ fn normalize_timing_report(mut timing: TimingReport, clock_period_ns: f64) -> Ti
 
 /// Generate a consolidated report file (report/report.rpt)
 /// Produces a comprehensive, professionally formatted report matching CLI output detail
-fn generate_report_rpt(project_dir: &Path, mod_name: &str, synth_info: &SynthInfo,
+fn select_report_power<'a>(
+    powers: Option<&'a [CornerPowerResult]>,
+    synthesis_corner: Option<&LibCorner>,
+) -> Option<&'a CornerPowerResult> {
+    let items = powers?;
+    if items.is_empty() {
+        return None;
+    }
+    if let Some(synth_corner) = synthesis_corner {
+        if let Some(result) = items.iter().find(|result| {
+            result.corner.process == synth_corner.process
+                && result.corner.short_name == synth_corner.short_name
+        }) {
+            return Some(result);
+        }
+        if let Some(result) = items
+            .iter()
+            .find(|result| result.corner.file_path == synth_corner.file_path)
+        {
+            return Some(result);
+        }
+    }
+    items
+        .iter()
+        .find(|result| result.corner.corner_type == CornerType::TT)
+        .or_else(|| items.first())
+}
+
+fn worst_report_power(powers: Option<&[CornerPowerResult]>) -> Option<&CornerPowerResult> {
+    powers?.iter().max_by(|a, b| {
+        a.power
+            .total_power_uw
+            .partial_cmp(&b.power.total_power_uw)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+fn report_power_point_json(result: Option<&CornerPowerResult>, freq_mhz: i32) -> serde_json::Value {
+    result
+        .map(|result| {
+            serde_json::json!({
+                "frequency_mhz": freq_mhz,
+                "technology": result.corner.process,
+                "corner": result.corner.short_name,
+                "type": result.corner.corner_type.to_string(),
+                "voltage": result.corner.voltage,
+                "temperature_c": result.corner.temperature,
+                "static_uw": result.power.static_power_uw,
+                "dynamic_uw": result.power.dynamic_power_uw,
+                "internal_uw": result.power.internal_power_uw,
+                "switching_uw": result.power.switching_power_uw,
+                "clock_uw": result.power.clock_power_uw,
+                "leakage_uw": result.power.leakage_power_uw,
+                "total_uw": result.power.total_power_uw
+            })
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn generate_report_rpt_with_extras(project_dir: &Path, mod_name: &str, synth_info: &SynthInfo,
                         timing: Option<&TimingReport>, power_info: Option<String>,
                         constraint_mhz: i32, max_freq: i32, freq_ratio: f64,
                         llm_decision: &str,
                         scan_results: Option<&[TimingReport]>,
                         corner_timings: Option<&[(LibCorner, TimingReport)]>,
-                        sim_passed: Option<bool>, lint_passed: bool, formal_ok: Option<bool>) -> std::io::Result<()> {
+                        sim_passed: Option<bool>, lint_passed: bool, formal_ok: Option<bool>,
+                        extras: ReportExtras<'_>) -> std::io::Result<()> {
     let report_dir = project_dir.join("report");
     fs::create_dir_all(&report_dir)?;
     let rpt_path = report_dir.join("report.rpt");
 
     let mut rpt = String::new();
+    let generated_at = chrono_simple();
     let critical_paths = timing
         .map(|t| parse_timing_report_paths(&t.report))
         .unwrap_or_default();
@@ -10647,16 +12118,57 @@ fn generate_report_rpt(project_dir: &Path, mod_name: &str, synth_info: &SynthInf
 
     let comb_cells = synth_info.cell_count.saturating_sub(synth_info.dff_count);
     let constraint_ghz = constraint_mhz as f64 / 1000.0;
+    let active_technology = extras.technology
+        .or_else(|| extras.synthesis_corner.map(|corner| corner.process.as_str()))
+        .or_else(|| corner_timings.and_then(|corners| corners.first().map(|(corner, _)| corner.process.as_str())));
+    let synthesis_corner_name = extras.synthesis_corner
+        .map(|corner| corner.short_name.as_str())
+        .or_else(|| corner_timings.and_then(|corners| corners.first().map(|(corner, _)| corner.short_name.as_str())));
+    let flow_decision = extras.final_llm_decision.unwrap_or(llm_decision);
+    let has_multi_corner = corner_timings.map(|corners| !corners.is_empty()).unwrap_or(false);
+    let selected_constraint_power =
+        select_report_power(extras.constraint_corner_powers, extras.synthesis_corner);
+    let selected_max_power = select_report_power(extras.max_corner_powers, extras.synthesis_corner);
+    let worst_constraint_power = worst_report_power(extras.constraint_corner_powers);
+    let worst_max_power = worst_report_power(extras.max_corner_powers);
+
+    let format_corner_power_table = |label: &str, freq_mhz: i32, powers: &[CornerPowerResult]| -> String {
+        let corner_width = powers.iter()
+            .map(|result| result.corner.short_name.len())
+            .max()
+            .unwrap_or(6)
+            .max(30);
+        let mut table = String::new();
+        table.push_str(&format!("  {} ({} MHz)\n", label, freq_mhz));
+        table.push_str(&format!("  {:<corner_width$} {:>10} {:>10} {:>10} {:>10} {:>10}\n", "Corner", "Type", "Voltage", "Static", "Dynamic", "Total"));
+        table.push_str(&format!("  {:-<corner_width$} {:-<10} {:-<10} {:-<10} {:-<10} {:-<10}\n", "", "", "", "", "", ""));
+        for result in powers {
+            table.push_str(&format!(
+                "  {:<corner_width$} {:>10} {:>10} {:>10.1} {:>10.1} {:>10.1}\n",
+                result.corner.short_name,
+                result.corner.corner_type,
+                format!("{}V", result.corner.voltage),
+                result.power.static_power_uw,
+                result.power.dynamic_power_uw,
+                result.power.total_power_uw,
+            ));
+        }
+        table
+    };
 
     // ════════════════════════════════════════════════════════════════════════════
     // HEADER
     // ════════════════════════════════════════════════════════════════════════════
     rpt.push_str(&format!("\n{}", "=" .repeat(78)));
-    rpt.push_str(&format!("\n{:^78}\n", format!("AI Digital v0.6.7 — Real NLDM Synthesis & STA Report")));
+    rpt.push_str(&format!("\n{:^78}\n", format!("AI Digital v0.6.8 — Real NLDM Synthesis & STA Report")));
     rpt.push_str(&format!("{}\n", "=".repeat(78)));
-    rpt.push_str(&format!("  Module: {}  |  Generated: {}\n", mod_name, chrono_simple()));
+    rpt.push_str(&format!("  Module: {}  |  Generated: {}\n", mod_name, generated_at));
     rpt.push_str(&format!("  Constraint: {} MHz  |  Max Achievable: {} MHz  |  Ratio: {:.1}x\n", constraint_mhz, max_freq, freq_ratio));
-    rpt.push_str(&format!("  Flow Decision: {}\n", llm_decision));
+    rpt.push_str(&format!("  Flow Decision: {}\n", flow_decision));
+    if let Some(tech) = active_technology {
+        rpt.push_str(&format!("  Technology: {}{}\n", tech,
+            synthesis_corner_name.map(|corner| format!("  |  Synthesis Corner: {}", corner)).unwrap_or_default()));
+    }
     rpt.push_str(&format!("\n"));
 
     // ════════════════════════════════════════════════════════════════════════════
@@ -10794,27 +12306,11 @@ fn generate_report_rpt(project_dir: &Path, mod_name: &str, synth_info: &SynthInf
             }
             rpt.push_str(&format!("\n"));
 
-            // Max frequency per-corner (scan from constraint freq to max_freq, check each corner)
-            rpt.push_str(&format!("--- PER-CORNER TIMING @ MAX FREQ {} MHz ---\n", max_freq));
-            rpt.push_str(&format!("  {:<30} {:>10} {:>10} {:>10} {:>10} {:>10}\n", "Corner", "Voltage", "Temp", "Arr(ns)", "Slack(ns)", "Status"));
-            rpt.push_str(&format!("  {:-<30} {:-<10} {:-<10} {:-<10} {:-<10} {:-<10}\n", "", "", "", "", "", ""));
-            let max_period = if max_freq > 0 { 1000.0 / max_freq as f64 } else { 10.0 };
-            for (corner, _) in corners {
-                // Use the corner's timing data scaled to max_freq by using the existing report
-                // We just use the timing data passed in - it's already at constraint frequency
-                // For a real max-frequency report, we'd need scan results per corner
-                let ct = corner_timings.map(|c| c.iter().find(|(co, _)| co.short_name == corner.short_name).map(|(_, t)| t)).flatten();
-                if let Some(ct) = ct {
-                    let cs = "---";
-                    let scaled_arrival = ct.arrival_time_ns * (constraint_mhz as f64 / max_freq as f64);
-                    let scaled_slack = (1000.0 / max_freq as f64) - ct.arrival_time_ns;
-                    let mcs = if scaled_slack >= 0.0 { "MET" } else { "VIO" };
-                    rpt.push_str(&format!("  {:<30} {:>10.2} {:>10.0}C {:>10.2} {:>10.2} {:>10}\n",
-                        corner.short_name, corner.voltage, corner.temperature,
-                        scaled_arrival, scaled_slack, mcs));
-                }
+            if max_freq > 0 && max_freq != constraint_mhz {
+                rpt.push_str(&format!("--- PER-CORNER TIMING @ MAX FREQ {} MHz ---\n", max_freq));
+                rpt.push_str("  Exact per-corner max-frequency re-analysis is emitted by the interactive flow.\n");
+                rpt.push_str("  This static report intentionally omits derived estimates here to avoid misreporting corner timing.\n\n");
             }
-            rpt.push_str(&format!("\n"));
         }
     }
 
@@ -10825,49 +12321,145 @@ fn generate_report_rpt(project_dir: &Path, mod_name: &str, synth_info: &SynthInf
     let max_ghz = max_freq as f64 / 1000.0;
     rpt.push_str(&format!("  {:<30} {:>10} {:>12} {:>12} {:>12}\n", "Cell Type", "Count", "Static(uW)", "Dyn(uW)", "Total(uW)"));
     rpt.push_str(&format!("  {:-<30} {:-<10} {:->12} {:->12} {:->12}\n", "", "", "", "", ""));
-    let mut p_static = 0.0;
-    let mut p_dynamic = 0.0;
+    let mut fallback_static = 0.0;
+    let mut fallback_dynamic = 0.0;
     for (ct, cnt) in &synth_info.cells {
         let sp = get_static_power(ct) * *cnt as f64;
         let dp = get_dynamic_power(ct) * *cnt as f64 * constraint_ghz;
-        p_static += sp;
-        p_dynamic += dp;
+        fallback_static += sp;
+        fallback_dynamic += dp;
         rpt.push_str(&format!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}\n", ct, cnt, sp, dp, sp + dp));
     }
-    rpt.push_str(&format!("  {:-<30} {:-<10} {:->12} {:->12} {:->12}\n", "", "", "", "", ""));
-    rpt.push_str(&format!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}\n", "Subtotal @ Constraint", "", p_static, p_dynamic, p_static + p_dynamic));
-    if max_freq > 0 && max_freq != constraint_mhz {
-        let mut m_static = 0.0;
-        let mut m_dynamic = 0.0;
+    let fallback_total = fallback_static + fallback_dynamic;
+    let mut fallback_max_static = 0.0;
+    let mut fallback_max_dynamic = 0.0;
+    if max_freq > 0 {
         for (ct, cnt) in &synth_info.cells {
-            m_static += get_static_power(ct) * *cnt as f64;
-            m_dynamic += get_dynamic_power(ct) * *cnt as f64 * max_ghz;
+            fallback_max_static += get_static_power(ct) * *cnt as f64;
+            fallback_max_dynamic += get_dynamic_power(ct) * *cnt as f64 * max_ghz;
         }
-        rpt.push_str(&format!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}\n", "Subtotal @ Max Freq", "", m_static, m_dynamic, m_static + m_dynamic));
     }
-    let total_p = p_static + p_dynamic;
-    let max_total_p = if max_freq > 0 {
-        let mut ms = 0.0; let mut md = 0.0;
-        for (ct, cnt) in &synth_info.cells { ms += get_static_power(ct) * *cnt as f64; md += get_dynamic_power(ct) * *cnt as f64 * max_ghz; }
-        ms + md
-    } else { total_p };
+    let fallback_max_total = if max_freq > 0 {
+        fallback_max_static + fallback_max_dynamic
+    } else {
+        fallback_total
+    };
+    let (p_static, p_dynamic, total_p, power_source) = selected_constraint_power
+        .map(|result| {
+            (
+                result.power.static_power_uw,
+                result.power.dynamic_power_uw,
+                result.power.total_power_uw,
+                format!("liberty_corner:{}", result.corner.short_name),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                fallback_static,
+                fallback_dynamic,
+                fallback_total,
+                "fallback_cell_estimate".to_string(),
+            )
+        });
+    let (max_static_p, max_dynamic_p, max_total_p, max_power_source) = selected_max_power
+        .map(|result| {
+            (
+                result.power.static_power_uw,
+                result.power.dynamic_power_uw,
+                result.power.total_power_uw,
+                format!("liberty_corner:{}", result.corner.short_name),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                fallback_max_static,
+                fallback_max_dynamic,
+                fallback_max_total,
+                "fallback_cell_estimate".to_string(),
+            )
+        });
+    rpt.push_str(&format!("  {:-<30} {:-<10} {:->12} {:->12} {:->12}\n", "", "", "", "", ""));
+    if selected_constraint_power.is_none() {
+        rpt.push_str(&format!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}\n", "Fallback Est. @ Constraint", "", fallback_static, fallback_dynamic, fallback_total));
+    }
+    if selected_max_power.is_none() && max_freq > 0 && max_freq != constraint_mhz {
+        rpt.push_str(&format!("  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}\n", "Fallback Est. @ Max Freq", "", fallback_max_static, fallback_max_dynamic, fallback_max_total));
+    }
+    if let Some(result) = selected_constraint_power {
+        rpt.push_str(&format!(
+            "  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}\n",
+            format!("Liberty {} @ Constr.", shorten_table_text(&result.corner.short_name, 14)),
+            "corner",
+            result.power.static_power_uw,
+            result.power.dynamic_power_uw,
+            result.power.total_power_uw
+        ));
+    }
+    if let Some(result) = selected_max_power {
+        rpt.push_str(&format!(
+            "  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}\n",
+            format!("Liberty {} @ Max", shorten_table_text(&result.corner.short_name, 18)),
+            "corner",
+            result.power.static_power_uw,
+            result.power.dynamic_power_uw,
+            result.power.total_power_uw
+        ));
+    }
+    if let Some(result) = worst_constraint_power {
+        rpt.push_str(&format!(
+            "  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}\n",
+            format!("Worst {} @ Constr.", shorten_table_text(&result.corner.short_name, 17)),
+            "corner",
+            result.power.static_power_uw,
+            result.power.dynamic_power_uw,
+            result.power.total_power_uw
+        ));
+    }
+    if let Some(result) = worst_max_power {
+        rpt.push_str(&format!(
+            "  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}\n",
+            format!("Worst {} @ Max", shorten_table_text(&result.corner.short_name, 21)),
+            "corner",
+            result.power.static_power_uw,
+            result.power.dynamic_power_uw,
+            result.power.total_power_uw
+        ));
+    }
     let energy_pc = if constraint_mhz > 0 { total_p / constraint_mhz as f64 * 1e-3 } else { 0.0 };
     let sd_ratio = if p_dynamic > 0.0 { p_static / p_dynamic * 100.0 } else { 0.0 };
     let pdens = if synth_info.area_ge > 0.0 { total_p / synth_info.area_ge } else { 0.0 };
-    rpt.push_str(&format!("  {:<30} {:>10.2} {:>12} {:>12} {:>12}\n", "Total @ Constraint", total_p, "uW", "", ""));
+    rpt.push_str(&format!("  {:<30} {:>10.2} {:>12} {:>12} {:>12}\n", "Selected @ Constraint", total_p, "uW", "", ""));
     if max_freq > 0 {
-        rpt.push_str(&format!("  {:<30} {:>10.2} {:>12} {:>12} {:>12}\n", "Total @ Max Freq", max_total_p, "uW", "", ""));
+        rpt.push_str(&format!("  {:<30} {:>10.2} {:>12} {:>12} {:>12}\n", "Selected @ Max Freq", max_total_p, "uW", "", ""));
     }
     rpt.push_str(&format!("  {:<30} {:>10.4} {:>12} {:>12} {:>12}\n", "Energy/Cycle", energy_pc, "nJ", "", ""));
     rpt.push_str(&format!("  {:<30} {:>10.1} {:>12} {:>12} {:>12}\n", "S/D Ratio", sd_ratio, "%", "", ""));
     rpt.push_str(&format!("  {:<30} {:>10.2} {:>12} {:>12} {:>12}\n", "Power Density", pdens, "uW/GE", "", ""));
     rpt.push_str(&format!("\n"));
+    let mut wrote_corner_power_detail = false;
     if let Some(power_text) = power_info.as_ref() {
         let trimmed = power_text.trim();
         if !trimmed.is_empty() {
             rpt.push_str("--- PER-CORNER POWER ---\n");
             rpt.push_str(trimmed);
             rpt.push_str("\n\n");
+            wrote_corner_power_detail = true;
+        }
+    }
+    if !wrote_corner_power_detail {
+        if let Some(powers) = extras.constraint_corner_powers {
+            if !powers.is_empty() {
+                rpt.push_str("--- PER-CORNER POWER @ CONSTRAINT ---\n");
+                rpt.push_str(&format_corner_power_table("Multi-Corner Power Analysis", constraint_mhz, powers));
+                rpt.push_str("\n");
+            }
+        }
+        if let Some(powers) = extras.max_corner_powers {
+            if !powers.is_empty() {
+                rpt.push_str("--- PER-CORNER POWER @ MAX FREQUENCY ---\n");
+                rpt.push_str(&format_corner_power_table("Max Frequency Power", max_freq, powers));
+                rpt.push_str("\n");
+            }
         }
     }
 
@@ -10927,8 +12519,13 @@ fn generate_report_rpt(project_dir: &Path, mod_name: &str, synth_info: &SynthInf
     rpt.push_str(&format!("  {:<30} {:>14}\n", "Max Achievable", format!("{} MHz", max_freq)));
     let lib_display = if synth_info.lib_name.is_empty() { "none (GE estimation)" } else { &synth_info.lib_name };
     rpt.push_str(&format!("  {:<30} {:>14}\n", "Liberty Library", lib_display));
-    rpt.push_str(&format!("  {:<30} {:>14}\n", "Multi-Corner", if synth_info.area_from_lib { "enabled" } else { "disabled" }));
-    rpt.push_str(&format!("  {:<30} {:>14}\n", "Tool Version", "AI Digital v0.6.7"));
+    rpt.push_str(&format!("  {:<30} {:>14}\n", "Technology", active_technology.unwrap_or("unknown")));
+    rpt.push_str(&format!("  {:<30} {:>14}\n", "Synthesis Corner", synthesis_corner_name.unwrap_or("unknown")));
+    rpt.push_str(&format!("  {:<30} {:>14}\n", "Multi-Corner", if has_multi_corner { "enabled" } else { "disabled" }));
+    if let Some(corners) = corner_timings {
+        rpt.push_str(&format!("  {:<30} {:>14}\n", "Corner Count", corners.len()));
+    }
+    rpt.push_str(&format!("  {:<30} {:>14}\n", "Tool Version", "AI Digital v0.6.8"));
     rpt.push_str(&format!("\n\n"));
 
     rpt.push_str("  See report.json for machine-readable data.\n");
@@ -10966,14 +12563,127 @@ fn generate_report_rpt(project_dir: &Path, mod_name: &str, synth_info: &SynthInf
             "stages": stages_json
         })
     }).collect::<Vec<_>>();
+    let scan_results_json = scan_results
+        .map(|results| {
+            results.iter().map(|t| serde_json::json!({
+                "clock_period_ns": t.clock_period_ns,
+                "freq_mhz": if t.clock_period_ns > 0.0 { 1000.0 / t.clock_period_ns } else { 0.0 },
+                "arrival_time_ns": t.arrival_time_ns,
+                "required_time_ns": t.required_time_ns,
+                "slack_ns": t.slack_ns,
+                "timing_met": t.timing_met
+            })).collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let corner_timings_json = corner_timings
+        .map(|corners| {
+            corners.iter().map(|(corner, t)| serde_json::json!({
+                "technology": corner.process,
+                "corner": corner.short_name,
+                "lib_name": corner.lib_name,
+                "type": corner.corner_type.to_string(),
+                "rc_type": corner.rc_type,
+                "voltage": corner.voltage,
+                "temperature_c": corner.temperature,
+                "cell_count": corner.cell_count,
+                "clock_period_ns": t.clock_period_ns,
+                "arrival_time_ns": t.arrival_time_ns,
+                "required_time_ns": t.required_time_ns,
+                "slack_ns": t.slack_ns,
+                "timing_met": t.timing_met,
+                "liberty_path": corner.file_path.to_string_lossy().to_string()
+            })).collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let corner_power_json = |powers: Option<&[CornerPowerResult]>, freq_mhz: i32| {
+        powers
+            .map(|items| {
+                items.iter().map(|result| serde_json::json!({
+                    "frequency_mhz": freq_mhz,
+                    "technology": result.corner.process,
+                    "corner": result.corner.short_name,
+                    "type": result.corner.corner_type.to_string(),
+                    "voltage": result.corner.voltage,
+                    "temperature_c": result.corner.temperature,
+                    "static_uw": result.power.static_power_uw,
+                    "dynamic_uw": result.power.dynamic_power_uw,
+                    "internal_uw": result.power.internal_power_uw,
+                    "switching_uw": result.power.switching_power_uw,
+                    "clock_uw": result.power.clock_power_uw,
+                    "leakage_uw": result.power.leakage_power_uw,
+                    "total_uw": result.power.total_power_uw
+                })).collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let synthesis_corner_json = extras.synthesis_corner.map(|corner| serde_json::json!({
+        "technology": corner.process,
+        "corner": corner.short_name,
+        "lib_name": corner.lib_name,
+        "type": corner.corner_type.to_string(),
+        "rc_type": corner.rc_type,
+        "voltage": corner.voltage,
+        "temperature_c": corner.temperature,
+        "liberty_path": corner.file_path.to_string_lossy().to_string()
+    }));
+    let power_json = serde_json::json!({
+        "constraint_mhz": constraint_mhz,
+        "source": power_source.clone(),
+        "max_freq_source": max_power_source.clone(),
+        "static_uw": p_static,
+        "dynamic_uw": p_dynamic,
+        "total_uw": total_p,
+        "max_freq_static_uw": max_static_p,
+        "max_freq_dynamic_uw": max_dynamic_p,
+        "max_freq_total_uw": max_total_p,
+        "fallback_static_uw": fallback_static,
+        "fallback_dynamic_uw": fallback_dynamic,
+        "fallback_total_uw": fallback_total,
+        "fallback_max_freq_total_uw": fallback_max_total,
+        "selected_constraint_corner": report_power_point_json(selected_constraint_power, constraint_mhz),
+        "selected_max_corner": report_power_point_json(selected_max_power, max_freq),
+        "worst_constraint_corner": report_power_point_json(worst_constraint_power, constraint_mhz),
+        "worst_max_corner": report_power_point_json(worst_max_power, max_freq),
+        "detail": power_info,
+        "constraint_corner_results": corner_power_json(extras.constraint_corner_powers, constraint_mhz),
+        "max_corner_results": corner_power_json(extras.max_corner_powers, max_freq)
+    });
+    let verification_json = serde_json::json!({
+        "lint": lint_passed,
+        "simulation": sim_passed,
+        "formal": formal_ok,
+        "formal_method": "structural port equivalence plus built-in bounded/exhaustive functional vector comparison",
+        "formal_report": extras.formal_report
+    });
+    let quality_json = serde_json::json!({
+        "score": ((quality_score * 10.0_f64).round() / 10.0),
+        "grade": grade,
+        "area_score": area_score,
+        "timing_score": timing_score,
+        "power_score": power_score,
+        "depth_score": depth_score
+    });
+    let timing_json = timing.map(|t| serde_json::json!({
+        "clock_period_ns": t.clock_period_ns,
+        "arrival_time_ns": t.arrival_time_ns,
+        "required_time_ns": t.required_time_ns,
+        "slack_ns": t.slack_ns,
+        "timing_met": t.timing_met,
+        "report": t.report,
+        "critical_paths": critical_paths_json
+    }));
     let json = serde_json::json!({
-        "version": "0.6.7",
-        "timestamp": chrono_simple(),
+        "version": "0.6.8",
+        "timestamp": generated_at,
         "module": mod_name,
         "constraint_mhz": constraint_mhz,
         "max_freq_mhz": max_freq,
         "freq_ratio": (freq_ratio * 100.0).round() / 100.0,
-        "llm_decision": llm_decision,
+        "llm_decision": flow_decision,
+        "technology": active_technology,
+        "synthesis_corner": synthesis_corner_json,
+        "corner_count": corner_timings.map(|corners| corners.len()).unwrap_or(0),
+        "multi_corner": has_multi_corner,
         "cell_count": synth_info.cell_count,
         "dff_count": synth_info.dff_count,
         "wire_count": synth_info.wire_count,
@@ -10984,35 +12694,123 @@ fn generate_report_rpt(project_dir: &Path, mod_name: &str, synth_info: &SynthInf
         "lib_name": synth_info.lib_name,
         "logic_depth": synth_info.logic_depth,
         "cells": cells_json,
-        "power": {
-            "constraint_mhz": constraint_mhz,
-            "static_uw": p_static,
-            "dynamic_uw": p_dynamic,
-            "total_uw": total_p,
-            "max_freq_total_uw": max_total_p,
-            "detail": power_info
-        },
-        "quality": {
-            "score": ((quality_score * 10.0_f64).round() / 10.0),
-            "grade": grade,
-            "area_score": area_score,
-            "timing_score": timing_score,
-            "power_score": power_score,
-            "depth_score": depth_score
-        },
-        "timing": timing.map(|t| serde_json::json!({
-            "clock_period_ns": t.clock_period_ns,
-            "arrival_time_ns": t.arrival_time_ns,
-            "required_time_ns": t.required_time_ns,
-            "slack_ns": t.slack_ns,
-            "timing_met": t.timing_met,
-            "report": t.report,
-            "critical_paths": critical_paths_json
-        })),
+        "power": power_json,
+        "verification": verification_json,
+        "quality": quality_json,
+        "timing": timing_json,
+        "timing_scan": scan_results_json,
+        "corner_timings": corner_timings_json,
     });
     fs::write(&json_path, serde_json::to_string_pretty(&json)?)?;
 
+    let md_path = project_dir.join("REPORT.md");
+    let mut md = String::new();
+    md.push_str(&format!("# Final Report: {}\n\n", mod_name));
+    md.push_str(&format!("**Date:** {}\n", generated_at));
+    md.push_str(&format!("**Technology:** {}\n", active_technology.unwrap_or("unknown")));
+    md.push_str(&format!("**Synthesis Corner:** {}\n", synthesis_corner_name.unwrap_or("unknown")));
+    md.push_str(&format!("**Constraint:** {} MHz\n", constraint_mhz));
+    md.push_str(&format!("**Max Frequency:** {} MHz\n\n", max_freq));
+
+    md.push_str("## Summary\n\n");
+    md.push_str("| Metric | Value |\n|--------|-------|\n");
+    md.push_str(&format!("| Cells | {} |\n", synth_info.cell_count));
+    md.push_str(&format!("| Area | {:.2} GE / {:.2} um2 |\n", synth_info.area_ge, synth_info.area_um2));
+    md.push_str(&format!("| DFFs | {} |\n", synth_info.dff_count));
+    md.push_str(&format!("| Logic Depth | {} |\n", synth_info.logic_depth));
+    md.push_str(&format!("| Timing | {} |\n", if timing.map(|t| t.timing_met).unwrap_or(false) { "MET" } else { "VIO" }));
+    md.push_str(&format!("| Slack | {:.3} ns |\n", timing.map(|t| t.slack_ns).unwrap_or(0.0)));
+    md.push_str(&format!("| Corner Count | {} |\n", corner_timings.map(|corners| corners.len()).unwrap_or(0)));
+    md.push_str(&format!("| Lint | {} |\n", if lint_passed { "PASS" } else { "FAIL" }));
+    md.push_str(&format!("| Simulation | {} |\n", match sim_passed { Some(true) => "PASS", Some(false) => "FAIL", None => "N/A" }));
+    md.push_str(&format!("| Formal | {} |\n", match formal_ok { Some(true) => "PASS", Some(false) => "FAIL", None => "N/A" }));
+
+    md.push_str("\n## Power\n\n");
+    md.push_str(&format!("Power source at constraint: `{}`\n\n", power_source));
+    md.push_str("| Operating Point | Static (uW) | Dynamic (uW) | Total (uW) |\n");
+    md.push_str("|-----------------|-------------|--------------|------------|\n");
+    md.push_str(&format!("| {} MHz selected | {:.3} | {:.3} | {:.3} |\n", constraint_mhz, p_static, p_dynamic, total_p));
+    if max_freq > 0 {
+        md.push_str(&format!("| {} MHz selected | {:.3} | {:.3} | {:.3} |\n", max_freq, max_static_p, max_dynamic_p, max_total_p));
+    }
+    if let Some(result) = worst_constraint_power {
+        md.push_str(&format!("| {} MHz worst ({}) | {:.3} | {:.3} | {:.3} |\n",
+            constraint_mhz,
+            result.corner.short_name,
+            result.power.static_power_uw,
+            result.power.dynamic_power_uw,
+            result.power.total_power_uw));
+    }
+    if let Some(result) = worst_max_power {
+        md.push_str(&format!("| {} MHz worst ({}) | {:.3} | {:.3} | {:.3} |\n",
+            max_freq,
+            result.corner.short_name,
+            result.power.static_power_uw,
+            result.power.dynamic_power_uw,
+            result.power.total_power_uw));
+    }
+
+    if let Some(powers) = extras.constraint_corner_powers {
+        if !powers.is_empty() {
+            md.push_str(&format!("\n## Per-Corner Power @ {} MHz\n\n", constraint_mhz));
+            md.push_str("| Corner | Type | Voltage | Static (uW) | Dynamic (uW) | Total (uW) |\n");
+            md.push_str("|--------|------|---------|-------------|--------------|------------|\n");
+            for result in powers {
+                md.push_str(&format!("| {} | {} | {:.2}V | {:.3} | {:.3} | {:.3} |\n",
+                    result.corner.short_name,
+                    result.corner.corner_type,
+                    result.corner.voltage,
+                    result.power.static_power_uw,
+                    result.power.dynamic_power_uw,
+                    result.power.total_power_uw));
+            }
+        }
+    }
+    if let Some(powers) = extras.max_corner_powers {
+        if !powers.is_empty() {
+            md.push_str(&format!("\n## Per-Corner Power @ {} MHz\n\n", max_freq));
+            md.push_str("| Corner | Type | Voltage | Static (uW) | Dynamic (uW) | Total (uW) |\n");
+            md.push_str("|--------|------|---------|-------------|--------------|------------|\n");
+            for result in powers {
+                md.push_str(&format!("| {} | {} | {:.2}V | {:.3} | {:.3} | {:.3} |\n",
+                    result.corner.short_name,
+                    result.corner.corner_type,
+                    result.corner.voltage,
+                    result.power.static_power_uw,
+                    result.power.dynamic_power_uw,
+                    result.power.total_power_uw));
+            }
+        }
+    }
+    fs::write(&md_path, md)?;
+
     Ok(())
+}
+
+fn generate_report_rpt(project_dir: &Path, mod_name: &str, synth_info: &SynthInfo,
+                        timing: Option<&TimingReport>, power_info: Option<String>,
+                        constraint_mhz: i32, max_freq: i32, freq_ratio: f64,
+                        llm_decision: &str,
+                        scan_results: Option<&[TimingReport]>,
+                        corner_timings: Option<&[(LibCorner, TimingReport)]>,
+                        sim_passed: Option<bool>, lint_passed: bool, formal_ok: Option<bool>) -> std::io::Result<()> {
+    generate_report_rpt_with_extras(
+        project_dir,
+        mod_name,
+        synth_info,
+        timing,
+        power_info,
+        constraint_mhz,
+        max_freq,
+        freq_ratio,
+        llm_decision,
+        scan_results,
+        corner_timings,
+        sim_passed,
+        lint_passed,
+        formal_ok,
+        ReportExtras::default(),
+    )
 }
 
 /// Get GE value for a cell type (for Area Report)

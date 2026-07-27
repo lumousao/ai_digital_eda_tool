@@ -4,6 +4,22 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Default)]
+pub struct GuiTechnologyCorner {
+    pub technology: String,
+    pub corner: String,
+    pub corner_type: String,
+    pub library: String,
+    pub voltage: f64,
+    pub temperature: f64,
+    pub cells: i32,
+    pub time_unit: String,
+    pub voltage_unit: String,
+    pub leakage_power_unit: String,
+    pub capacitance_unit: String,
+    pub is_synthesis: bool,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct GuiSyncContext {
     pub project_name: String,
     pub project_dir: PathBuf,
@@ -14,11 +30,32 @@ pub struct GuiSyncContext {
     pub status_text: String,
     pub constraint_freq_mhz: i32,
     pub last_error: String,
+    pub active_technology: String,
+    pub technology_corners: Vec<GuiTechnologyCorner>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct GuiStateFiles {
     pub state_path: PathBuf,
+}
+
+fn formal_status_from_report(report: &str) -> &'static str {
+    let upper = report.to_ascii_uppercase();
+    if upper.contains("FORMAL VERIFICATION: FAIL")
+        || upper.contains("RTL AND GATE-LEVEL NETLIST DIFFER")
+        || upper.contains("RTL != GATE-LEVEL")
+        || upper.contains("RTL VS GATE-LEVEL: DIFFERENT")
+    {
+        "FAIL"
+    } else if upper.contains("FORMAL VERIFICATION: PASS")
+        || upper.contains("RTL AND GATE-LEVEL NETLIST ARE EQUIVALENT")
+        || upper.contains("RTL == GATE-LEVEL")
+        || upper.contains("RTL VS GATE-LEVEL: EQUIVALENT")
+    {
+        "PASS"
+    } else {
+        "UNKNOWN"
+    }
 }
 
 pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
@@ -70,23 +107,23 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     let area_ge = json_f64(&report_json, &["area_ge"]).unwrap_or(0.0);
     let area_um2 = json_f64(&report_json, &["area_um2"]).unwrap_or(0.0);
     let logic_depth = json_i64(&report_json, &["logic_depth"]).unwrap_or(0);
-    let max_freq_mhz = parse_timing_scalar(timing_report.as_deref(), "Clock frequency:")
+    let max_freq_mhz = json_f64(&report_json, &["max_freq_mhz"])
+        .or_else(|| parse_timing_scalar(timing_report.as_deref(), "Max frequency"))
+        .or_else(|| parse_timing_scalar(timing_report.as_deref(), "Clock frequency:"))
         .or_else(|| parse_timing_scalar(timing_report.as_deref(), "Constraint frequency"))
-        .or_else(|| json_f64(&report_json, &["max_freq_mhz"]))
         .unwrap_or(0.0);
-    let timing_slack_ns = parse_timing_scalar(timing_report.as_deref(), "Slack:")
-        .or_else(|| json_f64(&report_json, &["timing", "slack_ns"]))
+    let timing_slack_ns = json_f64(&report_json, &["timing", "slack_ns"])
+        .or_else(|| parse_timing_scalar(timing_report.as_deref(), "Slack"))
+        .or_else(|| parse_timing_scalar(timing_report.as_deref(), "Slack:"))
         .unwrap_or(0.0);
-    let timing_arrival_ns = parse_timing_scalar(timing_report.as_deref(), "Arrival Time")
-        .or_else(|| json_f64(&report_json, &["timing", "arrival_time_ns"]))
+    let timing_arrival_ns = json_f64(&report_json, &["timing", "arrival_time_ns"])
+        .or_else(|| parse_timing_scalar(timing_report.as_deref(), "Arrival Time"))
         .unwrap_or(0.0);
-    let timing_required_ns = parse_timing_scalar(timing_report.as_deref(), "Required Time")
-        .or_else(|| json_f64(&report_json, &["timing", "required_time_ns"]))
+    let timing_required_ns = json_f64(&report_json, &["timing", "required_time_ns"])
+        .or_else(|| parse_timing_scalar(timing_report.as_deref(), "Required Time"))
         .unwrap_or(0.0);
-    let timing_met = timing_report
-        .as_deref()
-        .map(report_timing_met)
-        .or_else(|| json_bool(&report_json, &["timing", "timing_met"]))
+    let timing_met = json_bool(&report_json, &["timing", "timing_met"])
+        .or_else(|| timing_report.as_deref().map(report_timing_met))
         .unwrap_or(false);
     let power_total_mw = json_f64(&report_json, &["power", "total_uw"]).unwrap_or(0.0) / 1000.0;
     let power_static_mw = json_f64(&report_json, &["power", "static_uw"]).unwrap_or(0.0) / 1000.0;
@@ -96,15 +133,7 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     let sim_cycles = sim_report.as_ref().and_then(|r| extract_prefixed_int(r, "Time steps:")).unwrap_or(0);
     let formal_status = formal_report
         .as_ref()
-        .map(|r| {
-            if r.contains("PASS") || r.contains("EQUIVALENT") {
-                "PASS".to_string()
-            } else if r.contains("FAIL") || r.contains("DIFFERENT") {
-                "FAIL".to_string()
-            } else {
-                "UNKNOWN".to_string()
-            }
-        })
+        .map(|r| formal_status_from_report(r).to_string())
         .unwrap_or_else(|| "NOT_RUN".to_string());
 
     let area_exchange = build_area_exchange(
@@ -145,6 +174,12 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
         cell_count,
     );
     let timing_paths_exchange = build_timing_paths_exchange(timing_report.as_deref(), &report_json);
+    let technology_exchange = build_technology_exchange(&ctx.technology_corners);
+    let power_detail_json = json_string(&report_json, &["power", "detail"]);
+    let power_corners_exchange = build_power_corners_exchange(
+        &report_json,
+        report_rpt.as_deref().or(power_detail_json.as_deref()),
+    );
 
     let rtl_exchange_path = write_exchange_file(&exchange_dir, "rtl_source.v", rtl_code.as_deref());
     let gate_exchange_path = write_exchange_file(&exchange_dir, "gate_netlist.v", gate_netlist.as_deref());
@@ -157,12 +192,14 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     let summary_exchange_path = write_exchange_file(&exchange_dir, "summary_result.txt", Some(&summary_exchange));
     let hierarchy_exchange_path = write_exchange_file(&exchange_dir, "hierarchy_tree.tsv", Some(&hierarchy_exchange));
     let timing_paths_exchange_path = write_exchange_file(&exchange_dir, "timing_paths.tsv", Some(&timing_paths_exchange));
+    let technology_exchange_path = write_exchange_file(&exchange_dir, "technologies.tsv", Some(&technology_exchange));
+    let power_corners_exchange_path = write_exchange_file(&exchange_dir, "power_corners.tsv", Some(&power_corners_exchange));
 
     let state_path = exchange_dir.join("gui_state.tcl");
     let mut state = String::new();
     state.push_str("unset -nocomplain ::gui_state\n");
     state.push_str("array set ::gui_state {}\n");
-    set_string(&mut state, "version", "0.6.7");
+    set_string(&mut state, "version", "0.6.8");
     set_string(&mut state, "project_name", &ctx.project_name);
     set_string(&mut state, "project_dir", &ctx.project_dir.to_string_lossy());
     set_string(&mut state, "module_name", &ctx.module_name);
@@ -198,6 +235,9 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     set_string(&mut state, "exchange_summary_path", &summary_exchange_path.to_string_lossy());
     set_string(&mut state, "exchange_hierarchy_path", &hierarchy_exchange_path.to_string_lossy());
     set_string(&mut state, "exchange_timing_paths_path", &timing_paths_exchange_path.to_string_lossy());
+    set_string(&mut state, "exchange_technology_path", &technology_exchange_path.to_string_lossy());
+    set_string(&mut state, "active_technology", &ctx.active_technology);
+    set_string(&mut state, "exchange_power_corners_path", &power_corners_exchange_path.to_string_lossy());
     set_int(&mut state, "constraint_freq_mhz", ctx.constraint_freq_mhz as i64);
     set_int(&mut state, "cell_count", cell_count as i64);
     set_int(&mut state, "dff_count", dff_count as i64);
@@ -598,6 +638,119 @@ fn build_hierarchy_exchange(
         &mut HashSet::new(),
     );
     rows.join("\n") + "\n"
+}
+
+fn tsv_field(value: &str) -> String {
+    value.replace(['\t', '\r', '\n'], " ")
+}
+
+fn build_technology_exchange(corners: &[GuiTechnologyCorner]) -> String {
+    let mut rows = vec!["technology\tcorner\ttype\tlibrary\tvoltage_v\ttemperature_c\tcells\ttime_unit\tvoltage_unit\tleakage_power_unit\tcapacitance_unit\tsynthesis".to_string()];
+    for corner in corners {
+        rows.push(format!("{}\t{}\t{}\t{}\t{:.6}\t{:.3}\t{}\t{}\t{}\t{}\t{}\t{}",
+            tsv_field(&corner.technology),
+            tsv_field(&corner.corner),
+            tsv_field(&corner.corner_type),
+            tsv_field(&corner.library),
+            corner.voltage,
+            corner.temperature,
+            corner.cells,
+            tsv_field(&corner.time_unit),
+            tsv_field(&corner.voltage_unit),
+            tsv_field(&corner.leakage_power_unit),
+            tsv_field(&corner.capacitance_unit),
+            if corner.is_synthesis { 1 } else { 0 },
+        ));
+    }
+    rows.push(String::new());
+    rows.join("\n")
+}
+
+fn append_power_corner_rows_from_json(rows: &mut Vec<String>, report_json: &Option<Value>, key: &str, label: &str) {
+    let Some(entries) = report_json
+        .as_ref()
+        .and_then(|v| v.get("power"))
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.as_array())
+    else {
+        return;
+    };
+
+    for entry in entries {
+        let frequency = entry.get("frequency_mhz").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let corner = entry.get("corner").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let corner_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("NA");
+        let voltage = entry.get("voltage").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let static_uw = entry.get("static_uw").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let dynamic_uw = entry.get("dynamic_uw").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let total_uw = entry.get("total_uw").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        rows.push(format!(
+            "{}\t{:.3}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+            tsv_field(label),
+            frequency,
+            tsv_field(corner),
+            tsv_field(corner_type),
+            voltage,
+            static_uw,
+            dynamic_uw,
+            total_uw,
+        ));
+    }
+}
+
+fn build_power_corners_exchange(report_json: &Option<Value>, detail: Option<&str>) -> String {
+    let mut rows = vec!["analysis\tfrequency_mhz\tcorner\ttype\tvoltage_v\tstatic_uw\tdynamic_uw\ttotal_uw".to_string()];
+    append_power_corner_rows_from_json(
+        &mut rows,
+        report_json,
+        "constraint_corner_results",
+        "Multi-Corner Power Analysis",
+    );
+    append_power_corner_rows_from_json(
+        &mut rows,
+        report_json,
+        "max_corner_results",
+        "Max Frequency Power",
+    );
+    if rows.len() > 1 {
+        rows.push(String::new());
+        return rows.join("\n");
+    }
+
+    let mut analysis = String::new();
+    let mut frequency = 0.0;
+    for line in detail.unwrap_or_default().lines() {
+        let trimmed = line.trim();
+        if let Some(open) = trimmed.rfind('(') {
+            if trimmed.ends_with("MHz)") {
+                analysis = trimmed[..open].trim().to_string();
+                frequency = trimmed[open + 1..trimmed.len() - 1]
+                    .trim_end_matches("MHz").trim().parse().unwrap_or(0.0);
+                continue;
+            }
+        }
+        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+        if fields.len() != 6 || analysis.is_empty() || fields[0] == "Corner" || fields[0].starts_with('-') {
+            continue;
+        }
+        let corner_type = fields[1].to_ascii_uppercase();
+        if !matches!(corner_type.as_str(), "TT" | "FF" | "SS" | "FS" | "SF") || !fields[2].ends_with('V') {
+            continue;
+        }
+        let voltage = fields[2].trim_end_matches('V').parse::<f64>();
+        let static_uw = fields[3].parse::<f64>();
+        let dynamic_uw = fields[4].parse::<f64>();
+        let total_uw = fields[5].parse::<f64>();
+        if let (Ok(voltage), Ok(static_uw), Ok(dynamic_uw), Ok(total_uw)) =
+            (voltage, static_uw, dynamic_uw, total_uw)
+        {
+            rows.push(format!("{}\t{:.3}\t{}\t{}\t{:.6}\t{:.6}\t{:.6}\t{:.6}",
+                tsv_field(&analysis), frequency, tsv_field(fields[0]), tsv_field(fields[1]),
+                voltage, static_uw, dynamic_uw, total_uw));
+        }
+    }
+    rows.push(String::new());
+    rows.join("\n")
 }
 
 #[derive(Clone, Debug, Default)]

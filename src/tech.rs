@@ -1,433 +1,417 @@
 /**
- * Technology / Corner Database
+ * Technology library discovery and corner metadata.
  *
- * Auto-detects process corners from Liberty (.lib) files,
- * groups them by process name, and provides per-corner
- * library paths for multi-corner timing/power analysis.
- *
- * Reference: OpenSTA's corner/liberty management pattern.
+ * Each direct child of libs/ is one technology. Every Liberty file below that
+ * directory is one analysis corner. The directory name is authoritative; file
+ * names and Liberty headers are only used to describe and rank corners.
  */
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-/// Corner type classification
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CornerType {
-    /// Typical-Typical (nominal process, voltage, temperature)
     TT,
-    /// Fast-Fast (fast process, high voltage, low temperature variant)
     FF,
-    /// Slow-Slow (slow process, low voltage, high temperature variant)
     SS,
 }
 
 impl fmt::Display for CornerType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CornerType::TT => write!(f, "TT"),
-            CornerType::FF => write!(f, "FF"),
-            CornerType::SS => write!(f, "SS"),
-        }
+        f.write_str(match self {
+            CornerType::TT => "TT",
+            CornerType::FF => "FF",
+            CornerType::SS => "SS",
+        })
     }
 }
 
 impl CornerType {
-    pub fn label(&self) -> &str {
+    pub fn label(self) -> &'static str {
         match self {
             CornerType::TT => "Typical",
             CornerType::FF => "Fast",
             CornerType::SS => "Slow",
         }
     }
+
+    pub fn engine_name(self) -> &'static str {
+        match self {
+            CornerType::TT => "tt",
+            CornerType::FF => "ff",
+            CornerType::SS => "ss",
+        }
+    }
 }
 
-/// Represents a single liberty corner file
 #[derive(Debug, Clone)]
 pub struct LibCorner {
-    /// Absolute path to the .lib file
     pub file_path: PathBuf,
-    /// Library name from header (e.g. "ics55_LLSC_H9CR_typ_tt_1p2_25")
     pub lib_name: String,
-    /// Process name (e.g. "ics55_LLSC_H9CR")
     pub process: String,
-    /// Corner type (TT, FF, or SS)
     pub corner_type: CornerType,
-    /// Nominal voltage in Volts
     pub voltage: f64,
-    /// Nominal temperature in Celsius
     pub temperature: f64,
-    /// RC type from filename (cbest, rcbest, cworst, rcworst, typ)
+    pub process_value: f64,
     pub rc_type: String,
-    /// Short display name (e.g. "tt_1p2_25")
     pub short_name: String,
-    /// Number of cells in library (from header parse)
     pub cell_count: i32,
+    pub time_unit: String,
+    pub voltage_unit: String,
+    pub leakage_power_unit: String,
+    pub capacitive_load_unit: String,
+    pub default_operating_conditions: String,
 }
 
-/// All corners grouped by process name
 #[derive(Debug, Clone)]
 pub struct ProcessGroup {
     pub process_name: String,
-    /// Sorted corners: TT first, then FF, then SS
+    pub directory: PathBuf,
     pub corners: Vec<LibCorner>,
 }
 
 impl ProcessGroup {
-    /// Get TT corner if available
     pub fn get_tt(&self) -> Option<&LibCorner> {
-        self.corners.iter().find(|c| c.corner_type == CornerType::TT)
+        self.corners.iter().find(|corner| corner.corner_type == CornerType::TT)
     }
 
-    /// Get all FF corners
-    pub fn get_ff_corners(&self) -> Vec<&LibCorner> {
-        self.corners.iter().filter(|c| c.corner_type == CornerType::FF).collect()
+    /// Synthesis is performed against a nominal library. Prefer a true typical
+    /// RC corner closest to 25 C and the technology's median supply voltage.
+    pub fn get_synthesis_corner(&self) -> Option<&LibCorner> {
+        if self.corners.is_empty() {
+            return None;
+        }
+        let mut voltages: Vec<f64> = self.corners.iter()
+            .map(|corner| corner.voltage)
+            .filter(|voltage| *voltage > 0.0)
+            .collect();
+        voltages.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let nominal_voltage = voltages.get(voltages.len() / 2).copied().unwrap_or(1.0);
+
+        self.corners.iter().min_by(|a, b| {
+            let score = |corner: &LibCorner| {
+                let type_penalty = if corner.corner_type == CornerType::TT { 0.0 } else { 1000.0 };
+                let rc_penalty = if matches!(corner.rc_type.as_str(), "typ" | "tt" | "nom") { 0.0 } else { 100.0 };
+                type_penalty + rc_penalty
+                    + (corner.temperature - 25.0).abs()
+                    + (corner.voltage - nominal_voltage).abs() * 100.0
+            };
+            score(a).partial_cmp(&score(b)).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.short_name.cmp(&b.short_name))
+        })
     }
 
-    /// Get all SS corners
-    pub fn get_ss_corners(&self) -> Vec<&LibCorner> {
-        self.corners.iter().filter(|c| c.corner_type == CornerType::SS).collect()
-    }
-
-    /// Get the worst-case corner (SS corner with highest temperature)
     pub fn get_worst_corner(&self) -> Option<&LibCorner> {
         self.corners.iter()
-            .filter(|c| c.corner_type == CornerType::SS)
-            .max_by(|a, b| a.temperature.partial_cmp(&b.temperature).unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.voltage.partial_cmp(&b.voltage).unwrap_or(std::cmp::Ordering::Equal).reverse()))
+            .filter(|corner| corner.corner_type == CornerType::SS)
+            .max_by(|a, b| {
+                a.temperature.partial_cmp(&b.temperature).unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.voltage.partial_cmp(&a.voltage).unwrap_or(std::cmp::Ordering::Equal))
+            })
+            .or_else(|| self.corners.iter().max_by(|a, b| {
+                a.temperature.partial_cmp(&b.temperature).unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.voltage.partial_cmp(&a.voltage).unwrap_or(std::cmp::Ordering::Equal))
+            }))
     }
 
-    /// Get the best-case corner (FF corner with lowest temperature)
     pub fn get_best_corner(&self) -> Option<&LibCorner> {
         self.corners.iter()
-            .filter(|c| c.corner_type == CornerType::FF)
-            .min_by(|a, b| a.temperature.partial_cmp(&b.temperature).unwrap_or(std::cmp::Ordering::Equal))
+            .filter(|corner| corner.corner_type == CornerType::FF)
+            .min_by(|a, b| {
+                a.temperature.partial_cmp(&b.temperature).unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.voltage.partial_cmp(&a.voltage).unwrap_or(std::cmp::Ordering::Equal))
+            })
+            .or_else(|| self.corners.first())
     }
 
-    /// Total number of corners
     pub fn corner_count(&self) -> usize {
         self.corners.len()
     }
 }
 
-/// Main database for technology/corner management
+#[derive(Debug)]
 pub struct CornerDatabase {
     pub processes: Vec<ProcessGroup>,
     pub active_process: Option<String>,
     pub lib_dir: PathBuf,
-    /// If true, analyze all corners; if false, use default/selected corner
     pub multi_corner: bool,
 }
 
+#[derive(Debug, Default)]
+struct LibertyHeader {
+    library_name: String,
+    nom_process: Option<f64>,
+    nom_temperature: Option<f64>,
+    nom_voltage: Option<f64>,
+    time_unit: String,
+    voltage_unit: String,
+    leakage_power_unit: String,
+    capacitive_load_unit: String,
+    default_operating_conditions: String,
+    cell_count: i32,
+}
+
 impl CornerDatabase {
-    /// Auto-detect all liberty files in the given directory,
-    /// parse their headers, and group by process name.
     pub fn auto_detect(lib_dir: &Path) -> Self {
-        let mut all_corners: Vec<LibCorner> = Vec::new();
-        let lib_dir = lib_dir.to_path_buf();
+        let lib_dir = fs::canonicalize(lib_dir).unwrap_or_else(|_| lib_dir.to_path_buf());
+        let mut processes = Vec::new();
 
-        // Scan for .lib files
-        if let Ok(entries) = std::fs::read_dir(&lib_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let fname = path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
+        if let Ok(entries) = fs::read_dir(&lib_dir) {
+            let mut technology_dirs: Vec<PathBuf> = entries.flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect();
+            technology_dirs.sort();
+            for directory in technology_dirs {
+                let process_name = directory.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
                     .unwrap_or_default();
-
-                if !fname.ends_with(".lib") {
+                if process_name.starts_with('.') || process_name.is_empty() {
                     continue;
                 }
-
-                // Try to parse corner info from filename and library header
-                if let Some(corner) = Self::parse_corner_from_file(&path, &fname) {
-                    all_corners.push(corner);
+                let mut files = Vec::new();
+                Self::collect_liberty_files(&directory, &mut files);
+                files.sort();
+                let mut corners: Vec<LibCorner> = files.iter()
+                    .filter_map(|path| Self::parse_corner_from_file(path, &process_name))
+                    .collect();
+                Self::sort_corners(&mut corners);
+                if !corners.is_empty() {
+                    processes.push(ProcessGroup { process_name, directory, corners });
                 }
             }
         }
 
-        // Group by process name
-        let mut groups: std::collections::BTreeMap<String, Vec<LibCorner>> = std::collections::BTreeMap::new();
-        for corner in all_corners {
-            groups.entry(corner.process.clone()).or_default().push(corner);
-        }
-
-        // Build ProcessGroups with sorted corners
-        let mut processes: Vec<ProcessGroup> = Vec::new();
-        for (process_name, mut corners) in groups {
-            // Sort: TT first, FF, then SS; within each type sort by rc_type then temperature
-            corners.sort_by(|a, b| {
-                let type_order = |c: &LibCorner| match c.corner_type {
-                    CornerType::TT => 0,
-                    CornerType::FF => 1,
-                    CornerType::SS => 2,
-                };
-                let ord = type_order(a).cmp(&type_order(b));
-                if ord != std::cmp::Ordering::Equal { return ord; }
-                let rc_order = |c: &LibCorner| match c.rc_type.as_str() {
-                    "typ" => 0,
-                    "cbest" => 1, "rcbest" => 2,
-                    "cworst" => 3, "rcworst" => 4,
-                    _ => 5,
-                };
-                rc_order(a).cmp(&rc_order(b))
-                    .then(a.temperature.partial_cmp(&b.temperature).unwrap_or(std::cmp::Ordering::Equal))
-            });
-
-            processes.push(ProcessGroup { process_name, corners });
-        }
-
-        // Sort processes: special "demo" first, then by name
-        processes.sort_by(|a, b| {
-            if a.process_name == "demo" { return std::cmp::Ordering::Less; }
-            if b.process_name == "demo" { return std::cmp::Ordering::Greater; }
-            a.process_name.cmp(&b.process_name)
-        });
-
-        // Default: first non-demo process, or demo if only one
-        let default_process = processes.iter()
-            .find(|p| p.process_name != "demo")
+        processes.sort_by(|a, b| a.process_name.cmp(&b.process_name));
+        let active_process = processes.iter()
+            .find(|process| process.process_name != "demo")
             .or_else(|| processes.first())
-            .map(|p| p.process_name.clone());
+            .map(|process| process.process_name.clone());
 
-        CornerDatabase {
-            processes,
-            active_process: default_process,
-            lib_dir,
-            multi_corner: true,  // Default to multi-corner mode
+        Self { processes, active_process, lib_dir, multi_corner: true }
+    }
+
+    fn collect_liberty_files(directory: &Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(directory) else { return; };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                Self::collect_liberty_files(&path, files);
+            } else if path.extension().and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("lib"))
+                .unwrap_or(false)
+            {
+                files.push(fs::canonicalize(&path).unwrap_or(path));
+            }
         }
     }
 
-    /// Parse corner info from a .lib file (fast: filename parsing + lightweight header read)
-    fn parse_corner_from_file(file_path: &Path, fname: &str) -> Option<LibCorner> {
-        // First, try to get library name from the file header (one line read)
-        let lib_name = Self::read_library_name(file_path).unwrap_or_else(|| fname.replace(".lib", ""));
+    fn sort_corners(corners: &mut [LibCorner]) {
+        corners.sort_by(|a, b| {
+            let type_order = |corner: &LibCorner| match corner.corner_type {
+                CornerType::TT => 0,
+                CornerType::FF => 1,
+                CornerType::SS => 2,
+            };
+            type_order(a).cmp(&type_order(b))
+                .then_with(|| a.rc_type.cmp(&b.rc_type))
+                .then_with(|| a.voltage.partial_cmp(&b.voltage).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.temperature.partial_cmp(&b.temperature).unwrap_or(std::cmp::Ordering::Equal))
+                .then_with(|| a.lib_name.cmp(&b.lib_name))
+        });
+    }
 
-        // Detect if it's a demo/simple library (cmos_cells.lib style)
-        if lib_name == "demo" || fname == "cmos_cells.lib" {
-            return Some(LibCorner {
-                file_path: file_path.to_path_buf(),
-                lib_name: "demo".to_string(),
-                process: "demo".to_string(),
-                corner_type: CornerType::TT,
-                voltage: 3.3,
-                temperature: 25.0,
-                rc_type: "typ".to_string(),
-                short_name: "demo".to_string(),
-                cell_count: 10,
-            });
-        }
+    fn parse_corner_from_file(file_path: &Path, process: &str) -> Option<LibCorner> {
+        let header = Self::read_liberty_header(file_path)?;
+        let stem = file_path.file_stem()?.to_string_lossy();
+        let normalized_stem = stem.strip_suffix("_nldm").unwrap_or(&stem);
+        let lower = normalized_stem.to_ascii_lowercase();
+        let lower_lib = header.library_name.to_ascii_lowercase();
 
-        // Parse native filename pattern: {process}_{corner}_{rc}_{voltage}_{temp}_nldm.lib
-        let stem = fname.strip_suffix(".lib").unwrap_or(fname);
-        let stem = stem.strip_suffix("_nldm").unwrap_or(stem);
+        let corner_type = if Self::has_token(&lower, "ff") || Self::has_token(&lower_lib, "ff") {
+            CornerType::FF
+        } else if Self::has_token(&lower, "ss") || Self::has_token(&lower_lib, "ss") {
+            CornerType::SS
+        } else {
+            CornerType::TT
+        };
 
-        let parts: Vec<&str> = stem.split('_').collect();
-        if parts.len() < 5 {
-            // Can't parse, create generic entry
-            return Some(LibCorner {
-                file_path: file_path.to_path_buf(),
-                lib_name: lib_name.clone(),
-                process: lib_name.clone(),
-                corner_type: CornerType::TT,
-                voltage: 1.2,
-                temperature: 25.0,
-                rc_type: "typ".to_string(),
-                short_name: lib_name.chars().take(15).collect::<String>(),
-                cell_count: 0,
-            });
-        }
+        let rc_type = ["rcworst", "cworst", "rcbest", "cbest", "typ", "nom", "tt"]
+            .iter()
+            .find(|token| Self::has_token(&lower, token) || Self::has_token(&lower_lib, token))
+            .copied()
+            .unwrap_or("typ")
+            .to_string();
 
-        // Find corner type marker in parts
-        // Pattern: ... [corner_type] [rc_type] [voltage] [temp] ...
-        // Corner markers: "typ", "tt", "ff", "ss"
-        let mut corner_type = CornerType::TT;
-        let mut rc_type = String::from("typ");
-        let mut voltage = 1.2;
-        let mut temperature = 25.0;
-        let mut corner_idx = 0;
-        let mut rc_idx = 0;
-        let mut process_parts: Vec<&str> = Vec::new();
-
-        // Find the corner marker position
-        for (i, part) in parts.iter().enumerate() {
-            let lower = part.to_lowercase();
-            if lower == "typ" || lower == "tt" {
-                corner_type = CornerType::TT;
-                corner_idx = i;
-                break;
-            } else if lower == "ff" {
-                corner_type = CornerType::FF;
-                corner_idx = i;
-                break;
-            } else if lower == "ss" {
-                corner_type = CornerType::SS;
-                corner_idx = i;
-                break;
-            }
-        }
-
-        // Everything before corner_idx is the process name
-        process_parts = parts[..corner_idx].to_vec();
-        let process = process_parts.join("_");
-
-        // RC type: next part after corner type
-        if corner_idx + 1 < parts.len() {
-            rc_idx = corner_idx + 1;
-            rc_type = parts[rc_idx].to_lowercase();
-        }
-
-        // Voltage: part after RC type
-        if rc_idx + 1 < parts.len() {
-            voltage = Self::parse_voltage(parts[rc_idx + 1]);
-            // Check if next part is actually temperature (sometimes voltage is at position rc_idx+1 but path varies)
-        }
-
-        // Temperature: last numeric-ish part
-        if parts.len() >= rc_idx + 2 {
-            temperature = Self::parse_temperature(parts[parts.len() - 1]);
-        }
-
-        // Double check: if the part after rc_type looks like a temperature (not a voltage),
-        // then voltage might be missing
-        let voltage_part = parts[rc_idx + 1].to_lowercase();
-        if !voltage_part.contains('p') && !voltage_part.contains('.') {
-            voltage = 1.2; // default
-            temperature = Self::parse_temperature(parts[rc_idx + 1]);
-        }
-
-        let short_name = format!("{}_{}_{:.0}_{}",
-            match corner_type { CornerType::TT => "tt", CornerType::FF => "ff", CornerType::SS => "ss" },
-            rc_type,
-            voltage * 100.0,
-            temperature);
+        let voltage = header.nom_voltage
+            .or_else(|| Self::filename_voltage(normalized_stem))
+            .unwrap_or(1.0);
+        let temperature = header.nom_temperature
+            .or_else(|| Self::filename_temperature(normalized_stem))
+            .unwrap_or(25.0);
+        let short_name = Self::corner_short_name(normalized_stem, process, corner_type, &rc_type, voltage, temperature);
 
         Some(LibCorner {
             file_path: file_path.to_path_buf(),
-            lib_name: lib_name.clone(),
-            process,
+            lib_name: if header.library_name.is_empty() { normalized_stem.to_string() } else { header.library_name },
+            process: process.to_string(),
             corner_type,
             voltage,
             temperature,
+            process_value: header.nom_process.unwrap_or(1.0),
             rc_type,
             short_name,
-            cell_count: 0, // Will be populated by C API if needed
+            cell_count: header.cell_count,
+            time_unit: header.time_unit,
+            voltage_unit: header.voltage_unit,
+            leakage_power_unit: header.leakage_power_unit,
+            capacitive_load_unit: header.capacitive_load_unit,
+            default_operating_conditions: header.default_operating_conditions,
         })
     }
 
-    /// Read just the library name from a .lib file (first line only)
-    fn read_library_name(path: &Path) -> Option<String> {
-        use std::io::{BufRead, BufReader};
-        let file = std::fs::File::open(path).ok()?;
-        let mut reader = BufReader::new(file);
-        let mut first_line = String::new();
-        reader.read_line(&mut first_line).ok()?;
-
-        // Parse "library (NAME) {" or "library(NAME) {"
-        if let Some(lp) = first_line.find("library") {
-            let after = &first_line[lp + 7..];  // skip "library"
-            if let Some(lparen) = after.find('(') {
-                if let Some(rparen) = after[lparen..].find(')') {
-                    let name = &after[lparen + 1..lparen + rparen];
-                    return Some(name.trim().to_string());
-                }
+    fn read_liberty_header(path: &Path) -> Option<LibertyHeader> {
+        let file = fs::File::open(path).ok()?;
+        let mut header = LibertyHeader::default();
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let trimmed = line.trim();
+            if header.library_name.is_empty() && trimmed.starts_with("library") {
+                header.library_name = Self::group_name(trimmed).unwrap_or_default();
+            }
+            if trimmed.starts_with("cell") && Self::group_name(trimmed).is_some() {
+                header.cell_count += 1;
+            }
+            if header.nom_process.is_none() { header.nom_process = Self::numeric_attribute(trimmed, "nom_process"); }
+            if header.nom_temperature.is_none() { header.nom_temperature = Self::numeric_attribute(trimmed, "nom_temperature"); }
+            if header.nom_voltage.is_none() { header.nom_voltage = Self::numeric_attribute(trimmed, "nom_voltage"); }
+            Self::string_attribute(trimmed, "time_unit", &mut header.time_unit);
+            Self::string_attribute(trimmed, "voltage_unit", &mut header.voltage_unit);
+            Self::string_attribute(trimmed, "leakage_power_unit", &mut header.leakage_power_unit);
+            Self::string_attribute(trimmed, "default_operating_conditions", &mut header.default_operating_conditions);
+            if header.capacitive_load_unit.is_empty() && trimmed.starts_with("capacitive_load_unit") {
+                header.capacitive_load_unit = Self::group_name(trimmed).unwrap_or_default();
             }
         }
-        None
-    }
-
-    /// Parse voltage from string like "1p2" -> 1.2, "1p08" -> 1.08, "1p32" -> 1.32, "1.2" -> 1.2
-    fn parse_voltage(s: &str) -> f64 {
-        let s = s.to_lowercase();
-        // Handle "1p2" format
-        if s.contains('p') && !s.contains('.') {
-            let replaced = s.replace('p', ".");
-            return replaced.parse().unwrap_or(1.2);
+        if header.library_name.is_empty() {
+            header.library_name = path.file_stem()?.to_string_lossy().to_string();
         }
-        s.parse().unwrap_or(1.2)
+        Some(header)
     }
 
-    /// Parse temperature from string like "25" -> 25.0, "125" -> 125.0, "m40" -> -40.0
-    fn parse_temperature(s: &str) -> f64 {
-        let s = s.to_lowercase();
-        if s.starts_with('m') {
-            // Negative: "m40" -> -40
-            let val: f64 = s[1..].parse().unwrap_or(25.0);
-            -val
-        } else {
-            s.parse().unwrap_or(25.0)
+    fn group_name(line: &str) -> Option<String> {
+        let start = line.find('(')? + 1;
+        let end = line[start..].find(')')? + start;
+        Some(line[start..end].trim().trim_matches('"').to_string())
+    }
+
+    fn numeric_attribute(line: &str, key: &str) -> Option<f64> {
+        let remainder = line.strip_prefix(key)?.trim_start();
+        let remainder = remainder.strip_prefix(':')?.trim_start();
+        remainder.trim_end_matches(';').trim().parse().ok()
+    }
+
+    fn string_attribute(line: &str, key: &str, target: &mut String) {
+        if !target.is_empty() { return; }
+        let Some(remainder) = line.strip_prefix(key) else { return; };
+        let Some(remainder) = remainder.trim_start().strip_prefix(':') else { return; };
+        *target = remainder.trim().trim_end_matches(';').trim_matches('"').to_string();
+    }
+
+    fn has_token(value: &str, token: &str) -> bool {
+        value.split(|ch: char| !ch.is_ascii_alphanumeric()).any(|part| part == token)
+    }
+
+    fn filename_voltage(stem: &str) -> Option<f64> {
+        stem.split('_').rev().find_map(|part| {
+            let lower = part.to_ascii_lowercase();
+            if lower.contains('p') && lower.chars().all(|ch| ch.is_ascii_digit() || ch == 'p') {
+                lower.replace('p', ".").parse().ok()
+            } else { None }
+        })
+    }
+
+    fn filename_temperature(stem: &str) -> Option<f64> {
+        stem.split('_').rev().find_map(|part| {
+            let lower = part.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix('m') {
+                return value.parse::<f64>().ok().map(|number| -number);
+            }
+            if lower.chars().all(|ch| ch.is_ascii_digit()) {
+                return lower.parse().ok();
+            }
+            None
+        })
+    }
+
+    fn corner_short_name(stem: &str, process: &str, corner_type: CornerType, rc_type: &str, voltage: f64, temperature: f64) -> String {
+        let prefix = format!("{}_", process);
+        let candidate = stem.strip_prefix(&prefix).unwrap_or(stem);
+        if !candidate.is_empty() && candidate.len() <= 72 {
+            return candidate.to_string();
         }
+        let temperature = if temperature < 0.0 { format!("m{:.0}", -temperature) } else { format!("{:.0}", temperature) };
+        format!("{}_{}_{}_{temperature}", corner_type.engine_name(), rc_type, Self::voltage_token(voltage))
     }
 
-    // === Public API ===
+    fn voltage_token(voltage: f64) -> String {
+        let mut value = format!("{voltage:.3}");
+        while value.ends_with('0') { value.pop(); }
+        value.trim_end_matches('.').replace('.', "p")
+    }
 
-    /// Get the currently active process group
     pub fn get_active_group(&self) -> Option<&ProcessGroup> {
         let active = self.active_process.as_deref()?;
-        self.processes.iter().find(|p| p.process_name == active)
+        self.processes.iter().find(|process| process.process_name == active)
     }
 
-    /// Get all corners for the active process
     pub fn get_active_corners(&self) -> Vec<&LibCorner> {
-        match self.get_active_group() {
-            Some(group) => group.corners.iter().collect(),
-            None => vec![],
-        }
+        self.get_active_group().map(|group| group.corners.iter().collect()).unwrap_or_default()
     }
 
-    /// Get default liberty file path (TT corner, or first corner)
     pub fn get_default_liberty(&self) -> Option<PathBuf> {
-        let group = self.get_active_group()?;
-        // Prefer TT corner for default
-        group.get_tt()
-            .or_else(|| group.corners.first())
-            .map(|c| c.file_path.clone())
+        self.get_active_group()?.get_synthesis_corner().map(|corner| corner.file_path.clone())
     }
 
-    /// Get liberty paths for all corners of active process
+    pub fn get_synthesis_corner(&self) -> Option<&LibCorner> {
+        self.get_active_group()?.get_synthesis_corner()
+    }
+
     pub fn get_all_liberty_paths(&self) -> Vec<PathBuf> {
-        self.get_active_corners().iter().map(|c| c.file_path.clone()).collect()
+        self.get_active_corners().iter().map(|corner| corner.file_path.clone()).collect()
     }
 
-    /// Get liberty path for a specific corner
     pub fn liberty_path_for_corner(&self, corner: &LibCorner) -> Option<PathBuf> {
-        Some(corner.file_path.clone())
+        corner.file_path.is_file().then(|| corner.file_path.clone())
     }
 
-    /// Set active process by name
     pub fn set_active_process(&mut self, name: &str) -> Result<(), String> {
-        if self.processes.iter().any(|p| p.process_name == name) {
+        if self.processes.iter().any(|process| process.process_name == name) {
             self.active_process = Some(name.to_string());
             Ok(())
         } else {
-            Err(format!("Process '{}' not found. Available: {}",
-                name,
-                self.processes.iter().map(|p| p.process_name.as_str()).collect::<Vec<_>>().join(", ")))
+            Err(format!("Technology '{}' not found. Available: {}", name, self.list_processes().join(", ")))
         }
     }
 
-    /// Enable/disable multi-corner mode
-    pub fn set_multi_corner(&mut self, enabled: bool) {
-        self.multi_corner = enabled;
-    }
+    pub fn set_multi_corner(&mut self, enabled: bool) { self.multi_corner = enabled; }
 
-    /// List all process names
     pub fn list_processes(&self) -> Vec<&str> {
-        self.processes.iter().map(|p| p.process_name.as_str()).collect()
+        self.processes.iter().map(|process| process.process_name.as_str()).collect()
     }
 
-    /// Get summary string for display
     pub fn summary(&self) -> String {
-        let mut lines = Vec::new();
-        for process in &self.processes {
-            let tt_count = process.corners.iter().filter(|c| c.corner_type == CornerType::TT).count();
-            let ff_count = process.corners.iter().filter(|c| c.corner_type == CornerType::FF).count();
-            let ss_count = process.corners.iter().filter(|c| c.corner_type == CornerType::SS).count();
-            lines.push(format!(
-                "  {} ({} corners: TT={}, FF={}, SS={})",
-                process.process_name, process.corners.len(), tt_count, ff_count, ss_count
-            ));
-        }
-        lines.join("\n")
+        self.processes.iter().map(|process| {
+            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+            for corner in &process.corners { *counts.entry(corner.corner_type.to_string()).or_default() += 1; }
+            format!("  {} ({} corners: TT={}, FF={}, SS={})",
+                process.process_name, process.corners.len(),
+                counts.get("TT").copied().unwrap_or(0),
+                counts.get("FF").copied().unwrap_or(0),
+                counts.get("SS").copied().unwrap_or(0))
+        }).collect::<Vec<_>>().join("\n")
     }
 }
 
@@ -435,32 +419,50 @@ impl CornerDatabase {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_voltage() {
-        assert!((CornerDatabase::parse_voltage("1p2") - 1.2).abs() < 0.01);
-        assert!((CornerDatabase::parse_voltage("1p08") - 1.08).abs() < 0.01);
-        assert!((CornerDatabase::parse_voltage("1p32") - 1.32).abs() < 0.01);
-        assert!((CornerDatabase::parse_voltage("1.2") - 1.2).abs() < 0.01);
+    fn temp_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("ai_digital_tech_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_lib(path: &Path, name: &str, voltage: f64, temperature: f64, cells: usize) {
+        let mut content = format!("library ({name}) {{\n  time_unit : \"1ns\";\n  voltage_unit : \"1V\";\n  leakage_power_unit : \"1nW\";\n  capacitive_load_unit (1,pf);\n  nom_process : 1;\n  nom_temperature : {temperature};\n  nom_voltage : {voltage};\n  default_operating_conditions : OP;\n");
+        for index in 0..cells { content.push_str(&format!("  cell (C{index}) {{ area : 1; }}\n")); }
+        content.push_str("}\n");
+        fs::write(path, content).unwrap();
     }
 
     #[test]
-    fn test_parse_temperature() {
-        assert!((CornerDatabase::parse_temperature("25") - 25.0).abs() < 0.01);
-        assert!((CornerDatabase::parse_temperature("125") - 125.0).abs() < 0.01);
-        assert!((CornerDatabase::parse_temperature("m40") - (-40.0)).abs() < 0.01);
-        assert!((CornerDatabase::parse_temperature("m55") - (-55.0)).abs() < 0.01);
+    fn discovers_directory_technologies_and_header_metadata() {
+        let root = temp_root("discover");
+        let tech = root.join("node55");
+        fs::create_dir_all(&tech).unwrap();
+        write_lib(&tech.join("node55_typ_tt_1p2_25.lib"), "node55_tt", 1.2, 25.0, 3);
+        write_lib(&tech.join("node55_ss_rcworst_1p08_125.lib"), "node55_ss", 1.08, 125.0, 2);
+        fs::write(root.join("legacy.lib"), "library (ignored) {}\n").unwrap();
+
+        let db = CornerDatabase::auto_detect(&root);
+        assert_eq!(db.list_processes(), vec!["node55"]);
+        let group = db.get_active_group().unwrap();
+        assert_eq!(group.corner_count(), 2);
+        assert_eq!(group.get_synthesis_corner().unwrap().lib_name, "node55_tt");
+        assert_eq!(group.get_synthesis_corner().unwrap().cell_count, 3);
+        assert_eq!(group.get_worst_corner().unwrap().temperature, 125.0);
+        assert_eq!(group.corners[0].time_unit, "1ns");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn test_auto_detect() {
-        let db = CornerDatabase::auto_detect(Path::new("libs"));
-        for process in &db.processes {
-            println!("Process: {} ({} corners)", process.process_name, process.corners.len());
-            for corner in &process.corners {
-                println!("  {:20} {:>3} {:>5.2}V {:>6.1}C  {}",
-                    corner.short_name, corner.corner_type,
-                    corner.voltage, corner.temperature, corner.rc_type);
-            }
-        }
+    fn technology_name_is_directory_name_not_library_prefix() {
+        let root = temp_root("directory_name");
+        let tech = root.join("custom_process");
+        fs::create_dir_all(&tech).unwrap();
+        write_lib(&tech.join("vendor_fast.lib"), "unrelated_library_ff", 0.9, -40.0, 1);
+        let db = CornerDatabase::auto_detect(&root);
+        assert_eq!(db.processes[0].process_name, "custom_process");
+        assert_eq!(db.processes[0].corners[0].process, "custom_process");
+        assert_eq!(db.processes[0].corners[0].corner_type, CornerType::FF);
+        fs::remove_dir_all(root).unwrap();
     }
 }

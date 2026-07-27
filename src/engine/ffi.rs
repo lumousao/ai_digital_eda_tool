@@ -117,6 +117,7 @@ extern "C" {
     pub fn rtl_timing_analysis_corner(
         synth_output: *const c_char,
         module_name: *const c_char,
+        liberty_file: *const c_char,
         corner_type: *const c_char,
         voltage: f64,
         temperature: f64,

@@ -546,33 +546,11 @@ impl FlowSnapshotBuilder {
 /// This is the core API that integrates LLM judgment into every step
 pub fn build_llm_decision_prompt(snapshot: &FlowStateSnapshot) -> String {
     let mut prompt = String::new();
-
-    prompt.push_str(&format!(
-        "You are an EDA flow controller analyzing this step: **{}**\n\n",
-        snapshot.flow_step
-    ));
-
+    prompt.push_str("Decide the next EDA flow action from the current step snapshot.\n");
+    prompt.push_str("Return JSON only: {\"a\":\"p|r|b|o|x\",\"t\":\"step|\",\"r\":\"short_code\",\"k\":\"short_hint|\"}\n");
+    prompt.push_str("Rules: p=proceed, r=retry current step, b=back to target step, o=optimize, x=abort.\n");
+    prompt.push_str("Use short snake_case codes only. No prose. No markdown.\n\n");
     prompt.push_str(&snapshot.to_llm_context());
-
-    prompt.push_str("\n## DECISION REQUEST\n\n");
-    prompt.push_str("Based on the above state, decide the next action:\n");
-    prompt.push_str("1. **PROCEED** — Current step succeeded, continue to next step. Choose: \"proceed\"\n");
-    prompt.push_str("2. **RETRY** — Current step failed but is fixable. Choose: \"retry\" with reason.\n");
-    prompt.push_str("3. **BACK** — Current step failed due to upstream issue. Choose: \"back\" with target step.\n");
-    prompt.push_str("4. **OPTIMIZE** — Current result is acceptable but can be improved. Choose: \"optimize\".\n");
-    prompt.push_str("5. **ABORT** — Unrecoverable error. Choose: \"abort\" with reason.\n\n");
-
-    prompt.push_str("Decision criteria:\n");
-    prompt.push_str("- Parse/Lint errors: BACK to \"parse\" step\n");
-    prompt.push_str("- Synthesis failures: RETRY with fix suggestions (or BACK to \"parse\" if syntax)\n");
-    prompt.push_str("- Timing violations: RETRY with optimization or BACK to \"synthesize\"\n");
-    prompt.push_str("- Simulation failures: RETRY with testbench/RTL fixes\n");
-    prompt.push_str("- Everything passed: PROCEED to next step\n");
-    prompt.push_str("- 3+ repeated failures: ABORT\n\n");
-
-    prompt.push_str("Output a JSON object ONLY:\n");
-    prompt.push_str("{\"action\": \"proceed|retry|back|optimize|abort\", \"target\": \"<step>\", \"reason\": \"<explanation>\", \"suggestions\": \"<optional fix suggestions>\"}\n");
-
     prompt
 }
 
@@ -592,17 +570,37 @@ pub fn parse_llm_decision(response: &str) -> Result<FlowDecision, String> {
     let json: serde_json::Value = serde_json::from_str(json_str)
         .map_err(|e| format!("JSON parse error: {}", e))?;
 
-    let action = json["action"].as_str().unwrap_or("proceed").to_string();
-    let target = json["target"].as_str().unwrap_or("").to_string();
-    let reason = json["reason"].as_str().unwrap_or("").to_string();
-    let suggestions = json["suggestions"].as_str().map(|s| s.to_string());
+    let action = json
+        .get("action")
+        .and_then(|v| v.as_str())
+        .or_else(|| json.get("a").and_then(|v| v.as_str()))
+        .unwrap_or("proceed")
+        .to_string();
+    let target = json
+        .get("target")
+        .and_then(|v| v.as_str())
+        .or_else(|| json.get("t").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let reason = json
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .or_else(|| json.get("r").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let suggestions = json
+        .get("suggestions")
+        .and_then(|v| v.as_str())
+        .or_else(|| json.get("k").and_then(|v| v.as_str()))
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty());
 
     let action_enum = match action.as_str() {
-        "proceed" => FlowAction::Proceed,
-        "retry" => FlowAction::Retry,
-        "back" => FlowAction::Back,
-        "optimize" => FlowAction::Optimize,
-        "abort" => FlowAction::Abort,
+        "proceed" | "p" => FlowAction::Proceed,
+        "retry" | "r" => FlowAction::Retry,
+        "back" | "b" => FlowAction::Back,
+        "optimize" | "o" => FlowAction::Optimize,
+        "abort" | "x" => FlowAction::Abort,
         _ => FlowAction::Proceed,
     };
 

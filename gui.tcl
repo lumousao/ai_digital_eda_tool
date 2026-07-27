@@ -1,5 +1,5 @@
 #!/usr/bin/env wish
-# AI Digital v0.6.7 — Native Tcl/Tk GUI (pipe-integrated CLI mode)
+# AI Digital v0.6.8 — Native Tcl/Tk GUI (pipe-integrated CLI mode)
 # Debug: all output goes to stderr AND gui_debug.log
 
 package require Tk
@@ -58,12 +58,12 @@ proc console_input_clear {} {
 }
 
 _debug_init
-debug "=== AI Digital GUI v0.6.7 (pipe mode) ==="
+debug "=== AI Digital GUI v0.6.8 (pipe mode) ==="
 debug "Tcl=[info tclversion] Tk=[package provide Tk]"
 
 # ===================== Config =====================
 set ::APP_NAME "AI Digital"
-set ::APP_VERSION "0.6.7"
+set ::APP_VERSION "0.6.8"
 set ::BINARY [file normalize [file join [file dirname [info script]] "target" "release" "ai_digital"]]
 if {![file exists $::BINARY]} {
     set ::BINARY [file normalize [file join [file dirname [info script]] "target" "debug" "ai_digital"]]
@@ -119,6 +119,8 @@ set ::synth_area_ge 0.0; set ::synth_area_um2 0.0; set ::synth_depth 0
 set ::synth_gate_netlist ""
 set ::timing_slack 0.0; set ::timing_met 0
 set ::power_total 0.0; set ::power_static 0.0; set ::power_dynamic 0.0
+set ::power_corner_rows {}
+set ::area_breakdown_rows {}
 set ::formal_result ""
 set ::formal_points ""
 set ::gate_dot ""
@@ -141,6 +143,11 @@ set ::pipe_ready 0
 set ::pipe_last_cmd ""
 set ::current_project_dir ""
 set ::project_state_path ""
+set ::active_technology ""
+set ::technology_rows {}
+set ::technology_names {}
+set ::selected_technology ""
+set ::power_corner_rows {}
 
 proc hex_decode {value} {
     if {$value eq ""} { return "" }
@@ -215,6 +222,7 @@ proc load_gui_state_file {path} {
     if {[info exists ::gui_state(power_static_mw)]} { set ::power_static $::gui_state(power_static_mw) }
     if {[info exists ::gui_state(power_dynamic_mw)]} { set ::power_dynamic $::gui_state(power_dynamic_mw) }
     if {[info exists ::gui_state(formal_status)]} { set ::formal_result [gui_state_text formal_status] }
+    set ::active_technology [gui_state_text active_technology]
     if {[winfo exists .status.text]} {
         .status.text configure -text "  AI Digital v$::APP_VERSION | [gui_state_text current_step] / [gui_state_text step_status] | [gui_state_text status_text]"
     }
@@ -232,7 +240,7 @@ proc load_gui_state_file {path} {
     load_exchange_file [gui_state_text exchange_timing_path] .toparea.right.pages.timing.out
     load_exchange_file [gui_state_text exchange_formal_path] .toparea.right.pages.formal.out
     load_exchange_file [gui_state_text exchange_area_path] .toparea.right.pages.area.out
-    load_exchange_file [gui_state_text exchange_power_path] .toparea.right.pages.power.out
+    load_exchange_file [gui_state_text exchange_power_path] .toparea.right.pages.power.main.report.out
     load_exchange_file [gui_state_text exchange_summary_path] .toparea.right.pages.summary.out
     if {[gui_state_text gate_path] ne ""} {
         load_gate_from_project
@@ -241,6 +249,8 @@ proc load_gui_state_file {path} {
     load_waveform_from_state
     load_hierarchy_from_state
     load_formal_points_from_state
+    load_technology_from_state
+    load_power_corners_from_state
     return 1
 }
 
@@ -1805,8 +1815,8 @@ proc parse_vcd_content {content} {
 }
 
 proc wave_select_default_signals {} {
-    if {![winfo exists .toparea.right.pages.sim.vpane.wave.ctrl.list]} { return }
-    .toparea.right.pages.sim.vpane.wave.ctrl.list selection clear 0 end
+    if {![winfo exists .toparea.right.pages.sim.vpane.wave.main.ctrl.list]} { return }
+    .toparea.right.pages.sim.vpane.wave.main.ctrl.list selection clear 0 end
     set preferred {}
     foreach sig $::wave_signal_order {
         if {[string first "." $sig] < 0 && [regexp -nocase {(^|[._])clk($|[._\[])|clock} $sig]} {
@@ -1833,31 +1843,31 @@ proc wave_select_default_signals {} {
         set sig [lindex $preferred $i]
         set idx [lsearch -exact $::wave_signal_order $sig]
         if {$idx >= 0} {
-            .toparea.right.pages.sim.vpane.wave.ctrl.list selection set $idx
+            .toparea.right.pages.sim.vpane.wave.main.ctrl.list selection set $idx
         }
     }
     wave_apply_signal_selection
 }
 
 proc wave_apply_signal_selection {} {
-    if {![winfo exists .toparea.right.pages.sim.vpane.wave.ctrl.list]} { return }
+    if {![winfo exists .toparea.right.pages.sim.vpane.wave.main.ctrl.list]} { return }
     set selected {}
-    foreach idx [.toparea.right.pages.sim.vpane.wave.ctrl.list curselection] {
-        lappend selected [.toparea.right.pages.sim.vpane.wave.ctrl.list get $idx]
+    foreach idx [.toparea.right.pages.sim.vpane.wave.main.ctrl.list curselection] {
+        lappend selected [.toparea.right.pages.sim.vpane.wave.main.ctrl.list get $idx]
     }
     set ::wave_visible_signals $selected
     render_waveform
 }
 
 proc wave_show_all {} {
-    if {![winfo exists .toparea.right.pages.sim.vpane.wave.ctrl.list]} { return }
-    .toparea.right.pages.sim.vpane.wave.ctrl.list selection set 0 end
+    if {![winfo exists .toparea.right.pages.sim.vpane.wave.main.ctrl.list]} { return }
+    .toparea.right.pages.sim.vpane.wave.main.ctrl.list selection set 0 end
     wave_apply_signal_selection
 }
 
 proc wave_clear_selection {} {
-    if {![winfo exists .toparea.right.pages.sim.vpane.wave.ctrl.list]} { return }
-    .toparea.right.pages.sim.vpane.wave.ctrl.list selection clear 0 end
+    if {![winfo exists .toparea.right.pages.sim.vpane.wave.main.ctrl.list]} { return }
+    .toparea.right.pages.sim.vpane.wave.main.ctrl.list selection clear 0 end
     set ::wave_visible_signals {}
     render_waveform
 }
@@ -1893,7 +1903,7 @@ proc wave_time_to_x {time left_gutter scale} {
 }
 
 proc render_waveform {} {
-    set canvas .toparea.right.pages.sim.vpane.wave.canvas
+    set canvas .toparea.right.pages.sim.vpane.wave.main.view.canvas
     if {![winfo exists $canvas]} { return }
     if {$::wave_data eq ""} {
         canvas_message $canvas "No waveform" "Run simulation to generate a persistent VCD waveform."
@@ -2003,8 +2013,8 @@ proc load_waveform_from_state {} {
         set ::wave_data ""
         set ::wave_signal_map ""
         set ::wave_signal_order {}
-        if {[winfo exists .toparea.right.pages.sim.vpane.wave.ctrl.list]} {
-            .toparea.right.pages.sim.vpane.wave.ctrl.list delete 0 end
+        if {[winfo exists .toparea.right.pages.sim.vpane.wave.main.ctrl.list]} {
+            .toparea.right.pages.sim.vpane.wave.main.ctrl.list delete 0 end
         }
         render_waveform
         return
@@ -2015,14 +2025,14 @@ proc load_waveform_from_state {} {
     set ::wave_data [parse_vcd_content $content]
     set ::wave_signal_map [dict get $::wave_data signal_map]
     set ::wave_signal_order {}
-    if {[winfo exists .toparea.right.pages.sim.vpane.wave.ctrl.list]} {
-        .toparea.right.pages.sim.vpane.wave.ctrl.list delete 0 end
+    if {[winfo exists .toparea.right.pages.sim.vpane.wave.main.ctrl.list]} {
+        .toparea.right.pages.sim.vpane.wave.main.ctrl.list delete 0 end
     }
     foreach signal_record [dict get $::wave_data signals] {
         set sig_name [dict get $signal_record name]
         lappend ::wave_signal_order $sig_name
-        if {[winfo exists .toparea.right.pages.sim.vpane.wave.ctrl.list]} {
-            .toparea.right.pages.sim.vpane.wave.ctrl.list insert end $sig_name
+        if {[winfo exists .toparea.right.pages.sim.vpane.wave.main.ctrl.list]} {
+            .toparea.right.pages.sim.vpane.wave.main.ctrl.list insert end $sig_name
         }
     }
     set ::wave_max_time [dict get $::wave_data max_time]
@@ -2643,6 +2653,258 @@ proc console_cmd {} {
     }
 }
 
+# ===================== Technology Configuration =====================
+proc load_technology_from_state {} {
+    set ::technology_rows {}
+    set ::technology_names {}
+    set path [gui_state_text exchange_technology_path]
+    set content [load_text_file $path]
+    foreach line [split $content "\n"] {
+        if {$line eq "" || [string match "technology\t*" $line]} { continue }
+        set fields [split $line "\t"]
+        if {[llength $fields] < 12} { continue }
+        set row [dict create \
+            technology [lindex $fields 0] corner [lindex $fields 1] type [lindex $fields 2] \
+            library [lindex $fields 3] voltage [lindex $fields 4] temperature [lindex $fields 5] \
+            cells [lindex $fields 6] time_unit [lindex $fields 7] voltage_unit [lindex $fields 8] \
+            leakage_unit [lindex $fields 9] capacitance_unit [lindex $fields 10] synthesis [lindex $fields 11]]
+        lappend ::technology_rows $row
+        set tech [dict get $row technology]
+        if {[lsearch -exact $::technology_names $tech] < 0} { lappend ::technology_names $tech }
+    }
+    technology_refresh_list
+}
+
+proc technology_refresh_list {} {
+    set listbox .toparea.right.pages.config.main.techs.list
+    if {![winfo exists $listbox]} { return }
+    $listbox delete 0 end
+    set active_index -1
+    set index 0
+    foreach tech $::technology_names {
+        set count 0
+        foreach row $::technology_rows {
+            if {[dict get $row technology] eq $tech} { incr count }
+        }
+        set marker [expr {$tech eq $::active_technology ? "*" : " "}]
+        $listbox insert end [format "%s %-24s %2d" $marker $tech $count]
+        if {$tech eq $::active_technology} { set active_index $index }
+        incr index
+    }
+    if {$active_index >= 0} {
+        $listbox selection clear 0 end
+        $listbox selection set $active_index
+        $listbox see $active_index
+        set ::selected_technology [lindex $::technology_names $active_index]
+    } elseif {[llength $::technology_names] > 0} {
+        $listbox selection set 0
+        set ::selected_technology [lindex $::technology_names 0]
+    }
+    technology_update_details
+}
+
+proc technology_select {} {
+    set listbox .toparea.right.pages.config.main.techs.list
+    set selection [$listbox curselection]
+    if {[llength $selection] == 0} { return }
+    set ::selected_technology [lindex $::technology_names [lindex $selection 0]]
+    technology_update_details
+}
+
+proc technology_update_details {} {
+    set widget .toparea.right.pages.config.main.details.text
+    if {![winfo exists $widget]} { return }
+    set rows {}
+    set synthesis ""
+    foreach row $::technology_rows {
+        if {[dict get $row technology] eq $::selected_technology} {
+            lappend rows $row
+            if {[dict get $row synthesis]} { set synthesis [dict get $row corner] }
+        }
+    }
+    $widget configure -state normal
+    $widget delete 1.0 end
+    if {[llength $rows] == 0} {
+        $widget insert end "No Liberty libraries detected."
+    } else {
+        set first [lindex $rows 0]
+        $widget insert end "Technology: $::selected_technology\n"
+        $widget insert end "Corners: [llength $rows]\n"
+        $widget insert end "Synthesis corner: $synthesis\n"
+        $widget insert end "Units: time=[dict get $first time_unit], voltage=[dict get $first voltage_unit], leakage=[dict get $first leakage_unit], capacitance=[dict get $first capacitance_unit]\n\n"
+        $widget insert end [format "%-32s %-4s %8s %8s %7s  %s\n" "Corner" "Type" "VDD" "Temp" "Cells" "Library"]
+        $widget insert end [string repeat "-" 104]
+        $widget insert end "\n"
+        foreach row $rows {
+            set synth_mark ""
+            if {[dict get $row synthesis]} {
+                set synth_mark { [SYNTH]}
+            }
+            $widget insert end [format "%-32s %-4s %7.3fV %7.1fC %7s  %s%s\n" \
+                [dict get $row corner] [dict get $row type] [dict get $row voltage] \
+                [dict get $row temperature] [dict get $row cells] [dict get $row library] $synth_mark]
+        }
+    }
+    $widget configure -state disabled
+    if {[winfo exists .toparea.right.pages.config.current.value]} {
+        .toparea.right.pages.config.current.value configure -text \
+            [expr {$::active_technology eq "" ? "No technology selected" : $::active_technology}]
+    }
+    if {[winfo exists .toparea.right.pages.config.actions.apply]} {
+        set state [expr {$::selected_technology eq "" || $::selected_technology eq $::active_technology ? "disabled" : "normal"}]
+        .toparea.right.pages.config.actions.apply configure -state $state
+    }
+}
+
+proc technology_apply {} {
+    if {$::selected_technology eq ""} { return }
+    console_log "ai_digital ▸ /tech $::selected_technology" "cmd"
+    pipe_send "/tech $::selected_technology"
+}
+
+# ===================== Corner Power Chart =====================
+proc chart_palette {index} {
+    set colors {#4fc3f7 #ffa726 #66bb6a #ef5350 #ab47bc #26a69a #d4e157 #ff7043 #7e57c2 #8d6e63}
+    return [lindex $colors [expr {$index % [llength $colors]}]]
+}
+
+proc load_area_breakdown_from_state {} {
+    set ::area_breakdown_rows {}
+    set content [load_text_file [gui_state_text exchange_area_path]]
+    set in_section 0
+    foreach line [split $content "\n"] {
+        set trimmed [string trim $line]
+        if {$trimmed eq "Cell Breakdown"} {
+            set in_section 1
+            continue
+        }
+        if {!$in_section} { continue }
+        if {$trimmed eq "" || [string match "Synthesis Report*" $trimmed]} { break }
+        if {[string match "----*" $trimmed]} { continue }
+        if {[regexp {^(\S+)\s+(\d+)\s+([0-9.]+)\s+GE$} $trimmed -> cell_type count total_ge]} {
+            lappend ::area_breakdown_rows [dict create type $cell_type count $count total_ge $total_ge]
+        }
+    }
+}
+
+proc render_area_chart {} {
+    set canvas .toparea.right.pages.area.main.chart.canvas
+    if {![winfo exists $canvas]} { return }
+    $canvas delete all
+    if {[llength $::area_breakdown_rows] == 0} {
+        canvas_message $canvas "No area breakdown" "Run synthesis to populate standard-cell area composition."
+        return
+    }
+    set width [winfo width $canvas]
+    set height [winfo height $canvas]
+    if {$width < 420} { set width 620 }
+    if {$height < 320} { set height 420 }
+    set cx 160
+    set cy [expr {$height / 2.0}]
+    set radius [expr {min(130, ($height - 60) / 2.0)}]
+    set total 0.0
+    foreach row $::area_breakdown_rows { set total [expr {$total + [dict get $row total_ge]}] }
+    if {$total <= 0} {
+        canvas_message $canvas "No area breakdown" "Total area is zero."
+        return
+    }
+    $canvas create text 16 18 -anchor w -text "Cell Area Composition" -fill $::C_HIGHLIGHT -font {Helvetica 10 bold}
+    set start 0.0
+    set legend_y 52
+    set idx 0
+    foreach row $::area_breakdown_rows {
+        set value [dict get $row total_ge]
+        set extent [expr {$value / $total * 360.0}]
+        set color [chart_palette $idx]
+        $canvas create arc [expr {$cx - $radius}] [expr {$cy - $radius}] [expr {$cx + $radius}] [expr {$cy + $radius}] \
+            -start $start -extent $extent -fill $color -outline $::C_BG -width 1
+        set pct [expr {$value * 100.0 / $total}]
+        $canvas create rectangle 340 $legend_y 354 [expr {$legend_y + 14}] -fill $color -outline ""
+        $canvas create text 362 [expr {$legend_y + 7}] -anchor w \
+            -text [format "%s  %.1f%%  (%s cells / %.1f GE)" [dict get $row type] $pct [dict get $row count] $value] \
+            -fill $::C_TEXT -font {Helvetica 8}
+        set start [expr {$start + $extent}]
+        incr legend_y 22
+        incr idx
+    }
+    $canvas configure -scrollregion "0 0 $width [expr {max($height, $legend_y + 20)}]"
+}
+
+proc load_power_corners_from_state {} {
+    set ::power_corner_rows {}
+    set content [load_text_file [gui_state_text exchange_power_corners_path]]
+    foreach line [split $content "\n"] {
+        if {$line eq "" || [string match "analysis\t*" $line]} { continue }
+        set fields [split $line "\t"]
+        if {[llength $fields] < 8} { continue }
+        lappend ::power_corner_rows [dict create analysis [lindex $fields 0] frequency [lindex $fields 1] \
+            corner [lindex $fields 2] type [lindex $fields 3] voltage [lindex $fields 4] \
+            static [lindex $fields 5] dynamic [lindex $fields 6] total [lindex $fields 7]]
+    }
+    render_power_chart
+}
+
+proc render_power_chart {} {
+    set canvas .toparea.right.pages.power.main.chart.canvas
+    if {![winfo exists $canvas]} { return }
+    $canvas delete all
+    if {[llength $::power_corner_rows] == 0} {
+        canvas_message $canvas "No corner power data" "Run multi-corner power analysis to populate this chart."
+        return
+    }
+    set width [winfo width $canvas]
+    if {$width < 420} { set width 760 }
+    array unset groups
+    set order {}
+    set max_total 0.0
+    foreach row $::power_corner_rows {
+        set key "[dict get $row analysis]|[format %.3f [dict get $row frequency]]"
+        if {![info exists groups($key)]} {
+            set groups($key) {}
+            lappend order $key
+        }
+        lappend groups($key) $row
+        if {[dict get $row total] > $max_total} { set max_total [dict get $row total] }
+    }
+    if {$max_total <= 0} { set max_total 1.0 }
+    set row_height 42
+    set height 60
+    set label_width 190
+    set right_pad 80
+    $canvas create text 16 18 -anchor w -text "Per-Corner Power Across Operating Points" -fill $::C_HIGHLIGHT -font {Helvetica 10 bold}
+    $canvas create rectangle 16 38 30 50 -fill $::C_WARN -outline ""
+    $canvas create text 35 44 -anchor w -text "Static" -fill $::C_DIM -font {Helvetica 8}
+    $canvas create rectangle 88 38 102 50 -fill $::C_HIGHLIGHT -outline ""
+    $canvas create text 107 44 -anchor w -text "Non-static (dynamic/internal/clock)" -fill $::C_DIM -font {Helvetica 8}
+    set y 72
+    foreach key $order {
+        set rows $groups($key)
+        set first [lindex $rows 0]
+        $canvas create text 12 $y -anchor w \
+            -text "[dict get $first analysis] @ [format %.0f [dict get $first frequency]] MHz" \
+            -fill $::C_HIGHLIGHT -font {Helvetica 9 bold}
+        incr y 18
+        foreach row $rows {
+            set bar_x $label_width
+            set usable [expr {$width - $label_width - $right_pad}]
+            set static_w [expr {$usable * [dict get $row static] / $max_total}]
+            set total_w [expr {$usable * [dict get $row total] / $max_total}]
+            $canvas create text 12 [expr {$y + 11}] -anchor w \
+                -text "[dict get $row corner] ([dict get $row type])" -fill $::C_TEXT -font {Courier 8}
+            $canvas create rectangle $bar_x $y [expr {$bar_x + $total_w}] [expr {$y + 22}] -fill $::C_HIGHLIGHT -outline ""
+            if {$static_w > 0} {
+                $canvas create rectangle $bar_x $y [expr {$bar_x + $static_w}] [expr {$y + 22}] -fill $::C_WARN -outline ""
+            }
+            $canvas create text [expr {$bar_x + $total_w + 7}] [expr {$y + 11}] -anchor w \
+                -text [format "%.2f uW" [dict get $row total]] -fill $::C_TEXT -font {Helvetica 8 bold}
+            incr y $row_height
+        }
+        incr y 8
+    }
+    set height [expr {max($height, $y + 12)}]
+    $canvas configure -scrollregion "0 0 $width $height"
+}
+
 # ===================== Update UI =====================
 proc update_synth_stats {} {
     if {[winfo exists .toparea.right.pages.synth.stats.cells.v]} {
@@ -2696,6 +2958,8 @@ proc update_area_page {} {
         .toparea.right.pages.area.stats.um2.v configure -text [format "%.3f" $::synth_area_um2]
         .toparea.right.pages.area.stats.cells.v configure -text $::synth_cells
     }
+    load_area_breakdown_from_state
+    render_area_chart
 }
 
 proc update_summary_page {} {
@@ -2737,16 +3001,22 @@ proc update_summary_page {} {
 # ===================== Page Switching =====================
 proc set_page {page} {
     set ::current_page $page
-    foreach p {rtl sim synth timing power area formal summary} {
+    foreach p {config rtl sim synth timing power area formal summary} {
         if {[winfo exists .toparea.right.pages.$p]} { pack forget .toparea.right.pages.$p }
     }
     if {[winfo exists .toparea.right.pages.$page]} { pack .toparea.right.pages.$page -fill both -expand 1 }
-    foreach p {rtl sim synth timing power area formal summary} {
+    foreach p {config rtl sim synth timing power area formal summary} {
         if {[winfo exists .toparea.left.$p]} { .toparea.left.$p configure -bg $::C_PANEL -fg $::C_DIM }
     }
     if {[winfo exists .toparea.left.$page]} { .toparea.left.$page configure -bg $::C_ACCENT -fg $::C_HIGHLIGHT }
     if {$page eq "synth"} {
         after idle render_gate_netlist
+    } elseif {$page eq "config"} {
+        after idle technology_refresh_list
+    } elseif {$page eq "power"} {
+        after idle render_power_chart
+    } elseif {$page eq "area"} {
+        after idle render_area_chart
     } elseif {$page eq "timing"} {
         after idle render_timing_path_graph
     } elseif {$page eq "formal"} {
@@ -2787,8 +3057,10 @@ proc gui_run_autodump {} {
     foreach spec {
         {synth   .toparea.right.pages.synth.gate_canvas                 render_gate_netlist      synth_canvas}
         {timing  .toparea.right.pages.timing.vpane.graph.main.right.canvas render_timing_path_graph timing_canvas}
-        {sim     .toparea.right.pages.sim.vpane.wave.canvas             render_waveform          waveform_canvas}
+        {sim     .toparea.right.pages.sim.vpane.wave.main.view.canvas   render_waveform          waveform_canvas}
         {formal  .toparea.right.pages.formal.points_canvas              render_formal_points_graph formal_canvas}
+        {power   .toparea.right.pages.power.main.chart.canvas           render_power_chart        power_canvas}
+        {area    .toparea.right.pages.area.main.chart.canvas            render_area_chart         area_canvas}
         {summary .toparea.right.pages.summary.hpane.hier.canvas         render_hierarchy_treemap hierarchy_canvas}
     } {
         lassign $spec page canvas renderer stem
@@ -2908,7 +3180,7 @@ frame .toparea.left -width 180 -bg $::C_PANEL -bd 0 -highlightthickness 0
 pack .toparea.left -side left -fill y -anchor nw
 label .toparea.left.title -text "  Flow Steps" -fg $::C_HIGHLIGHT -bg $::C_PANEL -font {Helvetica 11 bold}
 pack .toparea.left.title -fill x -pady {10 6}
-set ::steps {rtl "📄 RTL" sim "▶ Simulation" synth "⚙ Synthesis" timing "⏱ Timing" power "⚡ Power" area "📐 Area" formal "✓ Formal" summary "📊 Summary"}
+set ::steps {config "⚙ Config" rtl "📄 RTL" sim "▶ Simulation" synth "⚙ Synthesis" timing "⏱ Timing" power "⚡ Power" area "📐 Area" formal "✓ Formal" summary "📊 Summary"}
 foreach {key label} $::steps {
     button .toparea.left.$key -text $label -bg $::C_PANEL -fg $::C_DIM \
         -activebackground "#33334a" -activeforeground $::C_HIGHLIGHT \
@@ -2931,6 +3203,49 @@ frame .toparea.right -bg $::C_BG
 pack .toparea.right -side left -fill both -expand 1
 set ::page_container [frame .toparea.right.pages -bg $::C_BG]
 pack $::page_container -fill both -expand 1
+
+# --- Page: Config ---
+set p [frame .toparea.right.pages.config -bg $::C_BG]
+frame $p.header -bg $::C_PANEL
+pack $p.header -fill x
+label $p.header.title -text "  Project Technology" -fg $::C_HIGHLIGHT -bg $::C_PANEL -font {Helvetica 11 bold}
+pack $p.header.title -side left -padx 4 -pady 7
+panedwindow $p.main -orient horizontal -bg $::C_BORDER -sashwidth 4
+pack $p.main -fill both -expand 1 -padx 6 -pady 6
+set tech_list_frame [frame $p.main.techs -bg $::C_PANEL -width 300]
+label $tech_list_frame.title -text "  Available Technologies" -fg $::C_HIGHLIGHT -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
+pack $tech_list_frame.title -fill x -pady {5 3}
+listbox $tech_list_frame.list -selectmode browse -bg $::C_INPUT_BG -fg $::C_TEXT -font {Courier 9} \
+    -highlightbackground $::C_BORDER -exportselection 0 -activestyle dotbox
+scrollbar $tech_list_frame.scroll -command [list $tech_list_frame.list yview] -bg $::C_PANEL -troughcolor $::C_BG
+$tech_list_frame.list configure -yscrollcommand [list $tech_list_frame.scroll set]
+pack $tech_list_frame.scroll -side right -fill y -padx {0 3} -pady 3
+pack $tech_list_frame.list -side left -fill both -expand 1 -padx {4 0} -pady 3
+bind $tech_list_frame.list <<ListboxSelect>> technology_select
+set tech_detail_frame [frame $p.main.details -bg $::C_INPUT_BG]
+label $tech_detail_frame.title -text "  Liberty Information" -fg $::C_HIGHLIGHT -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
+pack $tech_detail_frame.title -fill x -pady {5 3}
+text $tech_detail_frame.text -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 0 -font {Courier 9} -state disabled -wrap none
+scrollbar $tech_detail_frame.ys -command [list $tech_detail_frame.text yview] -bg $::C_PANEL -troughcolor $::C_BG
+scrollbar $tech_detail_frame.xs -orient horizontal -command [list $tech_detail_frame.text xview] -bg $::C_PANEL -troughcolor $::C_BG
+$tech_detail_frame.text configure -yscrollcommand [list $tech_detail_frame.ys set] -xscrollcommand [list $tech_detail_frame.xs set]
+pack $tech_detail_frame.ys -side right -fill y
+pack $tech_detail_frame.xs -side bottom -fill x
+pack $tech_detail_frame.text -fill both -expand 1 -padx 4 -pady 3
+$p.main add $tech_list_frame -width 300 -sticky news
+$p.main add $tech_detail_frame -width 680 -sticky news
+frame $p.current -bg $::C_PANEL
+pack $p.current -fill x -padx 6 -pady {0 2}
+label $p.current.label -text "  Current project technology:" -fg $::C_DIM -bg $::C_PANEL -font {Helvetica 10}
+label $p.current.value -text "No technology selected" -fg $::C_HIGHLIGHT -bg $::C_PANEL -font {Helvetica 10 bold}
+pack $p.current.label -side left -pady 7
+pack $p.current.value -side left -padx 8 -pady 7
+frame $p.actions -bg $::C_BG
+pack $p.actions -fill x -padx 6 -pady {2 7}
+button $p.actions.apply -text "Use for Project" -command technology_apply -bg $::C_ACCENT -fg $::C_HIGHLIGHT \
+    -activebackground "#33334a" -activeforeground $::C_HIGHLIGHT -relief flat -padx 12 -pady 4 -state disabled
+pack $p.actions.apply -side right
+pack forget $p
 
 # --- Page: RTL ---
 set p [frame .toparea.right.pages.rtl -bg $::C_BG]
@@ -2979,39 +3294,41 @@ pack $wave_frame.bar.zoom_out -side right -padx 2
 pack $wave_frame.bar.zoom_in -side right -padx 2
 frame $wave_frame.main -bg $::C_INPUT_BG
 pack $wave_frame.main -fill both -expand 1
-frame $wave_frame.ctrl -bg $::C_PANEL -width 230
-pack $wave_frame.ctrl -side left -fill y
-label $wave_frame.ctrl.title -text "  Visible Signals" -fg $::C_HIGHLIGHT -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
-pack $wave_frame.ctrl.title -fill x -pady {4 2}
-listbox $wave_frame.ctrl.list -selectmode extended -bg $::C_INPUT_BG -fg $::C_TEXT -font {Courier 9} -highlightbackground $::C_BORDER -exportselection 0
-scrollbar $wave_frame.ctrl.scroll -command [list $wave_frame.ctrl.list yview] -bg $::C_PANEL -troughcolor $::C_BG
-$wave_frame.ctrl.list configure -yscrollcommand [list $wave_frame.ctrl.scroll set]
-pack $wave_frame.ctrl.scroll -side right -fill y -padx {0 2} -pady 2
-pack $wave_frame.ctrl.list -side left -fill both -expand 1 -padx {4 0} -pady 2
-frame $wave_frame.ctrl.buttons -bg $::C_PANEL
-pack $wave_frame.ctrl.buttons -fill x -pady 4
-button $wave_frame.ctrl.buttons.apply -text "Show Selected" -command wave_apply_signal_selection -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat
-button $wave_frame.ctrl.buttons.all -text "Show All" -command wave_show_all -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat
-button $wave_frame.ctrl.buttons.clear -text "Clear" -command wave_clear_selection -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat
-pack $wave_frame.ctrl.buttons.apply -fill x -padx 4 -pady 1
-pack $wave_frame.ctrl.buttons.all -fill x -padx 4 -pady 1
-pack $wave_frame.ctrl.buttons.clear -fill x -padx 4 -pady 1
-bind $wave_frame.ctrl.list <<ListboxSelect>> wave_apply_signal_selection
-canvas $wave_frame.canvas -bg $::C_INPUT_BG -highlightthickness 0
-scrollbar $wave_frame.vs -orient vertical -command [list $wave_frame.canvas yview] -bg $::C_PANEL -troughcolor $::C_BG
-scrollbar $wave_frame.hs -orient horizontal -command [list $wave_frame.canvas xview] -bg $::C_PANEL -troughcolor $::C_BG
-$wave_frame.canvas configure -yscrollcommand [list $wave_frame.vs set] -xscrollcommand [list $wave_frame.hs set]
-bind $wave_frame.canvas <Button-4> {wave_zoom_in; break}
-bind $wave_frame.canvas <Button-5> {wave_zoom_out; break}
-bind $wave_frame.canvas <MouseWheel> {
+frame $wave_frame.main.ctrl -bg $::C_PANEL -width 230
+pack $wave_frame.main.ctrl -side left -fill y
+label $wave_frame.main.ctrl.title -text "  Visible Signals" -fg $::C_HIGHLIGHT -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
+pack $wave_frame.main.ctrl.title -fill x -pady {4 2}
+listbox $wave_frame.main.ctrl.list -selectmode extended -bg $::C_INPUT_BG -fg $::C_TEXT -font {Courier 9} -highlightbackground $::C_BORDER -exportselection 0
+scrollbar $wave_frame.main.ctrl.scroll -command [list $wave_frame.main.ctrl.list yview] -bg $::C_PANEL -troughcolor $::C_BG
+$wave_frame.main.ctrl.list configure -yscrollcommand [list $wave_frame.main.ctrl.scroll set]
+pack $wave_frame.main.ctrl.scroll -side right -fill y -padx {0 2} -pady 2
+pack $wave_frame.main.ctrl.list -side left -fill both -expand 1 -padx {4 0} -pady 2
+frame $wave_frame.main.ctrl.buttons -bg $::C_PANEL
+pack $wave_frame.main.ctrl.buttons -fill x -pady 4
+button $wave_frame.main.ctrl.buttons.apply -text "Show Selected" -command wave_apply_signal_selection -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat
+button $wave_frame.main.ctrl.buttons.all -text "Show All" -command wave_show_all -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat
+button $wave_frame.main.ctrl.buttons.clear -text "Clear" -command wave_clear_selection -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat
+pack $wave_frame.main.ctrl.buttons.apply -fill x -padx 4 -pady 1
+pack $wave_frame.main.ctrl.buttons.all -fill x -padx 4 -pady 1
+pack $wave_frame.main.ctrl.buttons.clear -fill x -padx 4 -pady 1
+bind $wave_frame.main.ctrl.list <<ListboxSelect>> wave_apply_signal_selection
+frame $wave_frame.main.view -bg $::C_INPUT_BG
+pack $wave_frame.main.view -side left -fill both -expand 1
+canvas $wave_frame.main.view.canvas -bg $::C_INPUT_BG -highlightthickness 0
+scrollbar $wave_frame.main.view.vs -orient vertical -command [list $wave_frame.main.view.canvas yview] -bg $::C_PANEL -troughcolor $::C_BG
+scrollbar $wave_frame.main.view.hs -orient horizontal -command [list $wave_frame.main.view.canvas xview] -bg $::C_PANEL -troughcolor $::C_BG
+$wave_frame.main.view.canvas configure -yscrollcommand [list $wave_frame.main.view.vs set] -xscrollcommand [list $wave_frame.main.view.hs set]
+bind $wave_frame.main.view.canvas <Button-4> {wave_zoom_in; break}
+bind $wave_frame.main.view.canvas <Button-5> {wave_zoom_out; break}
+bind $wave_frame.main.view.canvas <MouseWheel> {
     if {%D > 0} {wave_zoom_in} else {wave_zoom_out}
     break
 }
-bind $wave_frame.canvas <ButtonPress-1> {canvas_pan_mark %W %x %y}
-bind $wave_frame.canvas <B1-Motion> {canvas_pan_drag %W %x %y}
-pack $wave_frame.vs -side right -fill y -in $wave_frame.main
-pack $wave_frame.hs -side bottom -fill x -in $wave_frame.main
-pack $wave_frame.canvas -side left -fill both -expand 1 -in $wave_frame.main
+bind $wave_frame.main.view.canvas <ButtonPress-1> {canvas_pan_mark %W %x %y}
+bind $wave_frame.main.view.canvas <B1-Motion> {canvas_pan_drag %W %x %y}
+pack $wave_frame.main.view.vs -side right -fill y
+pack $wave_frame.main.view.hs -side bottom -fill x
+pack $wave_frame.main.view.canvas -side left -fill both -expand 1
 set log_frame [frame $p.vpane.log -bg $::C_INPUT_BG]
 frame $log_frame.bar -bg $::C_PANEL
 pack $log_frame.bar -fill x
@@ -3174,8 +3491,27 @@ foreach {key label} {total "Total Power:" static "Static:" dynamic "Dynamic:"} {
     label $p.stats.$key.v -text "0.0 mW" -fg $::C_HIGHLIGHT -bg $::C_INPUT_BG -anchor e -font {Helvetica 10 bold}
     pack $p.stats.$key.l -side left; pack $p.stats.$key.v -side right -padx 8
 }
-text $p.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
-pack $p.out -fill both -expand 1 -padx 6 -pady 4
+panedwindow $p.main -orient horizontal -bg $::C_BORDER -sashwidth 4
+pack $p.main -fill both -expand 1 -padx 6 -pady 4
+set power_chart_frame [frame $p.main.chart -bg $::C_INPUT_BG]
+label $power_chart_frame.title -text "  Corner Power Distribution" -fg $::C_HIGHLIGHT -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
+pack $power_chart_frame.title -fill x -pady {3 2}
+canvas $power_chart_frame.canvas -bg $::C_INPUT_BG -highlightthickness 0
+scrollbar $power_chart_frame.scroll -command [list $power_chart_frame.canvas yview] -bg $::C_PANEL -troughcolor $::C_BG
+$power_chart_frame.canvas configure -yscrollcommand [list $power_chart_frame.scroll set]
+bind $power_chart_frame.canvas <Configure> {after idle render_power_chart}
+pack $power_chart_frame.scroll -side right -fill y
+pack $power_chart_frame.canvas -fill both -expand 1
+set power_report_frame [frame $p.main.report -bg $::C_INPUT_BG]
+label $power_report_frame.title -text "  Power Report" -fg $::C_DIM -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
+pack $power_report_frame.title -fill x -pady {3 2}
+text $power_report_frame.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 9} -highlightbackground $::C_BORDER -state disabled -wrap none
+scrollbar $power_report_frame.scroll -command [list $power_report_frame.out yview] -bg $::C_PANEL -troughcolor $::C_BG
+$power_report_frame.out configure -yscrollcommand [list $power_report_frame.scroll set]
+pack $power_report_frame.scroll -side right -fill y
+pack $power_report_frame.out -fill both -expand 1 -padx 2 -pady 2
+$p.main add $power_chart_frame -width 620 -sticky news
+$p.main add $power_report_frame -width 420 -sticky news
 pack forget $p
 
 # --- Page: Area ---
@@ -3188,8 +3524,21 @@ foreach {key label} {ge "Area (GE):" um2 "Area (um^2):" cells "Cell Count:"} {
     label $p.stats.$key.v -text "0" -fg $::C_HIGHLIGHT -bg $::C_INPUT_BG -anchor e -font {Helvetica 10 bold}
     pack $p.stats.$key.l -side left; pack $p.stats.$key.v -side right -padx 8
 }
+panedwindow $p.main -orient horizontal -bg $::C_BORDER -sashwidth 4
+pack $p.main -fill both -expand 1 -padx 6 -pady 4
+set area_chart_frame [frame $p.main.chart -bg $::C_INPUT_BG]
+label $area_chart_frame.title -text "  Standard-Cell Area Share" -fg $::C_HIGHLIGHT -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
+pack $area_chart_frame.title -fill x -pady {3 2}
+canvas $area_chart_frame.canvas -bg $::C_INPUT_BG -highlightthickness 0
+bind $area_chart_frame.canvas <Configure> {after idle render_area_chart}
+pack $area_chart_frame.canvas -fill both -expand 1
+set area_report_frame [frame $p.main.report -bg $::C_INPUT_BG]
+label $area_report_frame.title -text "  Area Report" -fg $::C_DIM -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
+pack $area_report_frame.title -fill x -pady {3 2}
 text $p.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
-pack $p.out -fill both -expand 1 -padx 6 -pady 4
+pack $p.out -fill both -expand 1 -in $area_report_frame -padx 2 -pady 2
+$p.main add $area_chart_frame -width 520 -sticky news
+$p.main add $area_report_frame -width 520 -sticky news
 pack forget $p
 
 # --- Page: Formal ---

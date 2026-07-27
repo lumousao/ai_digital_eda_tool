@@ -5,6 +5,16 @@
 pub mod ffi;
 
 use ffi::*;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+static ENGINE_FFI_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn engine_ffi_lock() -> MutexGuard<'static, ()> {
+    ENGINE_FFI_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub struct SynthStats {
     pub cell_count: usize,
@@ -87,6 +97,7 @@ impl Design {
         let c_name = std::ffi::CString::new(name).unwrap();
         let code_bytes = clean_code.as_bytes();
         // Parse the code
+        let _ffi_guard = engine_ffi_lock();
         unsafe {
             let err = rtl_parse_verilog_str(
                 self.ptr,
@@ -257,6 +268,7 @@ impl Design {
         let c_lib = liberty_file.map(|s| std::ffi::CString::new(s).unwrap());
         let c_lib_ptr = c_lib.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null());
 
+        let _ffi_guard = engine_ffi_lock();
         unsafe {
             let report = rtl_timing_analysis(c_output.as_ptr(), c_name.as_ptr(), c_lib_ptr, clock_period);
             let report_text = cstr_to_string(report.report);
@@ -279,19 +291,19 @@ impl Design {
         }
     }
 
-    /// Run per-corner timing analysis with PVT-based delay scaling.
-    /// Uses corner type (ss/ff/tt), voltage, and temperature to scale delays.
-    /// Does NOT parse large .lib files — fast and reliable for multi-corner.
+    /// Run per-corner timing analysis from the corner's Liberty tables.
     pub fn timing_analysis_corner(&self, synth_output: &str, module_name: &str,
-        corner_type: &str, voltage: f64, temperature: f64, clock_period: f64) -> TimingReport {
+        liberty_file: &str, corner_type: &str, voltage: f64,
+        temperature: f64, clock_period: f64) -> TimingReport {
         let c_output = std::ffi::CString::new(synth_output).unwrap();
         let c_name = std::ffi::CString::new(module_name).unwrap();
+        let c_lib = std::ffi::CString::new(liberty_file).unwrap();
         let c_corner = std::ffi::CString::new(corner_type).unwrap();
 
         unsafe {
             let report = rtl_timing_analysis_corner(
                 c_output.as_ptr(), c_name.as_ptr(),
-                c_corner.as_ptr(), voltage, temperature, clock_period);
+                c_lib.as_ptr(), c_corner.as_ptr(), voltage, temperature, clock_period);
             let report_text = cstr_to_string(report.report);
             let out = TimingReport {
                 area_ge: report.area_ge,
@@ -435,6 +447,7 @@ pub fn simulate(rtl_code: &str, tb_code: &str, module_name: &str,
     let c_mod = std::ffi::CString::new(module_name).unwrap();
     let c_clk = std::ffi::CString::new(clk_port).unwrap();
 
+    let _ffi_guard = engine_ffi_lock();
     unsafe {
         let result = rtl_simulate(
             c_rtl.as_ptr(), c_tb.as_ptr(), c_mod.as_ptr(), c_clk.as_ptr(),
@@ -454,14 +467,27 @@ pub fn simulate(rtl_code: &str, tb_code: &str, module_name: &str,
     }
 }
 
-/// Run formal equivalence check
-pub fn formal_check(rtl_code: &str, gate_code: &str, module_name: &str) -> bool {
-    let c_rtl = std::ffi::CString::new(rtl_code).unwrap();
-    let c_gate = std::ffi::CString::new(gate_code).unwrap();
-    let c_mod = std::ffi::CString::new(module_name).unwrap();
+/// Run formal equivalence check.
+///
+/// `Ok(true)` and `Ok(false)` are explicit engine verdicts. `Err` means the
+/// comparison could not establish either result and must never be treated as
+/// equivalence.
+pub fn formal_check(rtl_code: &str, gate_code: &str, module_name: &str) -> Result<bool, String> {
+    let c_rtl = std::ffi::CString::new(rtl_code)
+        .map_err(|_| "RTL source contains an embedded NUL byte".to_string())?;
+    let c_gate = std::ffi::CString::new(gate_code)
+        .map_err(|_| "gate-level source contains an embedded NUL byte".to_string())?;
+    let c_mod = std::ffi::CString::new(module_name)
+        .map_err(|_| "module name contains an embedded NUL byte".to_string())?;
 
-    unsafe {
-        rtl_formal_check(c_rtl.as_ptr(), c_gate.as_ptr(), c_mod.as_ptr()) != 0
+    let _ffi_guard = engine_ffi_lock();
+    match unsafe { rtl_formal_check(c_rtl.as_ptr(), c_gate.as_ptr(), c_mod.as_ptr()) } {
+        1 => Ok(true),
+        0 => Ok(false),
+        status => Err(format!(
+            "formal equivalence check was inconclusive (engine status {})",
+            status
+        )),
     }
 }
 
@@ -483,6 +509,7 @@ pub fn simulate_with_limit_and_timeout(rtl_code: &str, tb_code: &str, module_nam
     let c_mod = std::ffi::CString::new(module_name).unwrap();
     let c_clk = std::ffi::CString::new(clk_port).unwrap();
 
+    let _ffi_guard = engine_ffi_lock();
     unsafe {
         let result = rtl_simulate_with_limit_and_timeout(
             c_rtl.as_ptr(), c_tb.as_ptr(), c_mod.as_ptr(), c_clk.as_ptr(),
@@ -738,6 +765,7 @@ pub fn synthesize_real_with_lib(rtl_code: &str, module_name: &str, liberty_path:
     let c_mod = std::ffi::CString::new(module_name).unwrap();
     let c_lib = liberty_path.map(|p| std::ffi::CString::new(p).unwrap());
 
+    let _ffi_guard = engine_ffi_lock();
     unsafe {
         let result = if let Some(ref lib) = c_lib {
             ffi::rtl_synthesize_real_with_lib(c_rtl.as_ptr(), c_mod.as_ptr(), lib.as_ptr())
@@ -789,6 +817,7 @@ pub fn synthesize_freq_optimized(rtl_code: &str, module_name: &str, liberty_path
     let c_mod = std::ffi::CString::new(module_name).unwrap_or_default();
     let c_lib = liberty_path.map(|p| std::ffi::CString::new(p).unwrap_or_default());
 
+    let _ffi_guard = engine_ffi_lock();
     unsafe {
         let lib_ptr = c_lib.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null());
         let result_ffi = ffi::rtl_synthesize_freq_optimized(
@@ -889,8 +918,12 @@ pub fn get_toggle_counts_json(rtl_code: &str, tb_code: &str, module_name: &str) 
     let c_rtl = std::ffi::CString::new(rtl_code).unwrap();
     let c_tb = std::ffi::CString::new(tb_code).unwrap();
     let c_mod = std::ffi::CString::new(module_name).unwrap();
+    let _ffi_guard = engine_ffi_lock();
     unsafe {
-        cstr_to_string(ffi::rtl_get_toggle_counts_json(c_rtl.as_ptr(), c_tb.as_ptr(), c_mod.as_ptr()))
+        let ptr = ffi::rtl_get_toggle_counts_json(c_rtl.as_ptr(), c_tb.as_ptr(), c_mod.as_ptr());
+        let result = cstr_to_string(ptr);
+        libc::free(ptr as *mut libc::c_void);
+        result
     }
 }
 
@@ -908,13 +941,29 @@ pub struct PowerAnalysisResult {
 
 /// Run power analysis on gate-level netlist using real liberty library
 pub fn analyze_power(gate_netlist: &str, module_name: &str, liberty_path: &str, clock_freq_mhz: f64) -> PowerAnalysisResult {
+    analyze_power_with_activity(gate_netlist, module_name, liberty_path, clock_freq_mhz, None)
+}
+
+/// Run power analysis using Liberty plus optional simulation switching activity JSON.
+pub fn analyze_power_with_activity(
+    gate_netlist: &str,
+    module_name: &str,
+    liberty_path: &str,
+    clock_freq_mhz: f64,
+    activity_json: Option<&str>,
+) -> PowerAnalysisResult {
     let c_netlist = std::ffi::CString::new(gate_netlist).unwrap();
     let c_mod = std::ffi::CString::new(module_name).unwrap();
     let c_lib = std::ffi::CString::new(liberty_path).unwrap();
+    let c_activity = activity_json.map(|json| std::ffi::CString::new(json).unwrap_or_default());
+    let activity_ptr = c_activity
+        .as_ref()
+        .map(|json| json.as_ptr())
+        .unwrap_or(std::ptr::null());
     unsafe {
         let r = ffi::rtl_power_analyze(
             c_netlist.as_ptr(), c_mod.as_ptr(), c_lib.as_ptr(),
-            clock_freq_mhz, std::ptr::null());
+            clock_freq_mhz, activity_ptr);
         let report = cstr_to_string(r.report);
         let result = PowerAnalysisResult {
             total_power_uw: r.total_power_uw,
@@ -936,8 +985,12 @@ pub fn get_sim_coverage_json(rtl_code: &str, tb_code: &str, module_name: &str) -
     let c_rtl = std::ffi::CString::new(rtl_code).unwrap();
     let c_tb = std::ffi::CString::new(tb_code).unwrap();
     let c_mod = std::ffi::CString::new(module_name).unwrap();
+    let _ffi_guard = engine_ffi_lock();
     unsafe {
-        cstr_to_string(ffi::rtl_get_sim_coverage_json(c_rtl.as_ptr(), c_tb.as_ptr(), c_mod.as_ptr()))
+        let ptr = ffi::rtl_get_sim_coverage_json(c_rtl.as_ptr(), c_tb.as_ptr(), c_mod.as_ptr());
+        let result = cstr_to_string(ptr);
+        libc::free(ptr as *mut libc::c_void);
+        result
     }
 }
 
@@ -1062,6 +1115,128 @@ endmodule
     }
 
     #[test]
+    fn counter_tb_with_posedge_and_negedge_waits_completes() {
+        let rtl = r#"
+module counter_4bit(
+    input clk,
+    input rst,
+    input en,
+    output reg [3:0] q
+);
+
+always @(posedge clk) begin
+    if (rst)
+        q <= 4'b0000;
+    else if (en)
+        q <= q + 4'd1;
+end
+
+endmodule
+"#;
+        let tb = r#"
+`timescale 1ns / 1ps
+
+module counter_4bit_tb;
+
+    reg  clk;
+    reg  rst;
+    reg  en;
+    wire [3:0] q;
+
+    counter_4bit uut (
+        .clk(clk),
+        .rst(rst),
+        .en(en),
+        .q(q)
+    );
+
+    always #5 clk = ~clk;
+
+    initial begin
+        $dumpfile("counter_4bit_tb.vcd");
+        $dumpvars(0, counter_4bit_tb);
+    end
+
+    initial begin
+        clk = 0;
+        rst = 1;
+        en  = 0;
+
+        @(posedge clk);
+        @(posedge clk);
+
+        @(negedge clk);
+        if (q !== 4'b0000) begin
+            $display("FAIL: Reset not working at time %0t", $time);
+            $finish;
+        end
+
+        rst = 0;
+        @(posedge clk);
+        @(negedge clk);
+        if (q !== 4'b0000) begin
+            $display("FAIL: Counter changed without enable at time %0t", $time);
+            $finish;
+        end
+
+        en = 1;
+        repeat (4) @(posedge clk);
+        en = 0;
+        @(negedge clk);
+        if (q !== 4'd4) begin
+            $display("FAIL: Counter expected 4, got %d at time %0t", q, $time);
+            $finish;
+        end
+
+        repeat (2) @(posedge clk);
+        @(negedge clk);
+        if (q !== 4'd4) begin
+            $display("FAIL: Counter changed without enable at time %0t", $time);
+            $finish;
+        end
+
+        en = 1;
+        @(posedge clk);
+        en = 0;
+        @(negedge clk);
+        if (q !== 4'd5) begin
+            $display("FAIL: Counter expected 5, got %d at time %0t", q, $time);
+            $finish;
+        end
+
+        rst = 1;
+        @(posedge clk);
+        @(negedge clk);
+        if (q !== 4'b0000) begin
+            $display("FAIL: Reset did not work while enabled at time %0t", $time);
+            $finish;
+        end
+
+        rst = 0;
+        @(posedge clk);
+        @(negedge clk);
+        if (q !== 4'b0000) begin
+            $display("FAIL: Counter changed after reset release without enable");
+            $finish;
+        end
+
+        $display("PASS: All tests completed");
+        $finish;
+    end
+
+endmodule
+"#;
+
+        let result = simulate_with_limit(rtl, tb, "counter_4bit", "clk", 400, 5.0, 256);
+        assert!(result.passed, "simulation failed: {}", result.output);
+        assert!(
+            result.output.contains("PASS: All tests completed"),
+            "expected PASS banner, got: {}",
+            result.output
+        );
+    }
+
+    #[test]
     fn combinational_and_gate_vcd_tracks_output_changes() {
         let rtl = include_str!("../../test_circuits/and_gate.v");
         let tb = r#"
@@ -1144,8 +1319,134 @@ endmodule
         let synth = synthesize_real(rtl, "counter_4bit");
         assert!(synth.success, "real synthesis failed: {}", synth.error);
         assert!(
-            formal_check(rtl, &synth.gate_verilog, "counter_4bit"),
+            formal_check(rtl, &synth.gate_verilog, "counter_4bit")
+                .expect("formal checker returned no verdict"),
             "formal equivalence check reported non-equivalent"
+        );
+    }
+
+    #[test]
+    fn formal_check_completes_for_unsigned_8bit_multiplier_gate_netlist() {
+        let rtl = r#"
+module formal_mul8(input [7:0] a, input [7:0] b, output [15:0] product);
+    assign product = a * b;
+endmodule
+"#;
+        let synth = synthesize_real(rtl, "formal_mul8");
+        assert!(synth.success, "real synthesis failed: {}", synth.error);
+        for pin in [".A()", ".B()", ".S()", ".Y()"] {
+            assert!(
+                !synth.gate_verilog.contains(pin),
+                "synthesis emitted an unconnected gate pin {pin}"
+            );
+        }
+        assert!(
+            formal_check(rtl, &synth.gate_verilog, "formal_mul8")
+                .expect("formal checker returned no verdict"),
+            "formal equivalence check reported non-equivalent multiplier"
+        );
+    }
+
+    #[test]
+    fn formal_check_completes_for_procedural_8bit_multiplier() {
+        let rtl = include_str!("../../workspace/default/src/mul8.v");
+        let synth = synthesize_real(rtl, "mul8");
+        assert!(synth.success, "real synthesis failed: {}", synth.error);
+        assert!(synth.cell_count > 0, "procedural multiplier produced no cells");
+        assert!(
+            formal_check(rtl, &synth.gate_verilog, "mul8")
+                .expect("formal checker returned no verdict"),
+            "formal equivalence check reported non-equivalent procedural multiplier"
+        );
+    }
+
+    #[test]
+    fn formal_check_procedural_multiplier_is_name_and_width_independent() {
+        let rtl = r#"
+module generic_shift_mul(
+    input [3:0] lhs,
+    input [4:0] rhs,
+    output reg [8:0] result
+);
+    integer index;
+    reg [8:0] running_total;
+    always @(*) begin
+        running_total = 0;
+        for (index = 0; index < 5; index = index + 1) begin
+            if (rhs[index])
+                running_total = running_total + (lhs << index);
+        end
+        result = running_total;
+    end
+endmodule
+"#;
+        let synth = synthesize_real(rtl, "generic_shift_mul");
+        assert!(synth.success, "real synthesis failed: {}", synth.error);
+        assert!(synth.cell_count > 0, "generic procedural multiplier produced no cells");
+        assert!(
+            formal_check(rtl, &synth.gate_verilog, "generic_shift_mul")
+                .expect("formal checker returned no verdict"),
+            "formal equivalence check reported non-equivalent generic procedural multiplier"
+        );
+    }
+
+    #[test]
+    fn synthesis_and_formal_cover_hierarchical_datapath() {
+        let rtl = include_str!("../../test_circuits/top_hierarchy.v");
+        let synth = synthesize_real(rtl, "top_hierarchy");
+        assert!(synth.success, "hierarchical synthesis failed: {}", synth.error);
+        assert!(synth.cell_count > 0, "hierarchical synthesis produced no cells");
+        assert!(
+            formal_check(rtl, &synth.gate_verilog, "top_hierarchy")
+                .expect("hierarchical formal checker returned no verdict"),
+            "hierarchical RTL and gate netlist are not equivalent"
+        );
+    }
+
+    #[test]
+    fn formal_check_rejects_functionally_modified_gate_netlist() {
+        let rtl = r#"
+module formal_and(input a, input b, output y);
+    assign y = a & b;
+endmodule
+"#;
+        let synth = synthesize_real(rtl, "formal_and");
+        assert!(synth.success, "real synthesis failed: {}", synth.error);
+
+        let mutated = synth
+            .gate_verilog
+            .replacen("AND", "OR", 1);
+        assert_ne!(mutated, synth.gate_verilog, "test could not mutate an AND cell");
+        assert_eq!(
+            formal_check(rtl, &mutated, "formal_and")
+                .expect("formal checker returned no verdict for mutated netlist"),
+            false,
+            "functionally modified gate netlist was incorrectly accepted"
+        );
+    }
+
+    #[test]
+    fn formal_check_models_clock_enable_semantics() {
+        let rtl = r#"
+module formal_dffe(input clk, input en, input d, output reg q);
+    always @(posedge clk) begin
+        if (en) q <= d;
+    end
+endmodule
+"#;
+        let gate = r#"
+module formal_dffe(clk, en, d, q);
+    input clk;
+    input en;
+    input d;
+    output q;
+    $_DFFE_PP_ u_dff (.C(clk), .D(d), .E(en), .Q(q));
+endmodule
+"#;
+        assert!(
+            formal_check(rtl, gate, "formal_dffe")
+                .expect("formal checker returned no verdict for DFFE model"),
+            "DFFE model did not preserve active-high clock-enable behavior"
         );
     }
 }

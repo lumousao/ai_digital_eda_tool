@@ -1,34 +1,24 @@
 # 版本号位置列表
 
-## 统一版本号文件
+当前项目版本：`0.6.8`
 
-版本号统一定义在 `VERSION` 文件中，内容为：`0.6.7`
+## 主要位置
 
-## 所有版本号位置
+| 文件 | 内容 | 说明 |
+|------|------|------|
+| `VERSION` | `0.6.8` | 统一版本文件 |
+| `Cargo.toml` | `version = "0.6.8"` | Rust 包版本 |
+| `src/repl/mod.rs` | `AI Digital v0.6.8` | CLI / 日志 / 报告文本 |
+| `src/gui/mod.rs` | `AI Digital v0.6.8` | GUI 启动横幅 |
+| `src/gui_exchange.rs` | `0.6.8` | GUI 交换状态版本 |
+| `gui.tcl` | `0.6.8` | GUI 脚本版本 |
+| `engine/src/rtl_engine.cpp` | `rtl-engine 0.6.8` | C++ 引擎版本 |
+| `engine/src/engine_full.cpp` | `0.6.8` | 引擎总版本 |
+| `install.sh` | `AI Digital v0.6.8 - Installation` | 安装脚本标题 |
 
-| 文件 | 行号 | 内容 | 说明 |
-|------|------|------|------|
-| `VERSION` | 1 | `0.6.7` | **统一版本号文件** |
-| `Cargo.toml` | 3 | `version = "0.6.7"` | Rust包版本 |
-| `README.md` | 1 | `# AI Digital v0.6.7` | 标题 |
-| `README.md` | 24 | `Cargo.toml # Rust project config (ai_digital v0.6.7)` | 注释 |
-| `README.md` | 319 | `║       AI Digital v0.6.7                 ║` | 示例输出 |
-| `README.md` | 323 | `● Engine: rtl-engine 0.6.7` | 示例输出 |
-| `engine/src/rtl_engine.cpp` | 158 | `return "rtl-engine 0.6.7 (industrial RTLIL)";` | 引擎版本 |
-| `engine/src/rtl_engine.cpp` | 159 | `"version":"0.6.7"` | 引擎信息JSON |
-| `engine/src/engine_full.cpp` | 457 | `return "0.6.7";` | 引擎版本 |
-| `src/repl/mod.rs` | 1398 | `║        AI Digital v0.6.7                 ║` | CLI横幅 |
+## 升级步骤
 
-## 升级版本号步骤
-
-1. 修改 `VERSION` 文件内容
-2. 更新 `Cargo.toml` 中的 `version`
-3. 更新 `README.md` 中的所有版本号引用
-4. 更新 `engine/src/rtl_engine.cpp` 中的版本号
-5. 更新 `engine/src/engine_full.cpp` 中的版本号
-6. 更新 `src/repl/mod.rs` 中的CLI横幅
-
-## 注意事项
-
-- 依赖库的版本号（如rustyline、serde等）不需要更新
-- 只更新项目本身的版本号
+1. 更新 `VERSION`
+2. 更新 `Cargo.toml`
+3. 更新 CLI / GUI / engine / 安装脚本中的版本字符串
+4. 重新构建并检查 `report.json`、CLI 横幅和 GUI 标题

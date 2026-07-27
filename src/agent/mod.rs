@@ -1682,8 +1682,10 @@ mod tests {
     #[test]
     fn test_error_strategies() {
         let strategies = ErrorClass::SyntaxError.recovery_strategies();
-        assert_eq!(strategies.len(), 3);
+        assert_eq!(strategies.len(), 6);
+        assert_eq!(strategies.len(), ErrorClass::SyntaxError.strategy_weights().len());
         let strategies = ErrorClass::TimingViolation.recovery_strategies();
-        assert_eq!(strategies.len(), 3);
+        assert_eq!(strategies.len(), 6);
+        assert_eq!(strategies.len(), ErrorClass::TimingViolation.strategy_weights().len());
     }
 }

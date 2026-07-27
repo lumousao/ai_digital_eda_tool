@@ -31,6 +31,9 @@ static SimEngine::SimLogCallback g_synth_log_cb = nullptr;
 static SimEngine::SimLogCallback g_timing_log_cb = nullptr;
 static SimEngine::SimLogCallback g_power_log_cb = nullptr;
 static SimEngine::SimLogCallback g_formal_log_cb = nullptr;
+static Liberty::LibertyLibrary g_timing_corner_lib;
+static std::string g_timing_corner_path;
+static bool g_timing_corner_loaded = false;
 
 static void synth_engine_log(const char *step, const char *msg) {
     if (g_synth_log_cb) g_synth_log_cb(step, msg);
@@ -111,6 +114,212 @@ static std::string rename_top_module_declaration(const std::string &code,
         return renamed;
     }
     return code;
+}
+
+static std::string build_formal_cell_models(const std::string &gate_code,
+                                            bool &all_cells_supported) {
+    std::map<std::string, std::set<std::string>> cell_ports;
+    std::istringstream input(gate_code);
+    std::string line;
+    while (std::getline(input, line)) {
+        size_t comment = line.find("//");
+        if (comment != std::string::npos) line.erase(comment);
+        std::string text = trim_copy_str(line);
+        size_t first_space = text.find_first_of(" \t");
+        size_t first_paren = text.find('(');
+        if (first_space == std::string::npos || first_paren == std::string::npos ||
+            first_space > first_paren) {
+            continue;
+        }
+        std::string type = text.substr(0, first_space);
+        if (type == "module" || type == "input" || type == "output" ||
+            type == "wire" || type == "reg" || type == "assign" ||
+            type == "always" || type == "initial") {
+            continue;
+        }
+        bool valid_identifier = !type.empty() &&
+            (std::isalpha(static_cast<unsigned char>(type[0])) || type[0] == '_');
+        for (char ch : type) {
+            if (!is_ident_char(ch) || ch == '$') {
+                valid_identifier = false;
+                break;
+            }
+        }
+        if (!valid_identifier) continue;
+
+        size_t pos = first_paren;
+        while ((pos = text.find('.', pos)) != std::string::npos) {
+            size_t name_start = pos + 1;
+            size_t name_end = text.find('(', name_start);
+            if (name_end == std::string::npos) break;
+            std::string port = trim_copy_str(text.substr(name_start, name_end - name_start));
+            if (!port.empty()) cell_ports[type].insert(port);
+            pos = name_end + 1;
+        }
+    }
+
+    auto upper_copy = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+        return value;
+    };
+    auto choose_port = [](const std::set<std::string> &ports,
+                          std::initializer_list<const char *> candidates) {
+        for (const char *candidate : candidates) {
+            if (ports.count(candidate)) return std::string(candidate);
+        }
+        return std::string();
+    };
+
+    all_cells_supported = true;
+    std::ostringstream models;
+    for (const auto &[type, ports] : cell_ports) {
+        std::string upper = upper_copy(type);
+        std::string class_name = upper.rfind("FORMAL_", 0) == 0 ? upper.substr(7) : upper;
+        enum class Kind { Dff, Mux, Xnor, Xor, Nand, Nor, And, Or, Inv, Buf, Unsupported };
+        Kind kind = Kind::Unsupported;
+        if (class_name.find("DFF") != std::string::npos) kind = Kind::Dff;
+        else if (class_name.find("MUX") != std::string::npos) kind = Kind::Mux;
+        else if (class_name.find("XNOR") != std::string::npos) kind = Kind::Xnor;
+        else if (class_name.find("XOR") != std::string::npos) kind = Kind::Xor;
+        else if (class_name.find("NAND") != std::string::npos) kind = Kind::Nand;
+        else if (class_name.find("NOR") != std::string::npos) kind = Kind::Nor;
+        else if (class_name.find("AND") != std::string::npos) kind = Kind::And;
+        else if (class_name.find("OR") != std::string::npos) kind = Kind::Or;
+        else if (class_name.find("INV") != std::string::npos ||
+                 class_name.find("NOT") != std::string::npos) kind = Kind::Inv;
+        else if (class_name.find("BUF") != std::string::npos) kind = Kind::Buf;
+
+        std::string out = kind == Kind::Dff
+            ? choose_port(ports, {"Q", "QN"})
+            : choose_port(ports, {"Y", "Z", "ZN", "Q"});
+        std::string a = choose_port(ports, {"A", "A1", "I", "IN"});
+        std::string b = choose_port(ports, {"B", "A2"});
+        std::string select = choose_port(ports, {"S", "S0", "SEL"});
+        std::string data = choose_port(ports, {"D", "DI"});
+        std::string clock = choose_port(ports, {"C", "CK", "CLK", "CP"});
+        std::string enable = choose_port(ports, {"E", "EN", "CE", "GATE"});
+        std::string reset_n = choose_port(ports, {"RN", "RESETN", "RSTN", "CDN", "RB"});
+        std::string reset_p = choose_port(ports, {"R", "RESET", "RST", "CD"});
+        std::string set_n = choose_port(ports, {"SN", "SETN", "PREN", "SDN", "SB"});
+        std::string set_p = choose_port(ports, {"S", "SET", "PRE", "SD"});
+
+        bool supported = kind != Kind::Unsupported && !out.empty();
+        if (kind == Kind::Dff) {
+            supported = supported && !data.empty() && !clock.empty();
+            if (class_name.find("DFFE") != std::string::npos) {
+                supported = supported && !enable.empty();
+            }
+        }
+        else if (kind == Kind::Mux) supported = supported && !a.empty() && !b.empty() && !select.empty();
+        else if (kind == Kind::Inv || kind == Kind::Buf) supported = supported && !a.empty();
+        else supported = supported && !a.empty() && !b.empty();
+        if (!supported) {
+            all_cells_supported = false;
+            formal_engine_log("FORMAL", ("unsupported standard cell model: " + type).c_str());
+            continue;
+        }
+
+        models << "module " << type << " (";
+        size_t port_index = 0;
+        for (const auto &port : ports) {
+            if (port_index++) models << ", ";
+            if (port == out) {
+                models << "output " << (kind == Kind::Dff ? "reg " : "") << port;
+            } else {
+                models << "input " << port;
+            }
+        }
+        models << ");\n";
+
+        if (kind == Kind::Dff) {
+            std::string polarity;
+            size_t polarity_pos = class_name.find('_');
+            if (polarity_pos != std::string::npos) {
+                polarity = class_name.substr(polarity_pos + 1);
+                polarity.erase(std::remove(polarity.begin(), polarity.end(), '_'), polarity.end());
+            }
+            bool negedge_clock = class_name.find("NEG") != std::string::npos ||
+                                  (!polarity.empty() && polarity[0] == 'N');
+            bool enable_active_low = !enable.empty() &&
+                (enable.back() == 'N' || enable.find("_N") != std::string::npos);
+            if (class_name.find("DFFE") != std::string::npos && polarity.size() >= 2) {
+                enable_active_low = polarity[1] == 'N';
+            }
+            bool encoded_set_active_low = class_name.find("DFFSR") != std::string::npos &&
+                polarity.size() >= 2 && polarity[1] == 'N';
+            bool encoded_reset_active_low = class_name.find("DFFSR") != std::string::npos &&
+                polarity.size() >= 3 && polarity[2] == 'N';
+            if (encoded_set_active_low && set_n.empty() && !set_p.empty()) {
+                set_n = set_p;
+                set_p.clear();
+            }
+            if (encoded_reset_active_low && reset_n.empty() && !reset_p.empty()) {
+                reset_n = reset_p;
+                reset_p.clear();
+            }
+            models << "  always @(" << (negedge_clock ? "negedge " : "posedge ") << clock;
+            if (!reset_n.empty()) models << " or negedge " << reset_n;
+            else if (!reset_p.empty()) models << " or posedge " << reset_p;
+            if (!set_n.empty()) models << " or negedge " << set_n;
+            else if (!set_p.empty()) models << " or posedge " << set_p;
+            models << ") begin\n";
+            if (!reset_n.empty()) models << "    if (!" << reset_n << ") " << out << " <= " << (out == "QN" ? "1'b1" : "1'b0") << ";\n    else ";
+            else if (!reset_p.empty()) models << "    if (" << reset_p << ") " << out << " <= " << (out == "QN" ? "1'b1" : "1'b0") << ";\n    else ";
+            else models << "    ";
+            if (!set_n.empty()) models << "if (!" << set_n << ") " << out << " <= " << (out == "QN" ? "1'b0" : "1'b1") << ";\n    else ";
+            else if (!set_p.empty()) models << "if (" << set_p << ") " << out << " <= " << (out == "QN" ? "1'b0" : "1'b1") << ";\n    else ";
+            if (!enable.empty()) {
+                models << "if (" << (enable_active_low ? "!" : "") << enable << ") ";
+            }
+            models << out << " <= " << (out == "QN" ? "~" : "") << data << ";\n";
+            models << "  end\n";
+        } else {
+            std::string expr;
+            switch (kind) {
+                case Kind::Mux: expr = select + " ? " + b + " : " + a; break;
+                case Kind::Xnor: expr = "~(" + a + " ^ " + b + ")"; break;
+                case Kind::Xor: expr = a + " ^ " + b; break;
+                case Kind::Nand: expr = "~(" + a + " & " + b + ")"; break;
+                case Kind::Nor: expr = "~(" + a + " | " + b + ")"; break;
+                case Kind::And: expr = a + " & " + b; break;
+                case Kind::Or: expr = a + " | " + b; break;
+                case Kind::Inv: expr = "~" + a; break;
+                case Kind::Buf: expr = a; break;
+                default: break;
+            }
+            models << "  assign " << out << " = " << expr << ";\n";
+        }
+        models << "endmodule\n\n";
+    }
+    return models.str();
+}
+
+static std::string normalize_formal_primitive_types(std::string gate_code) {
+    static const std::pair<const char *, const char *> replacements[] = {
+        {"$_DFFSR_PPP_", "FORMAL_DFFSR_PPP"},
+        {"$_DFFSR_NNN_", "FORMAL_DFFSR_NNN"},
+        {"$_DFFE_PP_", "FORMAL_DFFE_PP"},
+        {"$_DFF_P_", "FORMAL_DFF_P"},
+        {"$_DFF_N_", "FORMAL_DFF_N"},
+        {"$_XNOR_", "FORMAL_XNOR"},
+        {"$_XOR_", "FORMAL_XOR"},
+        {"$_NAND_", "FORMAL_NAND"},
+        {"$_NOR_", "FORMAL_NOR"},
+        {"$_AND_", "FORMAL_AND"},
+        {"$_OR_", "FORMAL_OR"},
+        {"$_NOT_", "FORMAL_NOT"},
+        {"$_BUF_", "FORMAL_BUF"},
+        {"$_MUX_", "FORMAL_MUX"},
+    };
+    for (const auto &[from, to] : replacements) {
+        size_t pos = 0;
+        while ((pos = gate_code.find(from, pos)) != std::string::npos) {
+            gate_code.replace(pos, std::strlen(from), to);
+            pos += std::strlen(to);
+        }
+    }
+    return gate_code;
 }
 
 static std::string extract_netlist_text_from_output(const std::string &output) {
@@ -293,8 +502,8 @@ TimingReport rtl_timing_check(RtlDesign *d, const char *mn, double cp) {
 }
 void rtl_timing_report_free(TimingReport *r) { if(r&&r->report){free(r->report);r->report=nullptr;} }
 
-const char *rtl_engine_version(void) { return "rtl-engine 0.6.7 (native RTLIL)"; }
-char *rtl_engine_info(void) { return strdup_safe("{\"version\":\"0.6.7\",\"name\":\"ai_digital\",\"features\":[\"verilog_parser\",\"lint_check\",\"synthesis\",\"timing_analysis\",\"formal_verification\",\"multi_corner\"]}"); }
+const char *rtl_engine_version(void) { return "rtl-engine 0.6.8 (native RTLIL)"; }
+char *rtl_engine_info(void) { return strdup_safe("{\"version\":\"0.6.8\",\"name\":\"ai_digital\",\"features\":[\"verilog_parser\",\"lint_check\",\"synthesis\",\"timing_analysis\",\"formal_verification\",\"multi_corner\"]}"); }
 void rtl_error_free(RtlError *e) { if(!e)return; if(e->message)free(e->message); if(e->file)free(e->file); free(e); }
 
 // Forward declarations for Liberty library functions
@@ -897,7 +1106,8 @@ TimingReport rtl_timing_analysis(const char *synth_output, const char *module_na
 }
 
 TimingReport rtl_timing_analysis_corner(const char *synth_output, const char *module_name,
-    const char *corner_type, double voltage, double temperature, double clock_period) {
+    const char *liberty_file, const char *corner_type, double voltage,
+    double temperature, double clock_period) {
 
     timing_engine_log("TIMING_CORNER", "Starting per-corner NLDM timing analysis");
 
@@ -947,14 +1157,23 @@ TimingReport rtl_timing_analysis_corner(const char *synth_output, const char *mo
         }
     } catch (...) {}
 
-    // Get liberty library for all delay/pvt/area calculations
+    // Load the requested liberty into a local object so per-corner timing
+    // analysis remains thread-safe across concurrent corner jobs.
+    Liberty::LibertyLibrary corner_lib_storage;
+    bool corner_lib_loaded = false;
+    if (liberty_file && liberty_file[0]) {
+        std::string requested_path(liberty_file);
+        corner_lib_loaded = corner_lib_storage.load(requested_path);
+    }
     const Liberty::LibertyLibrary *full_lib = nullptr;
     double v_nom = 1.2;
-    if (synth_is_liberty_loaded()) {
+    if (corner_lib_loaded) {
+        full_lib = &corner_lib_storage;
+    } else if (synth_is_liberty_loaded()) {
         full_lib = static_cast<const Liberty::LibertyLibrary*>(synth_get_liberty_lib());
-        if (full_lib) {
-            v_nom = full_lib->nom_voltage > 0 ? full_lib->nom_voltage : 1.2;
-        }
+    }
+    if (full_lib) {
+        v_nom = full_lib->nom_voltage > 0 ? full_lib->nom_voltage : 1.2;
     }
 
     // Area: compute from real liberty cell areas using NAND2 as GE reference
@@ -1017,9 +1236,8 @@ TimingReport rtl_timing_analysis_corner(const char *synth_output, const char *mo
             TimingAnalysis::TimingAnalyzer ta;
 
             // Load full liberty if available
-            if (synth_is_liberty_loaded()) {
-                const void *lib_ptr = synth_get_liberty_lib();
-                ta.loadLibertyFull(lib_ptr);
+            if (full_lib) {
+                ta.loadLibertyFull(full_lib);
                 char buf[256];
                 snprintf(buf, sizeof(buf), "Using loaded Liberty library with %zu cells for NLDM lookup",
                     full_lib ? full_lib->cells.size() : 0);
@@ -1042,11 +1260,13 @@ TimingReport rtl_timing_analysis_corner(const char *synth_output, const char *mo
             // The NLDM lookup already accounts for the specific corner (uses corner-specific liberty)
             // Additional PVT scaling for interconnect/wire effects:
             double pvt_scale = 1.0;
-            double v_ratio = voltage > 0.5 ? v_nom / voltage : 1.0;
-            pvt_scale *= 1.0 + (v_ratio - 1.0) * 0.8;
-            pvt_scale *= 1.0 + (temperature - 25.0) * 0.004;
-            if (pvt_scale < 0.3) pvt_scale = 0.3;
-            if (pvt_scale > 4.0) pvt_scale = 4.0;
+            if (!corner_lib_loaded) {
+                double v_ratio = voltage > 0.5 ? v_nom / voltage : 1.0;
+                pvt_scale *= 1.0 + (v_ratio - 1.0) * 0.8;
+                pvt_scale *= 1.0 + (temperature - 25.0) * 0.004;
+                if (pvt_scale < 0.3) pvt_scale = 0.3;
+                if (pvt_scale > 4.0) pvt_scale = 4.0;
+            }
 
             // Run timing analysis
             ta.computeArrivalTimes();
@@ -1080,11 +1300,10 @@ TimingReport rtl_timing_analysis_corner(const char *synth_output, const char *mo
             // Compute slack using liberty setup time for DFF
             double dff_setup_ns = compute_dff_setup_from_lib(full_lib);
             if (dff_setup_ns < 0.01) dff_setup_ns = 0.05;
-            result.arrival_time_ns *= 1.10; // OCV late path
-            result.required_time_ns = clock_period - dff_setup_ns * 0.90;
+            result.required_time_ns = clock_period - dff_setup_ns;
             result.slack_ns = result.required_time_ns - result.arrival_time_ns;
             if (!detailed.paths.empty()) {
-                const double path_scale = pvt_scale * 1.10;
+                const double path_scale = pvt_scale;
                 for (auto &path : detailed.paths) {
                     path.total_delay *= path_scale;
                     path.slack = result.required_time_ns - path.total_delay;
@@ -1101,7 +1320,7 @@ TimingReport rtl_timing_analysis_corner(const char *synth_output, const char *mo
                 auto fallback_paths = extract_fallback_critical_paths(
                     netlist_text, full_lib, result.required_time_ns, 10);
                 if (!fallback_paths.empty()) {
-                    const double path_scale = pvt_scale * 1.10;
+                    const double path_scale = pvt_scale;
                     for (auto &path : fallback_paths) {
                         path.total_delay_ns *= path_scale;
                         path.slack_ns = result.required_time_ns - path.total_delay_ns;
@@ -1124,11 +1343,13 @@ TimingReport rtl_timing_analysis_corner(const char *synth_output, const char *mo
             if (dff_setup_ns < 0.01) dff_setup_ns = 0.05;
 
             double pvt_scale = 1.0;
-            double v_ratio = voltage > 0.5 ? v_nom / voltage : 1.0;
-            pvt_scale *= 1.0 + (v_ratio - 1.0) * 0.8;
-            pvt_scale *= 1.0 + (temperature - 25.0) * 0.004;
-            if (pvt_scale < 0.3) pvt_scale = 0.3;
-            if (pvt_scale > 4.0) pvt_scale = 4.0;
+            if (!corner_lib_loaded) {
+                double v_ratio = voltage > 0.5 ? v_nom / voltage : 1.0;
+                pvt_scale *= 1.0 + (v_ratio - 1.0) * 0.8;
+                pvt_scale *= 1.0 + (temperature - 25.0) * 0.004;
+                if (pvt_scale < 0.3) pvt_scale = 0.3;
+                if (pvt_scale > 4.0) pvt_scale = 4.0;
+            }
 
             result.arrival_time_ns = result.logic_depth * gate_delay_ns * pvt_scale + (dff_count > 0 ? dff_setup_ns * pvt_scale : 0);
             result.required_time_ns = clock_period - dff_setup_ns * pvt_scale;
@@ -1142,11 +1363,13 @@ TimingReport rtl_timing_analysis_corner(const char *synth_output, const char *mo
         if (dff_setup_ns < 0.01) dff_setup_ns = 0.05;
 
         double pvt_scale = 1.0;
-        double v_ratio = voltage > 0.5 ? v_nom / voltage : 1.0;
-        pvt_scale *= 1.0 + (v_ratio - 1.0) * 0.8;
-        pvt_scale *= 1.0 + (temperature - 25.0) * 0.004;
-        if (pvt_scale < 0.3) pvt_scale = 0.3;
-        if (pvt_scale > 4.0) pvt_scale = 4.0;
+        if (!corner_lib_loaded) {
+            double v_ratio = voltage > 0.5 ? v_nom / voltage : 1.0;
+            pvt_scale *= 1.0 + (v_ratio - 1.0) * 0.8;
+            pvt_scale *= 1.0 + (temperature - 25.0) * 0.004;
+            if (pvt_scale < 0.3) pvt_scale = 0.3;
+            if (pvt_scale > 4.0) pvt_scale = 4.0;
+        }
 
         result.arrival_time_ns = result.logic_depth * gate_delay_ns * pvt_scale + (dff_count > 0 ? dff_setup_ns * pvt_scale : 0);
         result.required_time_ns = clock_period - dff_setup_ns * pvt_scale;
@@ -1186,6 +1409,7 @@ TimingReport rtl_timing_analysis_corner(const char *synth_output, const char *mo
     ss << sep << "\n";
     ss << fmt_row("Corner", corner_label) << "\n";
     ss << fmt_row("Liberty library", lib_name) << "\n";
+    ss << fmt_row("Delay source", corner_lib_loaded ? "corner NLDM" : "PVT fallback") << "\n";
     ss << fmt_row("Clock period", fmt(clock_period) + " ns") << "\n";
     ss << fmt_row("Vdd (from lib)", fmt(v_nom) + " V") << "\n";
     ss << sep << "\n";
@@ -1518,7 +1742,10 @@ int rtl_formal_check(const char *rtl_code, const char *gate_code, const char *mo
     formal_engine_log("FORMAL", "running interface equivalence checks");
 
     // --- Phase 4: Port matching ---
-    if (rtl_ports.empty() && gate_ports.empty()) return 1; // No ports to check
+    if (rtl_ports.empty() && gate_ports.empty()) {
+        formal_engine_log("FORMAL", "no comparable ports were found");
+        return -1;
+    }
     if (rtl_ports.empty() || gate_ports.empty()) return 0; // Mismatch
 
     // Check all RTL input ports exist in gate netlist
@@ -1571,12 +1798,19 @@ int rtl_formal_check(const char *rtl_code, const char *gate_code, const char *mo
     const std::string rtl_top_name = mod + "__rtl_ref";
     const std::string gate_top_name = mod + "__gate_ref";
     std::string renamed_rtl = rename_top_module_declaration(rtl, mod, rtl_top_name);
-    std::string renamed_gate = rename_top_module_declaration(gate, mod, gate_top_name);
+    std::string renamed_gate = normalize_formal_primitive_types(
+        rename_top_module_declaration(gate, mod, gate_top_name));
+    bool all_cells_supported = false;
+    std::string formal_cell_models = build_formal_cell_models(renamed_gate, all_cells_supported);
+    if (!all_cells_supported) {
+        formal_engine_log("FORMAL", "gate netlist contains cells without built-in formal models");
+        return -1;
+    }
 
     std::string tb;
     tb += "module __formal_check_tb;\n";
     tb += "  reg __mismatch = 0;\n";
-    tb += "  integer __i;\n\n";
+    tb += "\n";
 
     // Declare signals for RTL instance
     for (auto &rp : rtl_ports) {
@@ -1614,7 +1848,29 @@ int rtl_formal_check(const char *rtl_code, const char *gate_code, const char *mo
     }
     tb += "  );\n\n";
 
-    const int vector_count = has_sequential ? 48 : 64;
+    int driven_input_bits = 0;
+    for (const auto &rp : rtl_ports) {
+        if (rp.is_input && rp.name != clock_port && rp.name != reset_port) {
+            driven_input_bits += std::max(rp.width, 1);
+        }
+    }
+    // Exhausting a small input space is useful only while the mapped cone is
+    // also small.  A 9-bit input multiplier has 512 vectors but hundreds of
+    // primitive instances; running every vector through the native event
+    // kernel turns a valid check into a timeout.  Keep exhaustive proof for
+    // compact cones and use the deterministic bounded campaign otherwise.
+    const bool exhaustive_combinational = !has_sequential && driven_input_bits <= 10 &&
+        gate_cell_count <= 128;
+    // The native event simulator is intentionally conservative for large
+    // gate cones. Keep the deterministic random campaign bounded for those
+    // cones, while retaining exhaustive checking for small combinational
+    // interfaces. The timeout scales with actual mapped-cell count so a
+    // correct arithmetic block is never mislabeled inconclusive by a fixed
+    // short wall-clock budget.
+    const int vector_count = has_sequential ? 48
+        : (exhaustive_combinational ? (1 << driven_input_bits) : 32);
+    const int simulation_timeout_seconds = std::min(60, std::max(
+        12, 12 + static_cast<int>(gate_cell_count / 32)));
 
     // Test stimulus: apply deterministic pseudo-random test vectors
     tb += "  initial begin\n";
@@ -1641,46 +1897,73 @@ int rtl_formal_check(const char *rtl_code, const char *gate_code, const char *mo
         tb += "      #5 __rtl_" + clock_port + " = 1;\n";
         tb += "      #5 __rtl_" + clock_port + " = 0;\n";
         tb += "    end\n";
-        tb += "    // Apply cycle-based test vectors without event controls.\n";
-        tb += "    for (__i = 0; __i < " + std::to_string(vector_count) + "; __i = __i + 1) begin\n";
-        for (auto &rp : rtl_ports) {
-            if (!rp.is_input || rp.name == clock_port || rp.name == reset_port) continue;
-            if (rp.width > 1) tb += "      __rtl_" + rp.name + " = $random;\n";
-            else tb += "      __rtl_" + rp.name + " = $random & 1;\n";
-        }
-        tb += "      #5 __rtl_" + clock_port + " = 1;\n";
-        tb += "      #1;\n";
+        tb += "    // Deterministic cycle-based vectors, expanded by the host.\n";
     } else {
         tb += "    #10;\n";
-        tb += "    // Apply pseudo-random combinational vectors.\n";
-        tb += "    for (__i = 0; __i < " + std::to_string(vector_count) + "; __i = __i + 1) begin\n";
+        tb += exhaustive_combinational
+            ? "    // Exhaustive combinational input vectors.\n"
+            : "    // Deterministic combinational stress vectors.\n";
+    }
+
+    for (int vector_index = 0; vector_index < vector_count; ++vector_index) {
+        int bit_offset = 0;
         for (auto &rp : rtl_ports) {
-            if (rp.is_input) {
-                if (rp.width > 1) tb += "      __rtl_" + rp.name + " = $random;\n";
-                else tb += "      __rtl_" + rp.name + " = $random & 1;\n";
+            if (!rp.is_input || rp.name == clock_port || rp.name == reset_port) continue;
+            int width = std::max(rp.width, 1);
+            if (width <= 32) {
+                uint64_t value = 0;
+                if (exhaustive_combinational) {
+                    uint64_t mask = width == 32 ? 0xffffffffULL : ((1ULL << width) - 1ULL);
+                    value = (static_cast<uint64_t>(vector_index) >> bit_offset) & mask;
+                } else if (vector_index < 4) {
+                    uint64_t mask = width == 32 ? 0xffffffffULL : ((1ULL << width) - 1ULL);
+                    value = vector_index == 0 ? 0 : (vector_index == 1 ? 1 : mask);
+                } else {
+                    uint64_t x = 0x9e3779b97f4a7c15ULL ^
+                        (static_cast<uint64_t>(vector_index + 1) * 0xbf58476d1ce4e5b9ULL) ^
+                        (static_cast<uint64_t>(bit_offset + 1) * 0x94d049bb133111ebULL);
+                    x ^= x >> 30;
+                    x *= 0xbf58476d1ce4e5b9ULL;
+                    x ^= x >> 27;
+                    uint64_t mask = width == 32 ? 0xffffffffULL : ((1ULL << width) - 1ULL);
+                    value = x & mask;
+                }
+                tb += "    __rtl_" + rp.name + " = " + std::to_string(width) +
+                      "'d" + std::to_string(value) + ";\n";
+            } else {
+                tb += "    __rtl_" + rp.name + " = $random;\n";
+            }
+            bit_offset += width;
+        }
+
+        if (has_sequential && !clock_port.empty()) {
+            tb += "    #5 __rtl_" + clock_port + " = 1;\n";
+            tb += "    #1;\n";
+        } else {
+            tb += "    #5;\n";
+        }
+
+        tb += "    // Check outputs for vector " + std::to_string(vector_index) + ".\n";
+        for (auto &rp : rtl_ports) {
+            if (!rp.is_input) {
+                tb += "    if (__rtl_" + rp.name + " !== __gate_" + rp.name + ") begin\n";
+                tb += "      $display(\"MISMATCH: " + rp.name + " RTL=%d GATE=%d\", __rtl_" + rp.name + ", __gate_" + rp.name + ");\n";
+                tb += "      __mismatch = 1;\n";
+                tb += "    end\n";
             }
         }
-        tb += "      #5;\n";
-    }
-    tb += "      // Check outputs\n";
-    for (auto &rp : rtl_ports) {
-        if (!rp.is_input) {
-            tb += "      if (__rtl_" + rp.name + " !== __gate_" + rp.name + ") begin\n";
-            tb += "        $display(\"MISMATCH: " + rp.name + " RTL=%d GATE=%d\", __rtl_" + rp.name + ", __gate_" + rp.name + ");\n";
-            tb += "        __mismatch = 1;\n";
-            tb += "      end\n";
+
+        if (has_sequential && !clock_port.empty()) {
+            tb += "    #4;\n";
+            tb += "    __rtl_" + clock_port + " = 0;\n";
+        } else {
+            tb += "    #5;\n";
         }
     }
-    if (has_sequential && !clock_port.empty()) {
-        tb += "      #4;\n";
-        tb += "      __rtl_" + clock_port + " = 0;\n";
-        tb += "    end\n";
-    } else {
-        tb += "      #5;\n";
-        tb += "    end\n";
-    }
-    tb += "    if (__mismatch) $display(\"FORMAL: FAIL\");\n";
-    tb += "    else $display(\"FORMAL: PASS\");\n";
+    // The simulator parser does not require a conditional system-task here:
+    // mismatch sites emit FAIL, while this marker proves the full comparison
+    // loop reached its terminal point.
+    tb += "    $display(\"FORMAL: COMPLETE\");\n";
     tb += "    $finish;\n";
     tb += "  end\n";
     tb += "endmodule\n";
@@ -1689,35 +1972,32 @@ int rtl_formal_check(const char *rtl_code, const char *gate_code, const char *mo
     // We use a simple built-in simulator call
     formal_engine_log("FORMAL", "launching native comparison simulation");
     SimResult result = rtl_simulate_with_limit_and_timeout(
-        (renamed_rtl + "\n" + renamed_gate).c_str(),
+        (renamed_rtl + "\n" + renamed_gate + "\n" + formal_cell_models).c_str(),
         tb.c_str(),
         "__formal_check_tb",
         clock_port.empty() ? "clk" : clock_port.c_str(),
-        4096, 5.0, 1024, 12);
+        4096, 5.0, 1024, simulation_timeout_seconds);
 
-    if (result.passed) {
-        // Check if the output contains "FORMAL: PASS"
-        std::string output(result.output ? result.output : "");
-        rtl_sim_result_free(&result);
-        if (output.find("FORMAL: PASS") != std::string::npos) {
-            formal_engine_log("FORMAL", "comparison simulation reported PASS");
-            return 1;
-        }
-        if (output.find("FORMAL: FAIL") != std::string::npos) {
-            formal_engine_log("FORMAL", "comparison simulation reported FAIL");
-            return 0;
-        }
-        // If we got here, simulation passed but we didn't see formal result
-        // Default to PASS if simulation ran without error
-        formal_engine_log("FORMAL", "comparison simulation completed without explicit verdict");
+    std::string output(result.output ? result.output : "");
+    bool simulation_passed = result.passed;
+    rtl_sim_result_free(&result);
+    formal_engine_log("FORMAL_SIM_OUTPUT", output.c_str());
+
+    if (output.find("FORMAL: FAIL") != std::string::npos ||
+        output.find("MISMATCH:") != std::string::npos) {
+        formal_engine_log("FORMAL", "comparison simulation reported FAIL");
+        return 0;
+    }
+    if (simulation_passed && output.find("FORMAL: COMPLETE") != std::string::npos) {
+        formal_engine_log("FORMAL", "comparison simulation completed with no mismatches");
         return 1;
     }
 
-    // Simulation failed — formal check inconclusive
-    // Fall back to structural check (already passed above)
-    rtl_sim_result_free(&result);
-    formal_engine_log("FORMAL", "comparison simulation failed, falling back to structural equivalence");
-    return 1; // Structural check passed, give benefit of doubt
+    // Structural/interface agreement cannot establish functional equivalence.
+    // Preserve the inconclusive state so callers stop the flow or retry the
+    // failed node instead of publishing a false PASS.
+    formal_engine_log("FORMAL", "comparison simulation failed; equivalence is inconclusive");
+    return -1;
 }
 
 // Liberty library parser
@@ -2335,8 +2615,46 @@ PowerAnalysisResult rtl_power_analyze(const char *gate_netlist, const char *modu
 
     double total_leakage = 0.0, total_internal = 0.0, total_switching = 0.0, total_clock = 0.0;
     double vdd = 1.2; int total_cells = 0;
+    int liberty_mapped_cells = 0;
+    int liberty_unmapped_cells = 0;
     double freq_hz = clock_freq_mhz * 1e6;
     bool use_real_lib = false;
+    bool use_activity = false;
+    double activity_toggle_rate = 0.1;
+    if (toggle_data_json && toggle_data_json[0]) {
+        std::string activity(toggle_data_json);
+        double sum = 0.0;
+        int count = 0;
+        size_t pos = 0;
+        while ((pos = activity.find(':', pos)) != std::string::npos) {
+            size_t start = pos + 1;
+            while (start < activity.size() && std::isspace(static_cast<unsigned char>(activity[start]))) start++;
+            size_t end = start;
+            while (end < activity.size() &&
+                   (std::isdigit(static_cast<unsigned char>(activity[end])) ||
+                    activity[end] == '.' || activity[end] == 'e' || activity[end] == 'E' ||
+                    activity[end] == '+' || activity[end] == '-')) {
+                end++;
+            }
+            if (end > start) {
+                try {
+                    double rate = std::stod(activity.substr(start, end - start));
+                    if (rate >= 0.0 && rate <= 4.0) {
+                        sum += std::min(rate, 1.0);
+                        count++;
+                    }
+                } catch (...) {}
+            }
+            pos = end;
+        }
+        if (count > 0) {
+            activity_toggle_rate = sum / static_cast<double>(count);
+            if (activity_toggle_rate < 0.001) activity_toggle_rate = 0.001;
+            if (activity_toggle_rate > 1.0) activity_toggle_rate = 1.0;
+            use_activity = true;
+            power_engine_log("POWER_ACTIVITY", ("Using simulation activity average toggle=" + std::to_string(activity_toggle_rate)).c_str());
+        }
+    }
 
     // ── Use full Liberty library for accurate power ──
     if (liberty_path && strlen(liberty_path) > 0) {
@@ -2360,6 +2678,7 @@ PowerAnalysisResult rtl_power_analyze(const char *gate_netlist, const char *modu
                 }
 
                 if (lc) {
+                    liberty_mapped_cells += count;
                     // ── Static (leakage) power ──
                     // cell_leakage_power is in nW (liberty standard)
                     double leakage_per_cell = lc->cell_leakage_power * 1e-3; // nW → uW
@@ -2372,8 +2691,10 @@ PowerAnalysisResult rtl_power_analyze(const char *gate_netlist, const char *modu
                         if (pin.is_input()) total_input_cap += pin.capacitance;
                     }
                     if (total_input_cap < 0.0001) total_input_cap = 0.002; // 2fF fallback
-                    double cap_f = total_input_cap * 1e-15; // pF → F
-                    double toggle_rate = 0.1; // default toggle rate
+                    // Liberty pin capacitance is expressed in pF.  Treating
+                    // it as fF understated switching power by 1000x.
+                    double cap_f = total_input_cap * 1e-12; // pF → F
+                    double toggle_rate = activity_toggle_rate;
                     double dyn_per_cell = 0.5 * cap_f * vdd * vdd * freq_hz * toggle_rate * 1e6; // → uW
                     total_switching += dyn_per_cell * count;
 
@@ -2399,7 +2720,9 @@ PowerAnalysisResult rtl_power_analyze(const char *gate_netlist, const char *modu
                         total_internal += dyn_per_cell * 0.20 * count;
                     }
                 } else {
-                    // Cell not found in library — use estimation
+                    // Keep a debug estimate, but do not present a partially
+                    // mapped netlist as an NLDM signoff result.
+                    liberty_unmapped_cells += count;
                     total_cells += count;
                     double ge = 4.0;
                     if (cell_type.find("DFF") != std::string::npos) ge = 18.0;
@@ -2438,15 +2761,20 @@ PowerAnalysisResult rtl_power_analyze(const char *gate_netlist, const char *modu
     result.clock_power_uw = total_clock;
     result.leakage_power_uw = total_leakage;
 
+    const bool complete_liberty_coverage = use_real_lib && liberty_unmapped_cells == 0;
     std::ostringstream ss; ss << std::fixed << std::setprecision(2);
-    ss << "Power Analysis Report (" << (use_real_lib ? "liberty NLDM" : "estimated") << ")\n";
+    ss << "Power Analysis Report (" << (complete_liberty_coverage ? "liberty NLDM" : "estimated") << ")\n";
     ss << "========================\n";
     ss << "Total cells: " << total_cells << " | Freq: " << clock_freq_mhz << " MHz | Vdd: " << vdd << " V\n\n";
+    ss << "Activity source: " << (use_activity ? "simulation toggles" : "default toggle estimate")
+       << " | Avg toggle: " << activity_toggle_rate << "\n";
+    ss << "Liberty coverage: " << liberty_mapped_cells << "/" << total_cells << " mapped cells\n";
     ss << "Leakage: " << total_leakage << " uW | Internal: " << total_internal << " uW\n";
     ss << "Switching: " << total_switching << " uW | Clock: " << total_clock << " uW\n";
     ss << "Total: " << result.total_power_uw << " uW\n";
     result.report = strdup_safe(ss.str().c_str());
-    power_engine_log("POWER", ("Done. Total: " + std::to_string(result.total_power_uw) + " uW (liberty NLDM)").c_str());
+    power_engine_log("POWER", ("Done. Total: " + std::to_string(result.total_power_uw) +
+        " uW (" + (complete_liberty_coverage ? std::string("liberty NLDM") : std::string("estimated")) + ")").c_str());
     return result;
 }
 
