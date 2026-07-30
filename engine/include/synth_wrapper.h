@@ -1,11 +1,12 @@
 /**
- * Synthesis Wrapper - C API for calling libyosys directly
+ * Native Synthesis Wrapper - local C API
  *
- * This wraps the Yosys C++ library into a C API that can be called from Rust FFI.
+ * This wrapper dispatches to this repository's local synthesis core. It does
+ * not spawn or link an external synthesis executable or library.
  */
 
-#ifndef YOSYS_WRAPPER_H
-#define YOSYS_WRAPPER_H
+#ifndef NATIVE_SYNTH_WRAPPER_H
+#define NATIVE_SYNTH_WRAPPER_H
 
 #include <stddef.h>
 
@@ -70,4 +71,4 @@ void synth_wrapper_free(char *str);
 }
 #endif
 
-#endif /* YOSYS_WRAPPER_H */
+#endif /* NATIVE_SYNTH_WRAPPER_H */

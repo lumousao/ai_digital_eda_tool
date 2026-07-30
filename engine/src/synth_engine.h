@@ -294,11 +294,31 @@ struct CppSynthResult {
     size_t num_cell_types;
 };
 
+// Pass policy for the repository-native gate-netlist optimizer. All fields are
+// integers to keep the boundary stable for Rust/C FFI callers.
+struct NativeSynthesisOptions {
+    int constprop;
+    int dead_code_elimination;
+    int common_subexpression_elimination;
+    int expression_optimization;
+    int demorgan;
+    int width_reduction;
+    int resource_sharing;
+    int fsm_extraction;
+    int logic_minimization;
+    int retiming;
+    int boundary_optimization;
+};
+
 CppSynthResult synth_real(const char *rtl_code, const char *module_name,
                            void (*log_cb)(const char *, const char *));
 CppSynthResult synth_real_with_lib(const char *rtl_code, const char *module_name,
                                     const char *liberty_path,
                                     void (*log_cb)(const char *, const char *));
+CppSynthResult synth_real_with_options(const char *rtl_code, const char *module_name,
+                                        const char *liberty_path,
+                                        const NativeSynthesisOptions *options,
+                                        void (*log_cb)(const char *, const char *));
 // Frequency-optimized synthesis: iteratively applies optimization passes
 // to push max frequency toward target (default: 3x constraint)
 CppSynthResult synth_real_freq_optimized(const char *rtl_code, const char *module_name,

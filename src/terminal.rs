@@ -87,8 +87,13 @@ pub fn status_update(desc: &str) { spinner_update(desc); }
 pub fn status_stop(ok: bool, label: &str) {
     spinner_stop_and_wait();
     if !label.is_empty() {
-        if ok { println!("\x1b[38;5;33m┃\x1b[0m \x1b[38;5;82m✓\x1b[0m {}", label); }
-        else { println!("\x1b[38;5;33m┃\x1b[0m \x1b[38;5;196m✗\x1b[0m {}", label); }
+        if !is_tty() {
+            println!("{} {}", if ok { "✓" } else { "✗" }, label);
+        } else if ok {
+            println!("\x1b[38;5;33m┃\x1b[0m \x1b[38;5;82m✓\x1b[0m {}", label);
+        } else {
+            println!("\x1b[38;5;33m┃\x1b[0m \x1b[38;5;196m✗\x1b[0m {}", label);
+        }
     }
 }
 

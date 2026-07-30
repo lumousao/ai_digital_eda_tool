@@ -35,11 +35,69 @@ pub struct ProjectConfig {
     pub sdc_file: Option<String>,
     pub max_cycles: i32,
     pub opt_level: i32,
-    pub enable_timing: bool,
-    pub enable_power: bool,
-    pub enable_formal: bool,
+    pub synthesis_options: SynthesisOptions,
+    pub apr_options: AprOptions,
     pub last_rtl_code: Option<String>,
     pub last_synth_info: Option<SynthSnapshot>,
+}
+
+/// Controls for semantics-preserving native synthesis passes. Workflow stages
+/// are deliberately not configurable: every full flow always runs them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SynthesisOptions {
+    pub constprop: bool,
+    pub dead_code_elimination: bool,
+    pub common_subexpression_elimination: bool,
+    pub expression_optimization: bool,
+    pub demorgan: bool,
+    pub width_reduction: bool,
+    pub resource_sharing: bool,
+    pub fsm_extraction: bool,
+    pub logic_minimization: bool,
+    pub retiming: bool,
+    pub boundary_optimization: bool,
+}
+
+impl Default for SynthesisOptions {
+    fn default() -> Self {
+        Self {
+            constprop: true,
+            dead_code_elimination: true,
+            common_subexpression_elimination: true,
+            expression_optimization: true,
+            demorgan: true,
+            width_reduction: true,
+            resource_sharing: true,
+            fsm_extraction: true,
+            logic_minimization: true,
+            retiming: true,
+            boundary_optimization: true,
+        }
+    }
+}
+
+/// Physical implementation controls.  These tune native algorithms within
+/// mandatory APR stages; they never disable floorplanning, placement, CTS,
+/// routing, extraction, OCV, PDN/IR, or physical verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AprOptions {
+    pub core_utilization: f64,
+    pub aspect_ratio: f64,
+    pub voltage_v: f64,
+    /// A user-selected IR-analysis supply.  Without an explicit override,
+    /// APR must follow the synthesis Liberty corner's nominal voltage.
+    #[serde(default)]
+    pub voltage_override: bool,
+    pub ocv_early_derate: f64,
+    pub ocv_late_derate: f64,
+}
+
+impl Default for AprOptions {
+    fn default() -> Self {
+        Self { core_utilization: 0.65, aspect_ratio: 1.0, voltage_v: 1.0, voltage_override: false, ocv_early_derate: 0.95, ocv_late_derate: 1.05 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,9 +120,8 @@ impl Default for ProjectConfig {
             sdc_file: None,
             max_cycles: 1000,
             opt_level: 2,
-            enable_timing: true,
-            enable_power: true,
-            enable_formal: true,
+            synthesis_options: SynthesisOptions::default(),
+            apr_options: AprOptions::default(),
             last_rtl_code: None,
             last_synth_info: None,
         }
@@ -369,5 +426,25 @@ impl ProjectManager {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProjectConfig, SynthesisOptions};
+
+    #[test]
+    fn legacy_project_config_gets_the_complete_pass_policy() {
+        let legacy = r#"{
+            "project_name":"legacy",
+            "enable_timing":false,
+            "enable_power":false,
+            "enable_formal":false
+        }"#;
+        let config: ProjectConfig = serde_json::from_str(legacy).unwrap();
+        let expected = SynthesisOptions::default();
+        assert!(config.synthesis_options.constprop);
+        assert_eq!(config.synthesis_options.boundary_optimization, expected.boundary_optimization);
+        assert!(config.synthesis_options.logic_minimization);
     }
 }

@@ -123,6 +123,9 @@ struct TimingEdge {
     double transition;
     double load_cap;              // output load capacitance (pF) for NLDM lookup
     double input_slew;            // input transition time (ns) for NLDM lookup
+    // Concrete Liberty cell that owns this timing arc.  Do not infer this
+    // from a net name: foundry cell names routinely contain underscores.
+    std::string cell_type;
     enum Type { COMBINATIONAL, SEQUENTIAL, CLOCK };
     Type type;
     bool is_false_path;

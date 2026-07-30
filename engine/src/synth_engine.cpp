@@ -2801,8 +2801,8 @@ static void pass_techmap(GateNetlist &gn) {
         {"$_AND_",   "(A * B)"},
         {"$_OR_",    "(A + B)"},
         {"$_NOT_",   "(!A)"},
-        {"$_XOR_",   "((A * !B) + (!A * B))"},
-        {"$_XNOR_",  "((A * B) + (!A * !B))"},
+        {"$_XOR_",   "(A * !B) + (!A * B)"},
+        {"$_XNOR_",  "(A * B) + (!A * !B)"},
         {"$_NAND_",  "(!A) + (!B)"},
         {"$_NOR_",   "(!A * !B)"},
         {"$_MUX_",   "(A * !S0) + (B * S0)"},
@@ -5530,9 +5530,10 @@ static double get_liberty_cell_area(const std::string &gate_type,
     return best_area;
 }
 
-CppSynthResult synth_real_with_lib(const char *rtl_code, const char *module_name,
-                                    const char *liberty_path,
-                                    void (*log_cb)(const char *, const char *)) {
+CppSynthResult synth_real_with_options(const char *rtl_code, const char *module_name,
+                                        const char *liberty_path,
+                                        const NativeSynthesisOptions *requested_options,
+                                        void (*log_cb)(const char *, const char *)) {
     Synthesis::set_synth_log_callback(log_cb);
     CppSynthResult result = {};
     result.success = false;
@@ -5542,6 +5543,10 @@ CppSynthResult synth_real_with_lib(const char *rtl_code, const char *module_name
     std::string rtl = rtl_code ? rtl_code : "";
     std::string mod = module_name ? module_name : "top";
     std::string lib_path_str = liberty_path ? liberty_path : "";
+    const NativeSynthesisOptions default_options = {
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+    };
+    const NativeSynthesisOptions &options = requested_options ? *requested_options : default_options;
     // Declare lib_name_str here so it's in scope for the whole function
     std::string lib_name_str;
 
@@ -5622,36 +5627,34 @@ CppSynthResult synth_real_with_lib(const char *rtl_code, const char *module_name
             break;
         }
     }
-    Synthesis::pass_constprop(gn);
-    Synthesis::synth_log("SYNTH", "  after constprop: %zu cells", gn.cells.size());
-    Synthesis::pass_dce(gn);
-    Synthesis::synth_log("SYNTH", "  after dce: %zu cells", gn.cells.size());
-    Synthesis::pass_cse(gn);
-    Synthesis::synth_log("SYNTH", "  after cse: %zu cells", gn.cells.size());
-    Synthesis::pass_expr_opt(gn);
-    Synthesis::synth_log("SYNTH", "  after expr_opt: %zu cells", gn.cells.size());
-    Synthesis::pass_demorgan(gn);
-    Synthesis::synth_log("SYNTH", "  after demorgan: %zu cells", gn.cells.size());
-    Synthesis::pass_wreduce(gn);
-    Synthesis::synth_log("SYNTH", "  after wreduce: %zu cells", gn.cells.size());
+    if (options.constprop) Synthesis::pass_constprop(gn);
+    Synthesis::synth_log("SYNTH", "  %s constprop: %zu cells", options.constprop ? "after" : "skipped", gn.cells.size());
+    if (options.dead_code_elimination) Synthesis::pass_dce(gn);
+    Synthesis::synth_log("SYNTH", "  %s dce: %zu cells", options.dead_code_elimination ? "after" : "skipped", gn.cells.size());
+    if (options.common_subexpression_elimination) Synthesis::pass_cse(gn);
+    Synthesis::synth_log("SYNTH", "  %s cse: %zu cells", options.common_subexpression_elimination ? "after" : "skipped", gn.cells.size());
+    if (options.expression_optimization) Synthesis::pass_expr_opt(gn);
+    Synthesis::synth_log("SYNTH", "  %s expr_opt: %zu cells", options.expression_optimization ? "after" : "skipped", gn.cells.size());
+    if (options.demorgan) Synthesis::pass_demorgan(gn);
+    Synthesis::synth_log("SYNTH", "  %s demorgan: %zu cells", options.demorgan ? "after" : "skipped", gn.cells.size());
+    if (options.width_reduction) Synthesis::pass_wreduce(gn);
+    Synthesis::synth_log("SYNTH", "  %s wreduce: %zu cells", options.width_reduction ? "after" : "skipped", gn.cells.size());
     if (!has_sequential_logic) {
-        Synthesis::pass_resource_share(gn);
-        Synthesis::synth_log("SYNTH", "  after resource_share: %zu cells", gn.cells.size());
-        Synthesis::pass_fsm_extract(gn);
-        Synthesis::synth_log("SYNTH", "  after fsm_extract: %zu cells", gn.cells.size());
-        Synthesis::pass_logic_min(gn);
-        Synthesis::synth_log("SYNTH", "  after logic_min: %zu cells", gn.cells.size());
-        Synthesis::pass_retiming(gn);
-        Synthesis::synth_log("SYNTH", "  after retiming: %zu cells", gn.cells.size());
-        Synthesis::pass_boundary_opt(gn);
-        Synthesis::synth_log("SYNTH", "  after boundary_opt: %zu cells", gn.cells.size());
+        if (options.resource_sharing) Synthesis::pass_resource_share(gn);
+        if (options.fsm_extraction) Synthesis::pass_fsm_extract(gn);
+        if (options.logic_minimization) Synthesis::pass_logic_min(gn);
+        if (options.retiming) Synthesis::pass_retiming(gn);
+        if (options.boundary_optimization) Synthesis::pass_boundary_opt(gn);
+        Synthesis::synth_log("SYNTH", "  optional passes: resource=%d fsm=%d logic_min=%d retiming=%d boundary=%d; cells=%zu",
+            options.resource_sharing, options.fsm_extraction, options.logic_minimization,
+            options.retiming, options.boundary_optimization, gn.cells.size());
     } else {
         Synthesis::synth_log("SYNTH", "  skipping aggressive sequential-unsafe passes for stateful design");
     }
     Synthesis::pass_techmap(gn);
     Synthesis::synth_log("SYNTH", "  after techmap: %zu cells", gn.cells.size());
-    Synthesis::pass_dce(gn);
-    Synthesis::synth_log("SYNTH", "  final dce: %zu cells", gn.cells.size());
+    if (options.dead_code_elimination) Synthesis::pass_dce(gn);
+    Synthesis::synth_log("SYNTH", "  %s final dce: %zu cells", options.dead_code_elimination ? "after" : "skipped", gn.cells.size());
 
     // DRC check after synthesis
     auto drc_violations = pass_drc_check(gn);
@@ -5737,6 +5740,14 @@ CppSynthResult synth_real_with_lib(const char *rtl_code, const char *module_name
     ss<<"=== Synthesis Report ===\nModule: "<<mod<<"\nModules elaborated: "<<mod_map.size()
       <<"\nPorts: "<<gn.ports.size()<<"\nWires: "<<gn.wires.size()<<"\nCells: "<<gn.cells.size()<<"\n";
     for (auto &[t,c] : cc) ss<<"  "<<t<<": "<<c<<"\n";
+    ss<<"Pass policy:\n"
+      <<"  constprop="<<options.constprop<<" dce="<<options.dead_code_elimination
+      <<" cse="<<options.common_subexpression_elimination
+      <<" expr_opt="<<options.expression_optimization<<" demorgan="<<options.demorgan
+      <<" wreduce="<<options.width_reduction<<"\n"
+      <<"  resource_share="<<options.resource_sharing<<" fsm_extract="<<options.fsm_extraction
+      <<" logic_min="<<options.logic_minimization<<" retiming="<<options.retiming
+      <<" boundary_opt="<<options.boundary_optimization<<"\n";
     ss<<"Area: "<<area_ge<<" GE";
     if (from_lib) ss<<" ("<<area_um2<<" um^2 from "<<lib_name_str<<")";
     ss<<"\nDepth: "<<depth<<"\n";
@@ -5745,6 +5756,15 @@ CppSynthResult synth_real_with_lib(const char *rtl_code, const char *module_name
     Synthesis::synth_log("SYNTH", "=== Done: %zu cells, %zu DFF, %.0f GE, %.2f um^2, lib=%s ===",
         result.cell_count, dff, area_ge, area_um2, from_lib ? lib_name_str.c_str() : "none");
     return result;
+}
+
+// Preserve the historical entry point for callers that do not supply a
+// policy. A null policy intentionally means the complete, all-enabled pass
+// set, rather than a different synthesis implementation.
+CppSynthResult synth_real_with_lib(const char *rtl_code, const char *module_name,
+                                   const char *liberty_path,
+                                   void (*log_cb)(const char *, const char *)) {
+    return synth_real_with_options(rtl_code, module_name, liberty_path, nullptr, log_cb);
 }
 
 // ========== Frequency-Optimized Synthesis ==========

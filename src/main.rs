@@ -4,12 +4,12 @@
  * An agent-driven tool for RTL generation, simulation, and synthesis.
  * Uses LLM to generate Verilog code, then validates with lint and synthesis.
  *
- * References source code patterns from:
- * - Yosys (logic synthesis): kernel/rtlil.h, passes/, frontends/verilog/
- * -
+ * The synthesis, simulation, timing, formal, and power engines are compiled
+ * from this repository's local C++ sources and invoked through local FFI.
  */
 
 mod agent;
+mod apr;
 mod data_api;
 mod engine;
 mod gui;

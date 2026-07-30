@@ -411,8 +411,10 @@ private:
         } else if (p.type == Tokenizer::LBR) {
             tok_.next(); // {
             // Detect sequential cells from attribute names in cell body
-            if (kw.text.find("FF") != std::string::npos ||
-                kw.text.find("LAT") != std::string::npos) {
+            std::string group_name = kw.text;
+            for (char &ch : group_name) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+            if (group_name.find("FF") != std::string::npos ||
+                group_name.find("LAT") != std::string::npos) {
                 cell.is_sequential = true;
             }
             skip_to_rbrace();

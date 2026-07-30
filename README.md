@@ -29,6 +29,15 @@ project/
 └── workspace/        # Per-project runtime data (generated, not committed)
 ```
 
+Technology libraries are discovered as direct subdirectories of `libs/`.
+The repository includes the original 55nm corners and a compact, native
+Liberty view of five representative SkyWater SKY130 FD SC HD corners under
+`libs/sky130_fd_sc_hd/` (TT 25/100 C, FF -40 C, SS -40/100 C).  The Sky130
+views are derived from the checked-in `skywater-pdk-libs-sky130_fd_sc_hd-main`
+timing JSON and keep the source operating-condition names and cell identities.
+Use `/tech` to inspect corners and `/tech <process>` to switch them; the
+selected process is persisted per project.
+
 ## Requirements
 
 ### Build dependencies
@@ -139,6 +148,8 @@ Common commands:
 /timing <module>
 /power
 /formal <module>
+/opt                      # interactive native synthesis-pass configuration
+/opt synth logic_minimization off  # one-shot per-pass policy change
 /full <module>
 /quit
 ```
@@ -178,4 +189,3 @@ The GUI provides:
 - Release builds are strongly recommended for real runs and GUI integration.
 - If the LLM is unavailable during an LLM-required flow, the tool aborts instead of silently skipping that stage.
 - Runtime project data is stored under `workspace/`.
-

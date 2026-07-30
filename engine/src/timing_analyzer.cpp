@@ -697,6 +697,7 @@ void TimingAnalyzer::buildTimingGraph() {
                 edges_.back().delay = cell_delay;
                 edges_.back().load_cap = load_cap_pf;
                 edges_.back().input_slew = default_slew_ns;
+                edges_.back().cell_type = cell.type;
                 // Mark clock-to-sequential edges as CLOCK type
                 if (is_sequential && nodes_[in_node].type == TimingNode::CLOCK) {
                     edges_.back().type = TimingEdge::CLOCK;
@@ -994,12 +995,12 @@ void TimingAnalyzer::computeArrivalTimes() {
                 double load_cap = edge.load_cap;
                 if (load_cap < 0.0001) load_cap = 0.005; // default 5fF
 
-                // Look up the cell type from the target node name
-                // Node name format: "CELL_TYPE_name"
-                std::string target_name = nodes_[v].name;
-                size_t uscore = target_name.find('_');
-                if (uscore != std::string::npos) {
-                    std::string cell_type = target_name.substr(0, uscore);
+                // The edge retains its concrete mapped cell name.  Inferring
+                // a type from a signal name corrupts names such as
+                // sky130_fd_sc_hd__and2_0 and silently falls back to a
+                // technology-independent delay.
+                if (!edge.cell_type.empty()) {
+                    const std::string &cell_type = edge.cell_type;
                     // Optional: re-compute delay with actual slew
                     double nldm_delay = get_cell_delay_from_lib(cell_type, liberty_cells_, liberty_full_,
                                                                  input_slew, load_cap);
@@ -1013,8 +1014,8 @@ void TimingAnalyzer::computeArrivalTimes() {
                 if (newTime > nodes_[v].arrival_time) {
                     nodes_[v].arrival_time = newTime;
                     // Propagate output slew: use NLDM output transition lookup
-                    if (uscore != std::string::npos && liberty_full_) {
-                        std::string cell_type = target_name.substr(0, uscore);
+                    if (!edge.cell_type.empty() && liberty_full_) {
+                        const std::string &cell_type = edge.cell_type;
                         const Liberty::LibertyLibrary *full_lib = static_cast<const Liberty::LibertyLibrary*>(liberty_full_);
                         double out_slew = full_lib->compute_output_slew(cell_type, "", "",
                                                                          input_slew, load_cap, true);

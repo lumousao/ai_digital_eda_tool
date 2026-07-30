@@ -2,6 +2,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use crate::project::SynthesisOptions;
 
 #[derive(Clone, Debug, Default)]
 pub struct GuiTechnologyCorner {
@@ -32,6 +33,7 @@ pub struct GuiSyncContext {
     pub last_error: String,
     pub active_technology: String,
     pub technology_corners: Vec<GuiTechnologyCorner>,
+    pub synthesis_options: SynthesisOptions,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -70,7 +72,9 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     let gate_path = existing_path(&ctx.project_dir.join("syn").join(format!("{}_synth_gate.v", ctx.module_name)));
     let sim_report_path = existing_path(&ctx.project_dir.join("sim").join("sim_report.txt"));
     let timing_report_path = existing_path(&ctx.project_dir.join("syn").join("timing_report.txt"));
-    let synth_report_path = existing_path(&ctx.project_dir.join("syn").join("synth_report.txt"));
+    let power_report_path = existing_path(&ctx.project_dir.join("syn").join("power_report.txt"));
+    let synth_report_path = existing_path(&ctx.project_dir.join("syn").join(format!("{}_native_synth_report.txt", ctx.module_name)))
+        .or_else(|| existing_path(&ctx.project_dir.join("syn").join("synth_report.txt")));
     let formal_report_path = existing_path(&ctx.project_dir.join("formal").join("formal_report.txt"))
         .or_else(|| existing_path(&ctx.project_dir.join("formal").join("equiv_result.txt")));
     let formal_points_path = existing_path(&ctx.project_dir.join("formal").join("equiv_points.txt"));
@@ -79,6 +83,25 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     let report_json_path = existing_path(&ctx.project_dir.join("report").join("report.json"));
     let detail_log_path = existing_path(&ctx.project_dir.join("logs").join("detail.log"));
     let conversation_path = existing_path(&ctx.project_dir.join("history").join("conversation.jsonl"));
+    let apr_report_path = existing_path(&ctx.project_dir.join("apr").join("apr_report.txt"));
+    let apr_layout_path = existing_path(&ctx.project_dir.join("exchange").join("apr_layout.tsv"));
+    let apr_grid_path = existing_path(&ctx.project_dir.join("exchange").join("apr_grid.tsv"));
+    let apr_netlist_path = existing_path(&ctx.project_dir.join("apr").join("apr_netlist.v"));
+    let apr_final_def_path = existing_path(&ctx.project_dir.join("apr").join("final.def"));
+    let apr_floorplan_def_path = existing_path(&ctx.project_dir.join("apr").join("floorplan.def"));
+    let apr_gds_path = existing_path(&ctx.project_dir.join("apr").join("final.gds"));
+    let apr_detail_route_path = existing_path(&ctx.project_dir.join("apr").join("detail_route.tsv"));
+    let apr_timing_report_path = existing_path(&ctx.project_dir.join("apr").join("timing_report.txt"));
+    let apr_power_report_path = existing_path(&ctx.project_dir.join("apr").join("power_report.txt"));
+    let apr_area_report_path = existing_path(&ctx.project_dir.join("apr").join("area_report.txt"));
+    let apr_drc_report_path = existing_path(&ctx.project_dir.join("apr").join("drc_report.txt"));
+    let apr_lvs_report_path = existing_path(&ctx.project_dir.join("apr").join("lvs_report.txt"));
+    let apr_dft_report_path = existing_path(&ctx.project_dir.join("apr").join("dft_report.txt"));
+    let apr_report_json_path = existing_path(&ctx.project_dir.join("apr").join("apr_report.json"));
+    let apr_prediction_path = existing_path(&ctx.project_dir.join("apr").join("llm_prediction.txt"));
+    let apr_report_json = apr_report_json_path.as_ref()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
 
     let report_json = report_json_path
         .as_ref()
@@ -88,6 +111,7 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     let sim_report = read_optional_text(&sim_report_path);
     let timing_report = read_optional_text(&timing_report_path)
         .or_else(|| json_string(&report_json, &["timing", "report"]));
+    let power_report = read_optional_text(&power_report_path);
     let synth_report = read_optional_text(&synth_report_path);
     let formal_report = read_optional_text(&formal_report_path);
     let formal_points = read_optional_text(&formal_points_path);
@@ -125,9 +149,9 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     let timing_met = json_bool(&report_json, &["timing", "timing_met"])
         .or_else(|| timing_report.as_deref().map(report_timing_met))
         .unwrap_or(false);
-    let power_total_mw = json_f64(&report_json, &["power", "total_uw"]).unwrap_or(0.0) / 1000.0;
-    let power_static_mw = json_f64(&report_json, &["power", "static_uw"]).unwrap_or(0.0) / 1000.0;
-    let power_dynamic_mw = json_f64(&report_json, &["power", "dynamic_uw"]).unwrap_or(0.0) / 1000.0;
+    let mut power_total_mw = json_f64(&report_json, &["power", "total_uw"]).unwrap_or(0.0) / 1000.0;
+    let mut power_static_mw = json_f64(&report_json, &["power", "static_uw"]).unwrap_or(0.0) / 1000.0;
+    let mut power_dynamic_mw = json_f64(&report_json, &["power", "dynamic_uw"]).unwrap_or(0.0) / 1000.0;
 
     let sim_passed = sim_report.as_ref().map(|r| r.contains("Status: PASS") || r.contains("Simulation: PASS")).unwrap_or(false);
     let sim_cycles = sim_report.as_ref().and_then(|r| extract_prefixed_int(r, "Time steps:")).unwrap_or(0);
@@ -146,13 +170,6 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
         logic_depth,
         &report_json,
         synth_report.as_deref(),
-    );
-    let power_exchange = build_power_exchange(
-        power_total_mw,
-        power_static_mw,
-        power_dynamic_mw,
-        ctx.constraint_freq_mhz,
-        report_rpt.as_deref(),
     );
     let summary_exchange = build_summary_exchange(
         ctx,
@@ -178,7 +195,28 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     let power_detail_json = json_string(&report_json, &["power", "detail"]);
     let power_corners_exchange = build_power_corners_exchange(
         &report_json,
-        report_rpt.as_deref().or(power_detail_json.as_deref()),
+        power_report
+            .as_deref()
+            .or(report_rpt.as_deref())
+            .or(power_detail_json.as_deref()),
+    );
+    // The per-corner report is produced directly by the current power run,
+    // while report.json is only rewritten after a completed full flow. Prefer
+    // the current constraint-point row so a failed signoff run cannot leave
+    // the power cards showing values from an older report than the chart.
+    if let Some((static_uw, dynamic_uw, total_uw)) =
+        power_card_from_corner_exchange(&power_corners_exchange, ctx.constraint_freq_mhz)
+    {
+        power_static_mw = static_uw / 1000.0;
+        power_dynamic_mw = dynamic_uw / 1000.0;
+        power_total_mw = total_uw / 1000.0;
+    }
+    let power_exchange = build_power_exchange(
+        power_total_mw,
+        power_static_mw,
+        power_dynamic_mw,
+        ctx.constraint_freq_mhz,
+        report_rpt.as_deref(),
     );
 
     let rtl_exchange_path = write_exchange_file(&exchange_dir, "rtl_source.v", rtl_code.as_deref());
@@ -193,13 +231,26 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     let hierarchy_exchange_path = write_exchange_file(&exchange_dir, "hierarchy_tree.tsv", Some(&hierarchy_exchange));
     let timing_paths_exchange_path = write_exchange_file(&exchange_dir, "timing_paths.tsv", Some(&timing_paths_exchange));
     let technology_exchange_path = write_exchange_file(&exchange_dir, "technologies.tsv", Some(&technology_exchange));
-    let power_corners_exchange_path = write_exchange_file(&exchange_dir, "power_corners.tsv", Some(&power_corners_exchange));
+    let power_corners_exchange_path = exchange_dir.join("power_corners.tsv");
+    // A synthesis/formal/simulation refresh has no per-corner power payload.
+    // Do not erase a valid chart produced by the preceding timing/full-flow
+    // step merely because that unrelated command refreshed GUI state.
+    let power_corners_to_write = if has_power_corner_rows(&power_corners_exchange) {
+        power_corners_exchange
+    } else {
+        fs::read_to_string(&power_corners_exchange_path)
+            .ok()
+            .filter(|existing| has_power_corner_rows(existing))
+            .unwrap_or(power_corners_exchange)
+    };
+    fs::write(&power_corners_exchange_path, power_corners_to_write)
+        .map_err(|e| format!("Failed to write {}: {}", power_corners_exchange_path.display(), e))?;
 
     let state_path = exchange_dir.join("gui_state.tcl");
     let mut state = String::new();
     state.push_str("unset -nocomplain ::gui_state\n");
     state.push_str("array set ::gui_state {}\n");
-    set_string(&mut state, "version", "0.6.8");
+    set_string(&mut state, "version", "0.7.0");
     set_string(&mut state, "project_name", &ctx.project_name);
     set_string(&mut state, "project_dir", &ctx.project_dir.to_string_lossy());
     set_string(&mut state, "module_name", &ctx.module_name);
@@ -224,6 +275,44 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     set_string(&mut state, "report_json_path", &path_string(&report_json_path));
     set_string(&mut state, "detail_log_path", &path_string(&detail_log_path));
     set_string(&mut state, "conversation_path", &path_string(&conversation_path));
+    set_string(&mut state, "apr_report_path", &path_string(&apr_report_path));
+    set_string(&mut state, "apr_layout_path", &path_string(&apr_layout_path));
+    set_string(&mut state, "apr_grid_path", &path_string(&apr_grid_path));
+    set_string(&mut state, "apr_netlist_path", &path_string(&apr_netlist_path));
+    set_string(&mut state, "apr_final_def_path", &path_string(&apr_final_def_path));
+    set_string(&mut state, "apr_floorplan_def_path", &path_string(&apr_floorplan_def_path));
+    set_string(&mut state, "apr_gds_path", &path_string(&apr_gds_path));
+    set_string(&mut state, "apr_detail_route_path", &path_string(&apr_detail_route_path));
+    set_string(&mut state, "apr_timing_report_path", &path_string(&apr_timing_report_path));
+    set_string(&mut state, "apr_power_report_path", &path_string(&apr_power_report_path));
+    set_string(&mut state, "apr_area_report_path", &path_string(&apr_area_report_path));
+    set_string(&mut state, "apr_drc_report_path", &path_string(&apr_drc_report_path));
+    set_string(&mut state, "apr_lvs_report_path", &path_string(&apr_lvs_report_path));
+    set_string(&mut state, "apr_dft_report_path", &path_string(&apr_dft_report_path));
+    set_string(&mut state, "apr_report_json_path", &path_string(&apr_report_json_path));
+    set_string(&mut state, "apr_prediction_path", &path_string(&apr_prediction_path));
+    set_string(&mut state, "apr_signoff_status", apr_report_json.as_ref().and_then(|v| v.get("signoff_ready")).map(|v| if v.as_bool().unwrap_or(false) { "READY" } else { "BLOCKED" }).unwrap_or("NOT_RUN"));
+    set_string(&mut state, "apr_drc_status", apr_report_json.as_ref().and_then(|v| v.get("drc_status")).and_then(|v| v.as_str()).unwrap_or("NOT_RUN"));
+    set_string(&mut state, "apr_lvs_status", apr_report_json.as_ref().and_then(|v| v.get("lvs_status")).and_then(|v| v.as_str()).unwrap_or("NOT_RUN"));
+    set_string(&mut state, "apr_dft_status", apr_report_json.as_ref().and_then(|v| v.get("dft_status")).and_then(|v| v.as_str()).unwrap_or("NOT_RUN"));
+    set_string(&mut state, "apr_critical_route_source", apr_report_json.as_ref().and_then(|v| v.get("critical_route_source")).and_then(|v| v.as_str()).unwrap_or("not available"));
+    for key in [
+        "core_width_um", "core_height_um", "die_width_um", "die_height_um",
+        "ir_drop_mv", "ir_worst_voltage_v", "ocv_late_slack_ns", "ocv_early_hold_slack_ns",
+        "wns_ns", "tns_ns", "total_power_mw", "standard_cell_area_um2",
+        "total_wire_length_um", "utilization", "violating_endpoints",
+    ] {
+        let value = apr_report_json.as_ref().and_then(|v| v.get(key)).and_then(|v| v.as_f64())
+            .map(|v| format!("{v:.6}"))
+            .unwrap_or_default();
+        set_string(&mut state, &format!("apr_{key}"), &value);
+    }
+    for key in ["cells", "routes", "ir_grid", "critical_routes"] {
+        let value = apr_report_json.as_ref().and_then(|v| v.get(key)).and_then(|v| v.as_array())
+            .map(|v| v.len().to_string())
+            .unwrap_or_default();
+        set_string(&mut state, &format!("apr_{key}_count"), &value);
+    }
     set_string(&mut state, "exchange_rtl_path", &rtl_exchange_path.to_string_lossy());
     set_string(&mut state, "exchange_gate_path", &gate_exchange_path.to_string_lossy());
     set_string(&mut state, "exchange_sim_path", &sim_exchange_path.to_string_lossy());
@@ -237,6 +326,17 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     set_string(&mut state, "exchange_timing_paths_path", &timing_paths_exchange_path.to_string_lossy());
     set_string(&mut state, "exchange_technology_path", &technology_exchange_path.to_string_lossy());
     set_string(&mut state, "active_technology", &ctx.active_technology);
+    set_int(&mut state, "opt_constprop", ctx.synthesis_options.constprop as i64);
+    set_int(&mut state, "opt_dead_code_elimination", ctx.synthesis_options.dead_code_elimination as i64);
+    set_int(&mut state, "opt_common_subexpression_elimination", ctx.synthesis_options.common_subexpression_elimination as i64);
+    set_int(&mut state, "opt_expression_optimization", ctx.synthesis_options.expression_optimization as i64);
+    set_int(&mut state, "opt_demorgan", ctx.synthesis_options.demorgan as i64);
+    set_int(&mut state, "opt_width_reduction", ctx.synthesis_options.width_reduction as i64);
+    set_int(&mut state, "opt_resource_sharing", ctx.synthesis_options.resource_sharing as i64);
+    set_int(&mut state, "opt_fsm_extraction", ctx.synthesis_options.fsm_extraction as i64);
+    set_int(&mut state, "opt_logic_minimization", ctx.synthesis_options.logic_minimization as i64);
+    set_int(&mut state, "opt_retiming", ctx.synthesis_options.retiming as i64);
+    set_int(&mut state, "opt_boundary_optimization", ctx.synthesis_options.boundary_optimization as i64);
     set_string(&mut state, "exchange_power_corners_path", &power_corners_exchange_path.to_string_lossy());
     set_int(&mut state, "constraint_freq_mhz", ctx.constraint_freq_mhz as i64);
     set_int(&mut state, "cell_count", cell_count as i64);
@@ -377,8 +477,8 @@ fn build_area_exchange(
     text.push_str(&format!("DFF Count   : {}\n", dff_count));
     text.push_str(&format!("Wire Count  : {}\n", wire_count));
     text.push_str(&format!("Port Count  : {}\n", port_count));
-    text.push_str(&format!("Area (GE)   : {:.3}\n", area_ge));
     text.push_str(&format!("Area (um^2) : {:.3}\n", area_um2));
+    text.push_str(&format!("GE Reference : {:.3}\n", area_ge));
     text.push_str(&format!("Logic Depth : {}\n", logic_depth));
     if let Some(cells) = report_json
         .as_ref()
@@ -390,8 +490,8 @@ fn build_area_exchange(
         for cell in cells {
             let cell_type = cell.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
             let count = cell.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-            let total = cell.get("total_ge").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            text.push_str(&format!("{:<20} {:>6}  {:>10.3} GE\n", cell_type, count, total));
+            let total = cell.get("total_area_um2").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            text.push_str(&format!("{:<20} {:>6}  {:>10.3} um^2\n", cell_type, count, total));
         }
     }
     if let Some(report) = synth_report {
@@ -700,23 +800,9 @@ fn append_power_corner_rows_from_json(rows: &mut Vec<String>, report_json: &Opti
 
 fn build_power_corners_exchange(report_json: &Option<Value>, detail: Option<&str>) -> String {
     let mut rows = vec!["analysis\tfrequency_mhz\tcorner\ttype\tvoltage_v\tstatic_uw\tdynamic_uw\ttotal_uw".to_string()];
-    append_power_corner_rows_from_json(
-        &mut rows,
-        report_json,
-        "constraint_corner_results",
-        "Multi-Corner Power Analysis",
-    );
-    append_power_corner_rows_from_json(
-        &mut rows,
-        report_json,
-        "max_corner_results",
-        "Max Frequency Power",
-    );
-    if rows.len() > 1 {
-        rows.push(String::new());
-        return rows.join("\n");
-    }
-
+    // syn/power_report.txt is produced by the operation currently running.
+    // report.json is only finalized after a successful full flow, so stale JSON
+    // must never overwrite fresh per-corner power data after a failed signoff.
     let mut analysis = String::new();
     let mut frequency = 0.0;
     for line in detail.unwrap_or_default().lines() {
@@ -730,7 +816,10 @@ fn build_power_corners_exchange(report_json: &Option<Value>, detail: Option<&str
             }
         }
         let fields: Vec<&str> = trimmed.split_whitespace().collect();
-        if fields.len() != 6 || analysis.is_empty() || fields[0] == "Corner" || fields[0].starts_with('-') {
+        // Reports produced by the native NLDM analyzer optionally append a
+        // source column (for example, "NLDM").  Older reports omit it, so
+        // accept both forms while keeping the numeric columns authoritative.
+        if fields.len() < 6 || analysis.is_empty() || fields[0] == "Corner" || fields[0].starts_with('-') {
             continue;
         }
         let corner_type = fields[1].to_ascii_uppercase();
@@ -749,8 +838,66 @@ fn build_power_corners_exchange(report_json: &Option<Value>, detail: Option<&str
                 voltage, static_uw, dynamic_uw, total_uw));
         }
     }
+    if rows.len() == 1 {
+        append_power_corner_rows_from_json(
+            &mut rows,
+            report_json,
+            "constraint_corner_results",
+            "Multi-Corner Power Analysis",
+        );
+        append_power_corner_rows_from_json(
+            &mut rows,
+            report_json,
+            "max_corner_results",
+            "Max Frequency Power",
+        );
+    }
     rows.push(String::new());
     rows.join("\n")
+}
+
+fn has_power_corner_rows(content: &str) -> bool {
+    content.lines().skip(1).any(|line| !line.trim().is_empty())
+}
+
+/// Return the displayed power-card values from the current constraint table.
+/// The nominal TT row is the synthesis/display default; if it is unavailable,
+/// retain the first row at the requested operating point.
+fn power_card_from_corner_exchange(
+    content: &str,
+    constraint_freq_mhz: i32,
+) -> Option<(f64, f64, f64)> {
+    let mut first_row = None;
+    let mut constraint_row = None;
+    for line in content.lines().skip(1) {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        let (Ok(frequency), Ok(static_uw), Ok(dynamic_uw), Ok(total_uw)) = (
+            fields[1].parse::<f64>(),
+            fields[5].parse::<f64>(),
+            fields[6].parse::<f64>(),
+            fields[7].parse::<f64>(),
+        ) else {
+            continue;
+        };
+        let row = (static_uw, dynamic_uw, total_uw);
+        if first_row.is_none() {
+            first_row = Some(row);
+        }
+        if fields[0] == "Multi-Corner Power Analysis"
+            && (frequency - constraint_freq_mhz as f64).abs() < 0.001
+        {
+            if fields[3] == "TT" {
+                return Some(row);
+            }
+            if constraint_row.is_none() {
+                constraint_row = Some(row);
+            }
+        }
+    }
+    constraint_row.or(first_row)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1337,5 +1484,53 @@ fn nibble_to_hex(n: u8) -> char {
     match n {
         0..=9 => (b'0' + n) as char,
         _ => (b'a' + (n - 10)) as char,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_power_corners_exchange, power_card_from_corner_exchange};
+    use serde_json::json;
+
+    #[test]
+    fn power_card_prefers_current_constraint_corner_values() {
+        let tsv = concat!(
+            "analysis\tfrequency_mhz\tcorner\ttype\tvoltage_v\tstatic_uw\tdynamic_uw\ttotal_uw\n",
+            "Max Frequency Power\t1135.000\ttt\tTT\t1.200000\t74.300000\t3795.900000\t5009.000000\n",
+            "Multi-Corner Power Analysis\t100.000\ttt\tTT\t1.200000\t74.300000\t334.400000\t509.100000\n",
+        );
+
+        assert_eq!(
+            power_card_from_corner_exchange(tsv, 100),
+            Some((74.3, 334.4, 509.1))
+        );
+    }
+
+    #[test]
+    fn current_power_detail_overrides_stale_report_json() {
+        let stale_json = Some(json!({
+            "power": {
+                "constraint_corner_results": [{
+                    "frequency_mhz": 100.0,
+                    "corner": "typ_tt_1p2_25",
+                    "type": "TT",
+                    "voltage": 1.2,
+                    "static_uw": 74.3,
+                    "dynamic_uw": 334.4,
+                    "total_uw": 509.1
+                }]
+            }
+        }));
+        let current = concat!(
+            "  Multi-Corner Power Analysis (100 MHz)\n",
+            "  Corner Type Voltage Static Dynamic Total Source\n",
+            "  typ_tt_1p2_25 TT 1.2V 74.3 434.8 509.1 ESTIMATED_PVT\n",
+            "  ff_cbest_1p32_125 FF 1.32V 580.4 641.2 1221.6 ESTIMATED_PVT\n",
+        );
+
+        let exchange = build_power_corners_exchange(&stale_json, Some(current));
+        assert!(exchange.contains("ff_cbest_1p32_125"));
+        assert!(exchange.contains("1221.600000"));
+        assert!(!exchange.contains("334.400000"));
     }
 }

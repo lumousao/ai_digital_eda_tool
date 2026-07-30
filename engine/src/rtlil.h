@@ -58,7 +58,7 @@ struct OwningIdString;
 typedef std::pair<SigSpec, SigSpec> SigSig;
 
 // ============================================================================
-// State enumeration (from Yosys RTLIL::State)
+// RTLIL-compatible state enumeration
 // ============================================================================
 
 enum State : unsigned char {
@@ -71,7 +71,7 @@ enum State : unsigned char {
 };
 
 // ============================================================================
-// SyncType enumeration (from Yosys RTLIL::SyncType)
+// RTLIL-compatible synchronization enumeration
 // ============================================================================
 
 enum SyncType : unsigned char {
@@ -86,7 +86,7 @@ enum SyncType : unsigned char {
 };
 
 // ============================================================================
-// ConstFlags (from Yosys RTLIL::ConstFlags)
+// Constant flags
 // ============================================================================
 
 enum ConstFlags : unsigned char {
@@ -98,7 +98,7 @@ enum ConstFlags : unsigned char {
 };
 
 // ============================================================================
-// PortDir (from Yosys RTLIL::PortDir)
+// Port direction
 // ============================================================================
 
 enum PortDir : unsigned char {

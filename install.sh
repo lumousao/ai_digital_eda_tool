@@ -5,7 +5,7 @@
 set -e
 
 echo "========================================="
-echo "  AI Digital v0.6.8 - Installation"
+echo "  AI Digital v0.7.0 - Installation"
 echo "========================================="
 echo ""
 

@@ -1,5 +1,5 @@
 /**
- * Formal Verification - Industrial-grade implementation based on SymbiYosys
+ * Formal Verification - native SAT-based implementation
  *
  * Features:
  * - SAT solving (DPLL/CDCL)

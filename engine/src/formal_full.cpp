@@ -1,5 +1,5 @@
 /**
- * Formal Verification - Industrial-grade implementation based on SymbiYosys
+ * Formal Verification - native SAT-based implementation
  *
  * Complete implementation of all methods declared in formal_industrial.h
  */

@@ -502,8 +502,8 @@ TimingReport rtl_timing_check(RtlDesign *d, const char *mn, double cp) {
 }
 void rtl_timing_report_free(TimingReport *r) { if(r&&r->report){free(r->report);r->report=nullptr;} }
 
-const char *rtl_engine_version(void) { return "rtl-engine 0.6.8 (native RTLIL)"; }
-char *rtl_engine_info(void) { return strdup_safe("{\"version\":\"0.6.8\",\"name\":\"ai_digital\",\"features\":[\"verilog_parser\",\"lint_check\",\"synthesis\",\"timing_analysis\",\"formal_verification\",\"multi_corner\"]}"); }
+const char *rtl_engine_version(void) { return "rtl-engine 0.7.0 (native RTLIL)"; }
+char *rtl_engine_info(void) { return strdup_safe("{\"version\":\"0.7.0\",\"name\":\"ai_digital\",\"features\":[\"verilog_parser\",\"lint_check\",\"synthesis\",\"timing_analysis\",\"formal_verification\",\"multi_corner\"]}"); }
 void rtl_error_free(RtlError *e) { if(!e)return; if(e->message)free(e->message); if(e->file)free(e->file); free(e); }
 
 // Forward declarations for Liberty library functions
@@ -1249,6 +1249,14 @@ TimingReport rtl_timing_analysis_corner(const char *synth_output, const char *mo
             // Build timing graph from netlist (will use NLDM for liberty-loaded cells)
             ta.buildTimingGraphFromNetlist(netlist_text);
 
+            // Signoff STA must account for on-chip variation.  The analyzer
+            // applies its depth-aware AOCV table to data paths and CRPR to
+            // common clock paths; these base early/late factors cover the
+            // required-time side of setup/hold analysis.
+            ta.setOCVMode(true);
+            ta.setOCVDerateEarly(0.95);
+            ta.setOCVDerateLate(1.05);
+
             // Set clock period
             TimingAnalysis::ClockConstraint clk;
             clk.name = "clk";
@@ -1410,6 +1418,8 @@ TimingReport rtl_timing_analysis_corner(const char *synth_output, const char *mo
     ss << fmt_row("Corner", corner_label) << "\n";
     ss << fmt_row("Liberty library", lib_name) << "\n";
     ss << fmt_row("Delay source", corner_lib_loaded ? "corner NLDM" : "PVT fallback") << "\n";
+    ss << fmt_row("Variation model", "AOCV + CRPR (enabled)") << "\n";
+    ss << fmt_row("OCV derates", "early 0.95 / late 1.05") << "\n";
     ss << fmt_row("Clock period", fmt(clock_period) + " ns") << "\n";
     ss << fmt_row("Vdd (from lib)", fmt(v_nom) + " V") << "\n";
     ss << sep << "\n";
@@ -2334,6 +2344,12 @@ SynthResult rtl_synthesize_real(const char *rtl_code, const char *module_name) {
 
 SynthResult rtl_synthesize_real_with_lib(const char *rtl_code, const char *module_name,
                                           const char *liberty_path) {
+    return rtl_synthesize_real_with_options(rtl_code, module_name, liberty_path, nullptr);
+}
+
+SynthResult rtl_synthesize_real_with_options(const char *rtl_code, const char *module_name,
+                                              const char *liberty_path,
+                                              const RtlSynthesisOptions *options) {
     SynthResult result = {};
     result.success = 0;
 
@@ -2342,7 +2358,24 @@ SynthResult rtl_synthesize_real_with_lib(const char *rtl_code, const char *modul
         synth_engine_log(step, msg);
     };
 
-    auto cpp_result = synth_real_with_lib(rtl_code, module_name, liberty_path, log_cb);
+    NativeSynthesisOptions native_options = {};
+    const NativeSynthesisOptions *native_options_ptr = nullptr;
+    if (options) {
+        native_options.constprop = options->constprop;
+        native_options.dead_code_elimination = options->dead_code_elimination;
+        native_options.common_subexpression_elimination = options->common_subexpression_elimination;
+        native_options.expression_optimization = options->expression_optimization;
+        native_options.demorgan = options->demorgan;
+        native_options.width_reduction = options->width_reduction;
+        native_options.resource_sharing = options->resource_sharing;
+        native_options.fsm_extraction = options->fsm_extraction;
+        native_options.logic_minimization = options->logic_minimization;
+        native_options.retiming = options->retiming;
+        native_options.boundary_optimization = options->boundary_optimization;
+        native_options_ptr = &native_options;
+    }
+    auto cpp_result = synth_real_with_options(rtl_code, module_name, liberty_path,
+                                               native_options_ptr, log_cb);
 
     result.success = cpp_result.success ? 1 : 0;
     result.gate_verilog = cpp_result.gate_verilog;
@@ -2755,7 +2788,10 @@ PowerAnalysisResult rtl_power_analyze(const char *gate_netlist, const char *modu
     total_clock = (total_switching + total_internal) * 0.3;
     result.total_power_uw = total_leakage + total_switching + total_internal + total_clock;
     result.static_power_uw = total_leakage;
-    result.dynamic_power_uw = total_switching + total_internal;
+    // Dynamic power is the complete non-static component.  Keeping clock
+    // power inside this field makes static + dynamic exactly equal total in
+    // the CLI report, report.json, and GUI stacked bars.
+    result.dynamic_power_uw = total_switching + total_internal + total_clock;
     result.internal_power_uw = total_internal;
     result.switching_power_uw = total_switching;
     result.clock_power_uw = total_clock;

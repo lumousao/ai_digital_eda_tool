@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <set>
 
-namespace YosysCore {
+namespace NativeSynthCore {
 
 SynthesisEngine::SynthesisEngine() {}
 SynthesisEngine::~SynthesisEngine() {}
@@ -216,4 +216,4 @@ std::string SynthesisEngine::to_verilog(RTLIL::Module *module) {
     return ss.str();
 }
 
-} // namespace YosysCore
+} // namespace NativeSynthCore

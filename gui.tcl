@@ -1,5 +1,5 @@
 #!/usr/bin/env wish
-# AI Digital v0.6.8 — Native Tcl/Tk GUI (pipe-integrated CLI mode)
+# AI Digital v0.7.0 — Native Tcl/Tk GUI (pipe-integrated CLI mode)
 # Debug: all output goes to stderr AND gui_debug.log
 
 package require Tk
@@ -58,12 +58,12 @@ proc console_input_clear {} {
 }
 
 _debug_init
-debug "=== AI Digital GUI v0.6.8 (pipe mode) ==="
+debug "=== AI Digital GUI v0.7.0 (pipe mode) ==="
 debug "Tcl=[info tclversion] Tk=[package provide Tk]"
 
 # ===================== Config =====================
 set ::APP_NAME "AI Digital"
-set ::APP_VERSION "0.6.8"
+set ::APP_VERSION "0.7.0"
 set ::BINARY [file normalize [file join [file dirname [info script]] "target" "release" "ai_digital"]]
 if {![file exists $::BINARY]} {
     set ::BINARY [file normalize [file join [file dirname [info script]] "target" "debug" "ai_digital"]]
@@ -114,6 +114,9 @@ set ::project_name "default"
 set ::current_page "rtl"
 set ::console_lines 0
 set ::constraint_freq 100
+foreach pass {constprop dead_code_elimination common_subexpression_elimination expression_optimization demorgan width_reduction resource_sharing fsm_extraction logic_minimization retiming boundary_optimization} {
+    set ::opt_$pass 1
+}
 set ::synth_cells 0; set ::synth_dff 0; set ::synth_wires 0
 set ::synth_area_ge 0.0; set ::synth_area_um2 0.0; set ::synth_depth 0
 set ::synth_gate_netlist ""
@@ -137,6 +140,7 @@ set ::wave_signal_order {}
 set ::wave_max_time 0
 set ::hierarchy_rows {}
 set ::formal_points_data ""
+set ::formal_view "rtl_gate"
 set ::pipe_id ""
 set ::pipe_buffer ""
 set ::pipe_ready 0
@@ -148,6 +152,31 @@ set ::technology_rows {}
 set ::technology_names {}
 set ::selected_technology ""
 set ::power_corner_rows {}
+set ::apr_rows {}
+set ::apr_grid_rows {}
+set ::apr_heat_metric "cong"
+set ::apr_route_mode "critical"
+set ::apr_view "layout"
+set ::apr_zoom 1.0
+set ::apr_pan_x 0.0
+set ::apr_pan_y 0.0
+set ::apr_pan_mark_x 0
+set ::apr_pan_mark_y 0
+set ::apr_viewport_width 0
+set ::apr_viewport_height 0
+set ::apr_resize_job ""
+set ::apr_show_cells 1
+set ::apr_show_routes 0
+set ::apr_show_critical 1
+set ::apr_show_heatmap 0
+set ::apr_show_pins 1
+set ::apr_show_cell_pins 1
+set ::apr_show_fillers 1
+set ::apr_show_vias 1
+set ::apr_clock_only 0
+set ::apr_layers {}
+array set ::apr_layer_visible {}
+set ::synth_analysis_mode "summary"
 
 proc hex_decode {value} {
     if {$value eq ""} { return "" }
@@ -221,26 +250,40 @@ proc load_gui_state_file {path} {
     if {[info exists ::gui_state(power_total_mw)]} { set ::power_total $::gui_state(power_total_mw) }
     if {[info exists ::gui_state(power_static_mw)]} { set ::power_static $::gui_state(power_static_mw) }
     if {[info exists ::gui_state(power_dynamic_mw)]} { set ::power_dynamic $::gui_state(power_dynamic_mw) }
+    foreach pass {constprop dead_code_elimination common_subexpression_elimination expression_optimization demorgan width_reduction resource_sharing fsm_extraction logic_minimization retiming boundary_optimization} {
+        set key "opt_$pass"
+        if {[info exists ::gui_state($key)]} { set ::$key $::gui_state($key) }
+    }
     if {[info exists ::gui_state(formal_status)]} { set ::formal_result [gui_state_text formal_status] }
     set ::active_technology [gui_state_text active_technology]
+    if {[winfo exists .toparea.right.pages.apr.status]} {
+        .toparea.right.pages.apr.status configure -text "Signoff: [gui_state_get apr_signoff_status NOT_RUN] | DRC: [gui_state_get apr_drc_status NOT_RUN] | LVS: [gui_state_get apr_lvs_status NOT_RUN] | DFT: [gui_state_get apr_dft_status NOT_RUN]"
+    }
     if {[winfo exists .status.text]} {
         .status.text configure -text "  AI Digital v$::APP_VERSION | [gui_state_text current_step] / [gui_state_text step_status] | [gui_state_text status_text]"
     }
     update_synth_stats
+    update_synth_analysis
     update_timing_page
     update_formal_page
     update_sim_page
     update_power_page
     update_area_page
+    update_apr_page
     update_summary_page
-    load_exchange_file [gui_state_text exchange_rtl_path] .toparea.right.pages.rtl.code
-    load_exchange_file [gui_state_text tb_path] .toparea.right.pages.rtl.tb
-    load_exchange_file [gui_state_text exchange_gate_path] .toparea.right.pages.synth.gate_text
-    load_exchange_file [gui_state_text exchange_sim_path] .toparea.right.pages.sim.out
-    load_exchange_file [gui_state_text exchange_timing_path] .toparea.right.pages.timing.out
-    load_exchange_file [gui_state_text exchange_formal_path] .toparea.right.pages.formal.out
-    load_exchange_file [gui_state_text exchange_area_path] .toparea.right.pages.area.out
+    load_exchange_file [gui_state_text exchange_rtl_path] .toparea.right.pages.rtl.hpane.rtl.code
+    load_exchange_file [gui_state_text tb_path] .toparea.right.pages.rtl.hpane.tb.tb
+    load_exchange_file [gui_state_text exchange_gate_path] .toparea.right.pages.synth.hpane.right.gate_text
+    load_exchange_file [gui_state_text exchange_sim_path] .toparea.right.pages.sim.vpane.log.out
+    load_exchange_file [gui_state_text exchange_timing_path] .toparea.right.pages.timing.vpane.text.out
+    # The Formal page owns its report view: keep the selected equivalence
+    # stage visible rather than briefly replacing it with the aggregate log.
+    if {[winfo exists .toparea.right.pages.formal.hpane.report.out]} {
+        set_formal_view $::formal_view
+    }
+    load_exchange_file [gui_state_text exchange_area_path] .toparea.right.pages.area.main.report.out
     load_exchange_file [gui_state_text exchange_power_path] .toparea.right.pages.power.main.report.out
+    load_exchange_file [gui_state_text apr_report_path] .toparea.right.pages.apr.main.report.split.details.out
     load_exchange_file [gui_state_text exchange_summary_path] .toparea.right.pages.summary.out
     if {[gui_state_text gate_path] ne ""} {
         load_gate_from_project
@@ -252,6 +295,59 @@ proc load_gui_state_file {path} {
     load_technology_from_state
     load_power_corners_from_state
     return 1
+}
+
+proc synth_options_apply {} {
+    foreach pass {constprop dead_code_elimination common_subexpression_elimination expression_optimization demorgan width_reduction resource_sharing fsm_extraction logic_minimization retiming boundary_optimization} {
+        set value [expr {[set ::opt_$pass] ? "on" : "off"}]
+        pipe_send "/opt synth $pass $value"
+    }
+    console_log "Native synthesis optimization policy applied" "info"
+    if {[winfo exists .synth_options]} { destroy .synth_options }
+}
+
+proc synth_options_reset {} {
+    pipe_send "/opt reset"
+    foreach pass {constprop dead_code_elimination common_subexpression_elimination expression_optimization demorgan width_reduction resource_sharing fsm_extraction logic_minimization retiming boundary_optimization} {
+        set ::opt_$pass 1
+    }
+}
+
+proc show_synthesis_options_dialog {} {
+    if {[winfo exists .synth_options]} { raise .synth_options; focus .synth_options; return }
+    toplevel .synth_options -bg $::C_BG
+    wm title .synth_options "Native Synthesis Optimization"
+    wm transient .synth_options .
+    wm minsize .synth_options 650 460
+    grid columnconfigure .synth_options 0 -weight 1
+    label .synth_options.title -text "Native Synthesis Optimization Policy" -bg $::C_BG -fg $::C_HIGHLIGHT -font {Helvetica 13 bold} -anchor w
+    label .synth_options.note -text "Full-flow stages are mandatory. These controls affect only local semantics-preserving synthesis passes." -bg $::C_BG -fg $::C_DIM -font {Helvetica 9} -anchor w
+    grid .synth_options.title -row 0 -column 0 -sticky ew -padx 18 -pady {16 2}
+    grid .synth_options.note -row 1 -column 0 -sticky ew -padx 18 -pady {0 10}
+    foreach {frame title passes} {
+        cleanup "Canonicalization and Cleanup" {constprop "Constant propagation" dead_code_elimination "Dead-code elimination" common_subexpression_elimination "Common-subexpression elimination" expression_optimization "Expression simplification" demorgan "DeMorgan normalization" width_reduction "Width reduction"}
+        structure "Sharing and State Logic" {resource_sharing "Resource sharing" fsm_extraction "FSM extraction"}
+        logic "Logic and Boundaries" {logic_minimization "Logic minimization" retiming "Safe retiming" boundary_optimization "Boundary optimization"}
+    } {
+        labelframe .synth_options.$frame -text " $title " -bg $::C_BG -fg $::C_HIGHLIGHT -font {Helvetica 10 bold} -bd 1 -relief solid
+        set row 0
+        foreach {pass label} $passes {
+            checkbutton .synth_options.$frame.$pass -text $label -variable ::opt_$pass -onvalue 1 -offvalue 0 -bg $::C_BG -fg $::C_TEXT -activebackground $::C_BG -activeforeground $::C_HIGHLIGHT -selectcolor $::C_INPUT_BG -anchor w -font {Helvetica 10}
+            grid .synth_options.$frame.$pass -row $row -column 0 -sticky w -padx 14 -pady 3
+            incr row
+        }
+        grid .synth_options.$frame -row [expr {[llength [grid slaves .synth_options]] + 2}] -column 0 -sticky ew -padx 18 -pady 5
+    }
+    frame .synth_options.buttons -bg $::C_BG
+    button .synth_options.buttons.defaults -text "Restore Defaults" -command synth_options_reset -bg $::C_PANEL -fg $::C_TEXT -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT
+    button .synth_options.buttons.cancel -text "Cancel" -command {destroy .synth_options} -bg $::C_PANEL -fg $::C_TEXT -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT
+    button .synth_options.buttons.apply -text "Apply" -command synth_options_apply -bg $::C_ACCENT -fg $::C_HIGHLIGHT -activebackground $::C_HIGHLIGHT -activeforeground $::C_BG
+    pack .synth_options.buttons.defaults -side left -padx {0 6}
+    pack .synth_options.buttons.apply -side right
+    pack .synth_options.buttons.cancel -side right -padx 6
+    grid .synth_options.buttons -row 8 -column 0 -sticky ew -padx 18 -pady {12 16}
+    grab set .synth_options
+    bind .synth_options <Escape> {destroy .synth_options}
 }
 
 proc handle_gui_event {line} {
@@ -408,10 +504,10 @@ proc pipe_process_line {line} {
         debug "Wires: $wires"
     }
     # Area formats
-    if {[regexp {Area:\s*([\d.]+)\s*GE} $plain -> area]} {
-        set ::synth_area_ge $area
+    if {[regexp {Area \(um\^2\)\s*:\s*([\d.]+)} $plain -> area]} {
+        set ::synth_area_um2 $area
         update_synth_stats
-        debug "Area: $area GE"
+        debug "Area: $area um2"
     }
     # Logic Depth
     if {[regexp {Logic Depth:\s*(\d+)} $plain -> depth]} {
@@ -950,32 +1046,38 @@ proc parse_gate_netlist {gate_verilog} {
         if {$first_token in {module endmodule assign always initial generate endgenerate}} {
             continue
         }
-        if {[regexp {^input\b(.*)$} $stmt -> decl]} {
+        # Tcl's regular-expression engine does not use \b as a word boundary.
+        # Match declaration whitespace explicitly so native gate netlists retain
+        # their ports in the native connection and timing-path views.
+        if {[regexp {^input\s+(.+)$} $stmt -> decl]} {
             foreach sig [parse_decl_signals $decl] {
                 if {[lsearch -exact $inputs $sig] < 0} { lappend inputs $sig }
                 if {[lsearch -exact $signals $sig] < 0} { lappend signals $sig }
             }
             continue
         }
-        if {[regexp {^output\b(.*)$} $stmt -> decl]} {
+        if {[regexp {^output\s+(.+)$} $stmt -> decl]} {
             foreach sig [parse_decl_signals $decl] {
                 if {[lsearch -exact $outputs $sig] < 0} { lappend outputs $sig }
                 if {[lsearch -exact $signals $sig] < 0} { lappend signals $sig }
             }
             continue
         }
-        if {[regexp {^wire\b(.*)$} $stmt -> decl]} {
+        if {[regexp {^wire\s+(.+)$} $stmt -> decl]} {
             foreach sig [parse_decl_signals $decl] {
                 if {[lsearch -exact $signals $sig] < 0} { lappend signals $sig }
             }
             continue
         }
-        if {[regexp {^(\w+)\s+(\w+)\s*\((.*)\)$} $stmt -> cell_type inst_name pin_str]} {
+        # The native gate writer emits internal cell types such as $_AND_. They are legal
+        # Verilog identifiers but do not match \w+, which previously left the
+        # parsed netlist empty and therefore blanked both graph views.
+        if {[regexp {^([^[:space:]()]+)\s+([^[:space:]()]+)\s*\((.*)\)$} $stmt -> cell_type inst_name pin_str]} {
             set pins {}
             set input_pins {}
             set output_pins {}
             foreach pin_clause [split_pins $pin_str] {
-                if {[regexp {\.(\w+)\((.*?)\)} $pin_clause -> pin_name signal_name]} {
+                if {[regexp {\.([^[:space:].()]+)\((.*?)\)} $pin_clause -> pin_name signal_name]} {
                     set signal_name [string trim $signal_name]
                     if {[lsearch -exact $signals $signal_name] < 0} { lappend signals $signal_name }
                     set role [gate_pin_role $pin_name]
@@ -1280,7 +1382,7 @@ proc gate_find_matching_input_index {cell signal_name} {
 }
 
 proc render_gate_netlist {} {
-    set canvas .toparea.right.pages.synth.gate_canvas
+    set canvas .toparea.right.pages.synth.hpane.left.canvas_frame.canvas
     if {![winfo exists $canvas]} { return }
     if {$::synth_gate_netlist eq ""} {
         canvas_message $canvas "No gate netlist" "Run synthesis or open a finished project."
@@ -1332,8 +1434,11 @@ proc render_gate_netlist {} {
     set row_map [dict create]
 
     $canvas delete all
-    if {$::gate_zoom < 0.55} {
-        set unit 0.55
+    # Keep honoring the zoom control all the way down.  The previous 0.55
+    # floor made the minus button appear to stop while large netlists were
+    # still wider than the viewport.
+    if {$::gate_zoom < 0.12} {
+        set unit 0.12
     } else {
         set unit $::gate_zoom
     }
@@ -1633,8 +1738,8 @@ proc render_gate_netlist {} {
     }
 
     $canvas configure -scrollregion "0 0 $canvas_w $canvas_h"
-    if {[winfo exists .toparea.right.pages.synth.toolbar.status]} {
-        .toparea.right.pages.synth.toolbar.status configure \
+    if {[winfo exists .toparea.right.pages.synth.actions.note]} {
+        .toparea.right.pages.synth.actions.note configure \
             -text "[llength $cells] cells | native schematic" -fg $::C_OK
     }
 }
@@ -1647,7 +1752,7 @@ proc gate_zoom_in {} {
 
 proc gate_zoom_out {} {
     set ::gate_zoom [expr {$::gate_zoom / 1.25}]
-    if {$::gate_zoom < 0.45} { set ::gate_zoom 0.45 }
+    if {$::gate_zoom < 0.12} { set ::gate_zoom 0.12 }
     render_gate_netlist
 }
 
@@ -1665,7 +1770,7 @@ proc load_gate_from_project {} {
     if {![file exists $gate_path]} {
         set ::synth_gate_netlist ""
         set ::gate_parsed_netlist ""
-        canvas_message .toparea.right.pages.synth.gate_canvas "No gate netlist" "Open a synthesized project or run synthesis first."
+        canvas_message .toparea.right.pages.synth.hpane.left.canvas_frame.canvas "No gate netlist" "Open a synthesized project or run synthesis first."
         return
     }
     debug "load_gate_from_project: $gate_path"
@@ -1673,9 +1778,9 @@ proc load_gate_from_project {} {
     set ::synth_gate_netlist [read $fp]
     close $fp
     set ::gate_parsed_netlist ""
-    if {[winfo exists .toparea.right.pages.synth.gate_text]} {
-        .toparea.right.pages.synth.gate_text delete 1.0 end
-        .toparea.right.pages.synth.gate_text insert end $::synth_gate_netlist
+    if {[winfo exists .toparea.right.pages.synth.hpane.right.gate_text]} {
+        .toparea.right.pages.synth.hpane.right.gate_text delete 1.0 end
+        .toparea.right.pages.synth.hpane.right.gate_text insert end $::synth_gate_netlist
     }
     render_gate_netlist
     console_log "  Native gate schematic loaded" "ok"
@@ -1880,7 +1985,7 @@ proc wave_zoom_in {} {
 
 proc wave_zoom_out {} {
     set ::wave_zoom [expr {$::wave_zoom / 1.25}]
-    if {$::wave_zoom < 0.4} { set ::wave_zoom 0.4 }
+    if {$::wave_zoom < 0.12} { set ::wave_zoom 0.12 }
     render_waveform
 }
 
@@ -2109,8 +2214,8 @@ proc load_formal_points_from_state {} {
     render_formal_points_graph
 }
 
-proc render_formal_points_graph {} {
-    set canvas .toparea.right.pages.formal.points_canvas
+proc render_formal_points_graph_legacy {} {
+    set canvas .toparea.right.pages.formal.hpane.points.points_canvas
     if {![winfo exists $canvas]} { return }
     if {$::formal_points_data eq ""} {
         canvas_message $canvas "No equivalence graph" "Run formal verification to populate verified interface and observation points."
@@ -2222,6 +2327,129 @@ proc render_formal_points_graph {} {
         }
     }
 
+    $canvas configure -scrollregion "0 0 $width $height"
+}
+
+proc formal_stage_spec {view} {
+    switch -- $view {
+        rtl_gate { return [list 1 "RTL" "Synthesized Gate Netlist" "formal_stage_rtl_gate.txt"] }
+        rtl_apr { return [list 2 "RTL" "APR Post-Layout Netlist" "formal_stage_rtl_apr.txt"] }
+        gate_apr { return [list 3 "Synthesized Gate Netlist" "APR Post-Layout Netlist" "formal_stage_gate_apr.txt"] }
+    }
+    return [list 1 "RTL" "Synthesized Gate Netlist" "formal_stage_rtl_gate.txt"]
+}
+
+proc formal_stage_file {view} {
+    set report [gui_state_text formal_report_path]
+    if {$report eq ""} { return "" }
+    lassign [formal_stage_spec $view] _ _ _ filename
+    return [file join [file dirname $report] $filename]
+}
+
+proc formal_stage_text {view} {
+    set content [load_text_file [formal_stage_file $view]]
+    if {$content ne ""} { return $content }
+    return [load_text_file [gui_state_text formal_report_path]]
+}
+
+proc set_formal_view {view} {
+    if {$view ni {rtl_gate rtl_apr gate_apr}} { return }
+    set ::formal_view $view
+    set page .toparea.right.pages.formal
+    foreach key {rtl_gate rtl_apr gate_apr} {
+        if {[winfo exists $page.tabs.$key]} {
+            set active [expr {$key eq $view}]
+            $page.tabs.$key configure -bg [expr {$active ? $::C_ACCENT : $::C_PANEL}] -fg [expr {$active ? $::C_HIGHLIGHT : $::C_DIM}]
+        }
+    }
+    if {[winfo exists $page.hpane.report.bar.title]} {
+        lassign [formal_stage_spec $view] number lhs rhs _
+        $page.hpane.report.bar.title configure -text "  Stage $number: $lhs vs $rhs"
+    }
+    if {[winfo exists $page.hpane.report.out]} {
+        set widget $page.hpane.report.out
+        $widget configure -state normal
+        $widget delete 1.0 end
+        set content [formal_stage_text $view]
+        if {$content eq ""} { set content "This formal stage has not run yet." }
+        $widget insert end $content
+        $widget configure -state disabled
+    }
+    render_formal_points_graph
+}
+
+proc formal_tab_bar {page} {
+    frame $page.tabs -bg $::C_PANEL
+    pack $page.tabs -fill x
+    foreach {key label} {rtl_gate "RTL vs Gate" rtl_apr "RTL vs APR" gate_apr "Gate vs APR"} {
+        button $page.tabs.$key -text $label -command [list set_formal_view $key] \
+            -bg $::C_PANEL -fg $::C_DIM -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT \
+            -relief flat -bd 0 -padx 14 -pady 5
+        pack $page.tabs.$key -side left -padx {2 0} -pady 2
+    }
+}
+
+proc render_formal_points_graph {} {
+    set canvas .toparea.right.pages.formal.hpane.points.points_canvas
+    if {![winfo exists $canvas]} { return }
+    $canvas delete all
+    set width [winfo width $canvas]; if {$width < 480} { set width 640 }
+    set height [winfo height $canvas]; if {$height < 280} { set height 430 }
+    set content [formal_stage_text $::formal_view]
+    if {$content eq ""} {
+        canvas_message $canvas "No formal stage result" "Run formal verification to populate the three equivalence checks."
+        return
+    }
+    lassign [formal_stage_spec $::formal_view] number lhs rhs _
+    set status "BLOCKED"
+    if {[regexp {Stage\s+\d+:.*:\s*([A-Z_]+)} $content -> parsed_status]} { set status $parsed_status }
+    set passed [expr {$status eq "EQUIVALENT"}]
+    set status_color [expr {$passed ? $::C_OK : ($status eq "BLOCKED" ? $::C_WARN : $::C_ERR)}]
+    set status_fill [expr {$passed ? "#173b2a" : ($status eq "BLOCKED" ? "#3b321c" : "#472024")}]
+    $canvas create rectangle 0 0 $width $height -fill $::C_INPUT_BG -outline ""
+    $canvas create text 18 20 -anchor w -text "Formal Stage $number  |  $lhs vs $rhs" -fill $::C_HIGHLIGHT -font {Helvetica 11 bold}
+    $canvas create rectangle [expr {$width-138}] 8 [expr {$width-16}] 32 -fill $status_fill -outline $status_color -width 1
+    $canvas create text [expr {$width-77}] 20 -text $status -fill $status_color -font {Helvetica 9 bold}
+
+    set box_y 70; set box_h 112; set side_w [expr {max(150, min(230, ($width-180)/2.0))}]
+    set left_x 22; set right_x [expr {$width-$side_w-22}]
+    foreach {x title fill outline subtitle} [list \
+        $left_x $lhs "#1c3446" "#4fc3f7" "reference design" \
+        $right_x $rhs "#203b2f" $status_color "implementation candidate"] {
+        $canvas create rectangle $x $box_y [expr {$x+$side_w}] [expr {$box_y+$box_h}] -fill $fill -outline $outline -width 1.5
+        $canvas create text [expr {$x+$side_w/2.0}] [expr {$box_y+35}] -text $title -fill $::C_TEXT -font {Helvetica 10 bold}
+        $canvas create text [expr {$x+$side_w/2.0}] [expr {$box_y+62}] -text $subtitle -fill $::C_DIM -font {Helvetica 8}
+        $canvas create text [expr {$x+$side_w/2.0}] [expr {$box_y+88}] -text "module: $::current_module" -fill $outline -font {Helvetica 8}
+    }
+    set mid_x [expr {$width/2.0}]
+    $canvas create line [expr {$left_x+$side_w}] [expr {$box_y+$box_h/2.0}] [expr {$mid_x-62}] [expr {$box_y+$box_h/2.0}] -fill "#66879a" -width 2
+    $canvas create line [expr {$mid_x+62}] [expr {$box_y+$box_h/2.0}] $right_x [expr {$box_y+$box_h/2.0}] -fill "#66879a" -width 2
+    $canvas create rectangle [expr {$mid_x-62}] [expr {$box_y+26}] [expr {$mid_x+62}] [expr {$box_y+86}] -fill $status_fill -outline $status_color -width 1.5
+    $canvas create text $mid_x [expr {$box_y+46}] -text "EQUIVALENCE" -fill $::C_HIGHLIGHT -font {Helvetica 9 bold}
+    $canvas create text $mid_x [expr {$box_y+67}] -text $status -fill $status_color -font {Helvetica 9 bold}
+
+    set parsed [formal_parse_points_text $::formal_points_data]
+    set in_count [llength [dict get $parsed interface_in]]
+    set out_count [llength [dict get $parsed interface_out]]
+    set io_count [llength [dict get $parsed interface_io]]
+    set point_count [llength [dict get $parsed outputs]]
+    set table_y 218
+    $canvas create text 22 $table_y -anchor w -text "Matched interface and observation contract" -fill $::C_HIGHLIGHT -font {Helvetica 9 bold}
+    set cards [list "Inputs" $in_count "#4fc3f7" "Outputs" $out_count $::C_OK "Inouts" $io_count "#ab47bc" "Observed points" $point_count $::C_WARN]
+    set card_w [expr {($width-50)/4.0}]
+    set i 0
+    foreach {label value color} $cards {
+        set x [expr {18+$i*($card_w+4)}]
+        $canvas create rectangle $x [expr {$table_y+16}] [expr {$x+$card_w}] [expr {$table_y+74}] -fill "#172431" -outline "#355269"
+        $canvas create text [expr {$x+10}] [expr {$table_y+33}] -anchor w -text $label -fill $::C_DIM -font {Helvetica 8}
+        $canvas create text [expr {$x+10}] [expr {$table_y+57}] -anchor w -text $value -fill $color -font {Helvetica 15 bold}
+        incr i
+    }
+    set report_y [expr {$table_y+98}]
+    set reason "All required interface and behavioral checks matched."
+    if {[regexp {reason:\s*(.+)} $content -> parsed_reason]} { set reason $parsed_reason }
+    $canvas create text 24 $report_y -anchor nw -width [expr {$width-48}] -justify left \
+        -text "Result: $status\n$reason" -fill $::C_TEXT -font {Helvetica 9}
     $canvas configure -scrollregion "0 0 $width $height"
 }
 
@@ -2406,7 +2634,7 @@ proc timing_zoom_in {} {
 
 proc timing_zoom_out {} {
     set ::timing_zoom [expr {$::timing_zoom / 1.25}]
-    if {$::timing_zoom < 0.45} { set ::timing_zoom 0.45 }
+    if {$::timing_zoom < 0.12} { set ::timing_zoom 0.12 }
     render_timing_path_graph
 }
 
@@ -2449,8 +2677,10 @@ proc render_timing_path_graph {} {
         return
     }
 
-    if {$::timing_zoom < 0.55} {
-        set unit 0.55
+    # Match the control's true lower bound so dense critical paths can be
+    # inspected in one viewport instead of silently clamping at 0.55x.
+    if {$::timing_zoom < 0.12} {
+        set unit 0.12
     } else {
         set unit $::timing_zoom
     }
@@ -2781,8 +3011,8 @@ proc load_area_breakdown_from_state {} {
         if {!$in_section} { continue }
         if {$trimmed eq "" || [string match "Synthesis Report*" $trimmed]} { break }
         if {[string match "----*" $trimmed]} { continue }
-        if {[regexp {^(\S+)\s+(\d+)\s+([0-9.]+)\s+GE$} $trimmed -> cell_type count total_ge]} {
-            lappend ::area_breakdown_rows [dict create type $cell_type count $count total_ge $total_ge]
+        if {[regexp {^(\S+)\s+(\d+)\s+([0-9.]+)\s+um\^2$} $trimmed -> cell_type count total_um2]} {
+            lappend ::area_breakdown_rows [dict create type $cell_type count $count total_um2 $total_um2]
         }
     }
 }
@@ -2803,17 +3033,17 @@ proc render_area_chart {} {
     set cy [expr {$height / 2.0}]
     set radius [expr {min(130, ($height - 60) / 2.0)}]
     set total 0.0
-    foreach row $::area_breakdown_rows { set total [expr {$total + [dict get $row total_ge]}] }
+    foreach row $::area_breakdown_rows { set total [expr {$total + [dict get $row total_um2]}] }
     if {$total <= 0} {
         canvas_message $canvas "No area breakdown" "Total area is zero."
         return
     }
-    $canvas create text 16 18 -anchor w -text "Cell Area Composition" -fill $::C_HIGHLIGHT -font {Helvetica 10 bold}
+    $canvas create text 16 18 -anchor w -text "Cell Area Composition (µm²)" -fill $::C_HIGHLIGHT -font {Helvetica 10 bold}
     set start 0.0
     set legend_y 52
     set idx 0
     foreach row $::area_breakdown_rows {
-        set value [dict get $row total_ge]
+        set value [dict get $row total_um2]
         set extent [expr {$value / $total * 360.0}]
         set color [chart_palette $idx]
         $canvas create arc [expr {$cx - $radius}] [expr {$cy - $radius}] [expr {$cx + $radius}] [expr {$cy + $radius}] \
@@ -2821,7 +3051,7 @@ proc render_area_chart {} {
         set pct [expr {$value * 100.0 / $total}]
         $canvas create rectangle 340 $legend_y 354 [expr {$legend_y + 14}] -fill $color -outline ""
         $canvas create text 362 [expr {$legend_y + 7}] -anchor w \
-            -text [format "%s  %.1f%%  (%s cells / %.1f GE)" [dict get $row type] $pct [dict get $row count] $value] \
+            -text [format "%s  %.1f%%  (%s cells / %.2f µm²)" [dict get $row type] $pct [dict get $row count] $value] \
             -fill $::C_TEXT -font {Helvetica 8}
         set start [expr {$start + $extent}]
         incr legend_y 22
@@ -2910,15 +3140,45 @@ proc update_synth_stats {} {
     if {[winfo exists .toparea.right.pages.synth.stats.cells.v]} {
         .toparea.right.pages.synth.stats.cells.v configure -text $::synth_cells
         .toparea.right.pages.synth.stats.dff.v configure -text $::synth_dff
-        .toparea.right.pages.synth.stats.area.v configure -text [format "%.1f" $::synth_area_ge]
+        .toparea.right.pages.synth.stats.area.v configure -text [format "%.2f µm²" $::synth_area_um2]
         .toparea.right.pages.synth.stats.depth.v configure -text $::synth_depth
     }
 }
 
+proc update_synth_analysis {{mode ""}} {
+    if {$mode ne ""} { set ::synth_analysis_mode $mode }
+    set widget .toparea.right.pages.synth.analysis.out
+    if {![winfo exists $widget]} { return }
+    switch -- $::synth_analysis_mode {
+        timing {
+            set title "  Post-Synthesis Timing Analysis"
+            set content [load_text_file [gui_state_text exchange_timing_path]]
+        }
+        power {
+            set title "  Post-Synthesis Multi-Corner Power Analysis"
+            set content [load_text_file [gui_state_text exchange_power_path]]
+        }
+        area {
+            set title "  Post-Synthesis Area Analysis"
+            set content [load_text_file [gui_state_text exchange_area_path]]
+        }
+        default {
+            set title "  Synthesis Analysis Summary"
+            set content [load_text_file [gui_state_text synth_report_path]]
+            if {$content eq ""} { set content [load_text_file [gui_state_text exchange_area_path]] }
+        }
+    }
+    .toparea.right.pages.synth.analysis.title configure -text $title
+    $widget configure -state normal
+    $widget delete 1.0 end
+    if {$content ne ""} { $widget insert end $content } else { $widget insert end "No post-synthesis analysis has been generated." }
+    $widget configure -state disabled
+}
+
 proc update_timing_page {} {
-    if {[winfo exists .toparea.right.pages.timing.toolbar.freq]} {
-        .toparea.right.pages.timing.toolbar.freq delete 0 end
-        .toparea.right.pages.timing.toolbar.freq insert 0 $::constraint_freq
+    if {[winfo exists .toparea.right.pages.timing.actions.freq]} {
+        .toparea.right.pages.timing.actions.freq delete 0 end
+        .toparea.right.pages.timing.actions.freq insert 0 $::constraint_freq
     }
 }
 
@@ -2931,7 +3191,23 @@ proc update_formal_page {} {
             .toparea.right.pages.formal.result configure -fg $::C_ERR -bg "#3d1b1b"
         }
     }
-    render_formal_points_graph
+    if {[winfo exists .toparea.right.pages.formal.toolbar.stages]} {
+        set report [load_text_file [gui_state_text formal_report_path]]
+        set s1 "NOT_RUN"; set s2 "NOT_RUN"; set s3 "NOT_RUN"
+        foreach line [split $report "\n"] {
+            if {[string match "Stage 1:*" $line]} { set s1 [lindex [split $line ":"] end] }
+            if {[string match "Stage 2:*" $line]} { set s2 [lindex [split $line ":"] end] }
+            if {[string match "Stage 3:*" $line]} { set s3 [lindex [split $line ":"] end] }
+        }
+        .toparea.right.pages.formal.toolbar.stages configure -text "Stages: RTL→Synth $s1 | RTL→APR $s2 | Synth→APR $s3"
+    }
+    # A formal result consists of three independent contracts.  Refresh the
+    # active contract report and its diagram together.
+    if {[winfo exists .toparea.right.pages.formal.hpane.report.out]} {
+        set_formal_view $::formal_view
+    } else {
+        render_formal_points_graph
+    }
 }
 
 proc update_sim_page {} {
@@ -2962,6 +3238,682 @@ proc update_area_page {} {
     render_area_chart
 }
 
+# ===================== APR Layout Viewer =====================
+proc load_apr_layout_from_state {} {
+    set ::apr_rows {}
+    set ::apr_layers {}
+    set path [gui_state_text apr_layout_path]
+    set content [load_text_file $path]
+    foreach line [split $content "\n"] {
+        if {$line eq "" || [string match "kind\t*" $line]} { continue }
+        set fields [split $line "\t"]
+        if {[llength $fields] < 7} { continue }
+        set numeric 1
+        foreach index {3 4 5 6} {
+            if {![string is double -strict [lindex $fields $index]]} { set numeric 0 }
+        }
+        if {!$numeric} { continue }
+        set route_width 0.14
+        if {[llength $fields] >= 8 && [string is double -strict [lindex $fields 7]] && [lindex $fields 7] > 0.0} {
+            set route_width [lindex $fields 7]
+        }
+        set row [dict create kind [lindex $fields 0] name [lindex $fields 1] layer [lindex $fields 2] x1 [lindex $fields 3] y1 [lindex $fields 4] x2 [lindex $fields 5] y2 [lindex $fields 6] width $route_width]
+        lappend ::apr_rows $row
+        if {[dict get $row kind] in {route critical pdn cellpin via}} {
+            set layer [dict get $row layer]
+            if {[lsearch -exact $::apr_layers $layer] < 0} { lappend ::apr_layers $layer }
+            if {![info exists ::apr_layer_visible($layer)]} { set ::apr_layer_visible($layer) 1 }
+        }
+    }
+    debug "APR layout load: path=$path records=[llength $::apr_rows]"
+}
+
+proc load_apr_grid_from_state {} {
+    set ::apr_grid_rows {}
+    set path [gui_state_text apr_grid_path]
+    set content [load_text_file $path]
+    foreach line [split $content "\n"] {
+        if {$line eq "" || [string match "x_index\t*" $line]} { continue }
+        set fields [split $line "\t"]
+        if {[llength $fields] < 7} { continue }
+        set valid 1
+        foreach index {0 1 2 3 4 5 6} {
+            if {![string is double -strict [lindex $fields $index]]} { set valid 0 }
+        }
+        if {$valid} {
+            lappend ::apr_grid_rows [dict create xi [lindex $fields 0] yi [lindex $fields 1] x [lindex $fields 2] y [lindex $fields 3] ir [lindex $fields 4] cong [lindex $fields 5] power [lindex $fields 6]]
+        }
+    }
+    debug "APR grid load: path=$path points=[llength $::apr_grid_rows]"
+}
+
+proc apr_report_file {path title} {
+    if {$path eq "" || ![file exists $path]} {
+        canvas_message $::apr_canvas_path "$title unavailable" "Run /apr to generate native APR signoff artifacts."
+        return
+    }
+    load_exchange_file $path .toparea.right.pages.apr.main.report.split.details.out
+    .toparea.right.pages.apr.main.report.split.details.title configure -text "  $title"
+}
+
+proc set_apr_heat_metric {metric} {
+    set ::apr_heat_metric $metric
+    set ::apr_show_heatmap 1
+    render_apr_layout
+}
+
+proc set_apr_route_mode {mode} {
+    set ::apr_route_mode $mode
+    set ::apr_show_routes [expr {$mode eq "all"}]
+    set ::apr_show_critical [expr {$mode ne "all"}]
+    render_apr_layout
+}
+
+proc apr_layer_color {layer} {
+    array set colors {li1 #78909c met1 #26a69a met2 #42a5f5 met3 #ab47bc met4 #ffa726 met5 #ef5350}
+    set key [string tolower $layer]
+    if {[info exists colors($key)]} { return $colors($key) }
+    return #b0bec5
+}
+
+proc apr_route_pixel_width {row scale} {
+    # `width` is read from native APR's LEF-derived exchange record.  A one
+    # pixel floor keeps sub-micron layers visible at die overview; once the
+    # geometry is zoomed, the displayed stroke follows the actual physical
+    # width and is capped only to keep the canvas usable.
+    set physical_width 0.14
+    if {[dict exists $row width] && [string is double -strict [dict get $row width]]} {
+        set physical_width [dict get $row width]
+    }
+    return [expr {min(12.0, max(1.15, $physical_width * $scale))}]
+}
+
+proc apr_draw_via_marker {canvas x y wire_width color} {
+    set radius [expr {max(1.5, min(5.0, $wire_width * 0.70))}]
+    $canvas create rectangle [expr {$x-$radius}] [expr {$y-$radius}] [expr {$x+$radius}] [expr {$y+$radius}] \
+        -fill $color -outline "" -tags critical_via
+}
+
+proc apr_main_configure {height} {
+    set main .toparea.right.pages.apr.main
+    if {![winfo exists $main] || $height < 160} { return }
+    # The APR main area is a weighted grid.  Its children therefore consume
+    # every newly available row pixel instead of retaining an old pane request.
+    if {$::apr_resize_job ne ""} { catch {after cancel $::apr_resize_job} }
+    set ::apr_resize_job [after 25 apr_render_after_resize]
+}
+
+proc apr_is_clock_net {net} {
+    set lower [string tolower $net]
+    expr {$lower eq "clk" || [string first "clock" $lower] >= 0 || [string first "clk" $lower] >= 0}
+}
+
+proc apr_cell_fill {cell} {
+    set lower [string tolower $cell]
+    if {[string first "dff" $lower] >= 0 || [string first "latch" $lower] >= 0} { return "#9b6bb2" }
+    if {[string first "xor" $lower] >= 0 || [string first "xnor" $lower] >= 0} { return "#557ca3" }
+    if {[string first "buf" $lower] >= 0 || [string first "inv" $lower] >= 0} { return "#4d8b78" }
+    if {[string first "mux" $lower] >= 0} { return "#a27b4b" }
+    return "#4c657b"
+}
+
+proc apr_toggle_display {key} {
+    set ::$key [expr {[set ::$key] ? 1 : 0}]
+    render_apr_layout
+}
+
+proc apr_refresh_display_controls {} {
+    set panel .toparea.right.pages.apr.main.layout.controls
+    if {![winfo exists $panel]} { return }
+    foreach child [winfo children $panel.layers] { destroy $child }
+    foreach layer $::apr_layers {
+        checkbutton $panel.layers.[string map {. _ / _} $layer] -text $layer -variable ::apr_layer_visible($layer) \
+            -command render_apr_layout -bg $::C_INPUT_BG -fg [apr_layer_color $layer] \
+            -activebackground $::C_INPUT_BG -activeforeground $::C_HIGHLIGHT -selectcolor $::C_PANEL \
+            -anchor w -font {Courier 8}
+        pack $panel.layers.[string map {. _ / _} $layer] -fill x -padx 4 -pady 1
+    }
+    set cells 0
+    foreach row $::apr_rows { if {[dict get $row kind] eq "cell"} { incr cells } }
+    $panel.count configure -text "Cells: $cells  |  Layers: [llength $::apr_layers]"
+}
+
+proc apr_zoom_in {} { set ::apr_zoom [expr {min(32.0, $::apr_zoom * 1.30)}]; render_apr_layout }
+proc apr_zoom_out {} { set ::apr_zoom [expr {max(0.15, $::apr_zoom / 1.30)}]; render_apr_layout }
+proc apr_zoom_fit {} {
+    set ::apr_zoom 1.0
+    set ::apr_pan_x 0.0
+    set ::apr_pan_y 0.0
+    render_apr_layout
+}
+
+# A canvas retains its old drawing until it is explicitly redrawn.  The APR
+# viewer is nested in a paned window, so coalesce the short burst of Configure
+# events produced while a user resizes either the main window or the pane.
+# The transform in render_apr_layout is then recomputed from the live canvas
+# dimensions, preserving any relative zoom/pan chosen by the user.
+proc apr_canvas_configure {width height} {
+    if {$width < 40 || $height < 40} { return }
+    set ::apr_viewport_width $width
+    set ::apr_viewport_height $height
+    if {$::apr_resize_job ne ""} { catch {after cancel $::apr_resize_job} }
+    set ::apr_resize_job [after 45 apr_render_after_resize]
+}
+
+proc apr_render_after_resize {} {
+    set ::apr_resize_job ""
+    render_apr_layout
+}
+proc apr_pan_mark {x y} { set ::apr_pan_mark_x $x; set ::apr_pan_mark_y $y }
+proc apr_pan_drag {x y} {
+    set ::apr_pan_x [expr {$::apr_pan_x + $x - $::apr_pan_mark_x}]
+    set ::apr_pan_y [expr {$::apr_pan_y + $y - $::apr_pan_mark_y}]
+    set ::apr_pan_mark_x $x; set ::apr_pan_mark_y $y
+    render_apr_layout
+}
+
+proc apr_metric {key {default 0.0}} {
+    set value [gui_state_get $key $default]
+    if {![string is double -strict $value]} { return $default }
+    return $value
+}
+
+proc apr_grid_peak {metric} {
+    set peak 0.0
+    foreach row $::apr_grid_rows {
+        set value [dict get $row $metric]
+        if {$value > $peak} { set peak $value }
+    }
+    return $peak
+}
+
+proc apr_dashboard_card {canvas x y w title value color} {
+    $canvas create rectangle $x $y [expr {$x + $w}] [expr {$y + 54}] -fill "#14202c" -outline "#2d4659" -width 1 -tags dashboard
+    $canvas create text [expr {$x + 9}] [expr {$y + 13}] -text $title -anchor w -fill $::C_DIM -font {Helvetica 8} -tags dashboard
+    $canvas create text [expr {$x + 9}] [expr {$y + 35}] -text $value -anchor w -fill $color -font {Helvetica 12 bold} -tags dashboard
+}
+
+# The upper APR report pane is deliberately compact: it shows physical
+# results, not a duplicate of the layout canvas.  Every value comes from the
+# native APR JSON state or the emitted IR/congestion/power grid.
+proc render_apr_dashboard {} {
+    set canvas .toparea.right.pages.apr.main.report.split.chart.canvas
+    if {![winfo exists $canvas]} { return }
+    $canvas delete all
+    set width [winfo width $canvas]
+    set height [winfo height $canvas]
+    if {$width < 160 || $height < 120} { return }
+    set wns [apr_metric apr_wns_ns [apr_metric apr_ocv_late_slack_ns 0.0]]
+    set tns [apr_metric apr_tns_ns 0.0]
+    set hold [apr_metric apr_ocv_early_hold_slack_ns 0.0]
+    set ir [apr_metric apr_ir_drop_mv 0.0]
+    set util [apr_metric apr_utilization 0.0]
+    set cells [gui_state_get apr_cells_count 0]
+    set wire [apr_metric apr_total_wire_length_um 0.0]
+    set peak_cong [apr_grid_peak cong]
+    set peak_power [apr_grid_peak power]
+    set view [string totitle $::apr_view]
+    $canvas create text 12 12 -anchor w -text "$view Physical Analytics" -fill $::C_HIGHLIGHT -font {Helvetica 10 bold} -tags dashboard
+    set gap 7
+    set card_w [expr {max(86, ($width - 5*$gap) / 4.0)}]
+    switch -- $::apr_view {
+        timing {
+            apr_dashboard_card $canvas $gap 27 $card_w "WNS (OCV late)" [format "%.3f ns" $wns] [expr {$wns >= 0 ? $::C_OK : $::C_ERR}]
+            apr_dashboard_card $canvas [expr {2*$gap+$card_w}] 27 $card_w "TNS" [format "%.3f ns" $tns] [expr {$tns >= 0 ? $::C_OK : $::C_ERR}]
+            apr_dashboard_card $canvas [expr {3*$gap+2*$card_w}] 27 $card_w "Hold (OCV early)" [format "%.3f ns" $hold] [expr {$hold >= 0 ? $::C_OK : $::C_ERR}]
+            apr_dashboard_card $canvas [expr {4*$gap+3*$card_w}] 27 $card_w "Critical routes" [gui_state_get apr_critical_routes_count 0] $::C_HIGHLIGHT
+            set base_y [expr {$height - 33}]
+            set center [expr {$width * 0.5}]
+            set range [expr {max(0.25, abs($wns), abs($hold))}]
+            foreach {label value color x} [list "WNS" $wns $::C_WARN [expr {$width*0.30}] "HOLD" $hold $::C_OK [expr {$width*0.70}]] {
+                set bw [expr {min($width*0.24, abs($value)/$range*$width*0.24)}]
+                set left [expr {$value >= 0 ? $x : $x-$bw}]
+                $canvas create rectangle $left [expr {$base_y-12}] [expr {$left+$bw}] $base_y -fill $color -outline "" -tags dashboard
+                $canvas create text $x [expr {$base_y+10}] -text "$label [format %.3f $value] ns" -anchor n -fill $::C_TEXT -font {Helvetica 8} -tags dashboard
+            }
+            $canvas create line $center [expr {$base_y-18}] $center [expr {$base_y+3}] -fill "#61788c" -tags dashboard
+        }
+        power - congestion {
+            apr_dashboard_card $canvas $gap 27 $card_w "IR drop" [format "%.3f mV" $ir] [expr {$ir < 0.1 * 1000.0 ? $::C_OK : $::C_WARN}]
+            apr_dashboard_card $canvas [expr {2*$gap+$card_w}] 27 $card_w "Peak congestion" [format "%.3f" $peak_cong] $::C_WARN
+            apr_dashboard_card $canvas [expr {3*$gap+2*$card_w}] 27 $card_w "Peak hotspot" [format "%.2f uW" $peak_power] $::C_HIGHLIGHT
+            apr_dashboard_card $canvas [expr {4*$gap+3*$card_w}] 27 $card_w "Worst VDD" [format "%.3f V" [apr_metric apr_ir_worst_voltage_v 0.0]] $::C_OK
+            set n [llength $::apr_grid_rows]
+            if {$n > 1} {
+                set maxv [expr {$::apr_view eq "congestion" ? max(0.001,$peak_cong) : max(0.001,$ir)}]
+                set points {}
+                set index 0
+                foreach row $::apr_grid_rows {
+                    set value [expr {$::apr_view eq "congestion" ? [dict get $row cong] : [dict get $row ir]}]
+                    set x [expr {12.0 + $index * ($width-24.0) / ($n-1)}]
+                    set y [expr {$height-12.0 - $value/$maxv*max(20.0,$height-112.0)}]
+                    lappend points $x $y
+                    incr index
+                }
+                $canvas create line $points -fill [expr {$::apr_view eq "congestion" ? "#ffa726" : "#4fc3f7"}] -width 2 -smooth 1 -tags dashboard
+            }
+        }
+        area - placement {
+            apr_dashboard_card $canvas $gap 27 $card_w "Utilization" [format "%.1f%%" [expr {$util*100.0}]] $::C_HIGHLIGHT
+            apr_dashboard_card $canvas [expr {2*$gap+$card_w}] 27 $card_w "Placed cells" $cells $::C_OK
+            apr_dashboard_card $canvas [expr {3*$gap+2*$card_w}] 27 $card_w "Core" [format "%.1f x %.1f" [apr_metric apr_core_width_um] [apr_metric apr_core_height_um]] $::C_TEXT
+            apr_dashboard_card $canvas [expr {4*$gap+3*$card_w}] 27 $card_w "Wire length" [format "%.0f um" $wire] $::C_WARN
+            set cx [expr {$width/2.0}]; set cy [expr {$height-43.0}]; set r [expr {min(30, max(15, ($height-98)/2.0))}]
+            $canvas create arc [expr {$cx-$r}] [expr {$cy-$r}] [expr {$cx+$r}] [expr {$cy+$r}] -start 90 -extent [expr {-360*$util}] -style pieslice -fill "#4fc3f7" -outline "" -tags dashboard
+            $canvas create arc [expr {$cx-$r}] [expr {$cy-$r}] [expr {$cx+$r}] [expr {$cy+$r}] -start [expr {90-360*$util}] -extent [expr {-360*(1-$util)}] -style pieslice -fill "#263a4a" -outline "" -tags dashboard
+            $canvas create text $cx $cy -text [format "%.1f%%" [expr {$util*100.0}]] -fill $::C_TEXT -font {Helvetica 8 bold} -tags dashboard
+        }
+        default {
+            apr_dashboard_card $canvas $gap 27 $card_w "Signoff" [gui_state_get apr_signoff_status NOT_RUN] $::C_OK
+            apr_dashboard_card $canvas [expr {2*$gap+$card_w}] 27 $card_w "DRC / LVS" "[gui_state_get apr_drc_status -] / [gui_state_get apr_lvs_status -]" $::C_OK
+            apr_dashboard_card $canvas [expr {3*$gap+2*$card_w}] 27 $card_w "IR drop" [format "%.3f mV" $ir] $::C_HIGHLIGHT
+            apr_dashboard_card $canvas [expr {4*$gap+3*$card_w}] 27 $card_w "Cells / routes" "$cells / [gui_state_get apr_routes_count 0]" $::C_TEXT
+            $canvas create text [expr {$width/2.0}] [expr {$height-31.0}] -text "Core utilization [format %.1f%% [expr {$util*100.0}]]   |   total routed wire [format %.1f $wire] um" -anchor center -fill $::C_DIM -font {Helvetica 8} -tags dashboard
+        }
+    }
+}
+
+proc refresh_apr_page {} {
+    if {$::project_state_path ne "" && [file exists $::project_state_path]} {
+        load_gui_state_file $::project_state_path
+    } else {
+        update_apr_page
+    }
+}
+
+proc gui_run_stage {command label} {
+    console_log "ai_digital ▸ $command" "cmd"
+    pipe_send $command
+    console_log "$label requested; the view will refresh when the native flow publishes its exchange state." "info"
+}
+
+proc set_synth_view {view} {
+    if {$view ni {synth timing power area}} { return }
+    set_page $view
+    # Timing, power and area are synthesis result views, not independent flow
+    # stages. Keep Synthesis selected in the navigation while they are shown.
+    if {[winfo exists .toparea.left.synth]} {
+        .toparea.left.synth configure -bg $::C_ACCENT -fg $::C_HIGHLIGHT
+    }
+    switch -- $view {
+        synth { after idle render_gate_netlist; after idle {update_synth_analysis summary} }
+        timing { after idle load_timing_paths_from_state; after idle render_timing_path_graph }
+        power { after idle load_power_corners_from_state; after idle render_power_chart }
+        area { after idle update_area_page }
+    }
+}
+
+proc synth_tab_bar {page selected} {
+    frame $page.tabs -bg $::C_PANEL
+    pack $page.tabs -fill x
+    foreach {key label} {synth "Netlist" timing "Timing" power "Power" area "Area"} {
+        set active [expr {$key eq $selected}]
+        set bg [expr {$active ? $::C_ACCENT : $::C_PANEL}]
+        set fg [expr {$active ? $::C_HIGHLIGHT : $::C_DIM}]
+        button $page.tabs.$key -text $label -command [list set_synth_view $key] \
+            -bg $bg -fg $fg -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT \
+            -relief flat -bd 0 -padx 14 -pady 6
+        pack $page.tabs.$key -side left -padx {2 0} -pady 2
+    }
+}
+
+proc set_apr_view {view} {
+    if {$view ni {layout placement routing clock timing power congestion area signoff}} { return }
+    set ::apr_view $view
+    set page .toparea.right.pages.apr
+    foreach key {layout placement routing clock timing power congestion area signoff} {
+        if {[winfo exists $page.tabs.$key]} {
+            set active [expr {$key eq $view}]
+            $page.tabs.$key configure \
+                -bg [expr {$active ? $::C_ACCENT : $::C_PANEL}] \
+                -fg [expr {$active ? $::C_HIGHLIGHT : $::C_DIM}]
+        }
+    }
+    switch -- $view {
+        layout {
+            set ::apr_heat_metric cong
+            set ::apr_show_cells 1; set ::apr_show_routes 0; set ::apr_show_critical 1
+            set ::apr_show_cell_pins 0; set ::apr_show_vias 0; set ::apr_show_fillers 1
+            set ::apr_show_heatmap 0; set ::apr_clock_only 0
+            apr_report_file [gui_state_text apr_report_path] "APR Implementation Summary"
+        }
+        placement {
+            set ::apr_show_cells 1; set ::apr_show_routes 0; set ::apr_show_critical 0
+            set ::apr_show_cell_pins 0; set ::apr_show_vias 0; set ::apr_show_fillers 1
+            set ::apr_show_heatmap 0; set ::apr_clock_only 0
+            apr_report_file [gui_state_text apr_area_report_path] "Placement and Utilization"
+        }
+        routing {
+            set ::apr_show_cells 1; set ::apr_show_routes 1; set ::apr_show_critical 1
+            set ::apr_show_cell_pins 0; set ::apr_show_vias 1; set ::apr_show_fillers 0
+            set ::apr_show_heatmap 0; set ::apr_clock_only 0
+            apr_report_file [gui_state_text apr_report_path] "Global and Detailed Routing"
+        }
+        clock {
+            set ::apr_show_cells 0; set ::apr_show_routes 1; set ::apr_show_critical 0
+            set ::apr_show_cell_pins 0; set ::apr_show_vias 1; set ::apr_show_fillers 0
+            set ::apr_show_heatmap 0; set ::apr_clock_only 1
+            apr_report_file [gui_state_text apr_report_path] "Clock Tree Synthesis"
+        }
+        timing {
+            set ::apr_show_cells 1; set ::apr_show_routes 0; set ::apr_show_critical 1
+            set ::apr_show_cell_pins 0; set ::apr_show_vias 0; set ::apr_show_fillers 0
+            set ::apr_show_heatmap 0; set ::apr_clock_only 0
+            apr_report_file [gui_state_text apr_timing_report_path] "APR Timing Analysis"
+        }
+        power {
+            set ::apr_heat_metric ir
+            set ::apr_show_cells 1; set ::apr_show_routes 0; set ::apr_show_critical 1
+            set ::apr_show_cell_pins 0; set ::apr_show_vias 0; set ::apr_show_fillers 0
+            set ::apr_show_heatmap 1; set ::apr_clock_only 0
+            apr_report_file [gui_state_text apr_power_report_path] "APR Power and IR Analysis"
+        }
+        congestion {
+            set ::apr_heat_metric cong
+            set ::apr_show_cells 0; set ::apr_show_routes 1; set ::apr_show_critical 0
+            set ::apr_show_cell_pins 0; set ::apr_show_vias 0; set ::apr_show_fillers 0
+            set ::apr_show_heatmap 1; set ::apr_clock_only 0
+            apr_report_file [gui_state_text apr_power_report_path] "Routing Congestion Analysis"
+        }
+        area {
+            set ::apr_show_cells 1; set ::apr_show_routes 0; set ::apr_show_critical 0
+            set ::apr_show_cell_pins 0; set ::apr_show_vias 0; set ::apr_show_fillers 1
+            set ::apr_show_heatmap 0; set ::apr_clock_only 0
+            apr_report_file [gui_state_text apr_area_report_path] "APR Area Analysis"
+        }
+        signoff {
+            set ::apr_show_cells 1; set ::apr_show_routes 0; set ::apr_show_critical 0
+            set ::apr_show_cell_pins 0; set ::apr_show_vias 0; set ::apr_show_fillers 1
+            set ::apr_show_heatmap 0; set ::apr_clock_only 0
+            apr_report_file [gui_state_text apr_drc_report_path] "APR DRC / LVS / DFT Signoff"
+        }
+    }
+    apr_refresh_display_controls
+    render_apr_layout
+    render_apr_dashboard
+}
+
+proc apr_tab_bar {page} {
+    frame $page.tabs -bg $::C_PANEL
+    pack $page.tabs -fill x
+    foreach {key label} {layout "Layout" placement "Placement" routing "Routing" clock "Clock Tree" timing "Timing" power "Power / IR" congestion "Congestion" area "Area" signoff "Signoff"} {
+        button $page.tabs.$key -text $label -command [list set_apr_view $key] \
+            -bg $::C_PANEL -fg $::C_DIM -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT \
+            -relief flat -bd 0 -padx 14 -pady 6
+        pack $page.tabs.$key -side left -padx {2 0} -pady 2
+    }
+}
+
+proc render_apr_layout {} {
+    if {![info exists ::apr_canvas_path]} { return }
+    set canvas $::apr_canvas_path
+    if {![winfo exists $canvas]} { return }
+    $canvas delete all
+    if {[llength $::apr_rows] == 0} {
+        canvas_message $canvas "No physical layout" "Run /apr after synthesis with a compatible Liberty and LEF library."
+        return
+    }
+    set xmax 1.0; set ymax 1.0
+    set core_x 0.0; set core_y 0.0
+    set have_die 0; set have_core 0
+    foreach row $::apr_rows {
+        if {[dict get $row kind] eq "die"} {
+            set xmax [dict get $row x2]; set ymax [dict get $row y2]; set have_die 1
+            continue
+        }
+        if {[dict get $row kind] eq "core"} {
+            set core_x [dict get $row x2]; set core_y [dict get $row y2]; set have_core 1
+            continue
+        }
+        foreach key {x1 x2} { set xmax [expr {max($xmax, [dict get $row $key])}] }
+        foreach key {y1 y2} { set ymax [expr {max($ymax, [dict get $row $key])}] }
+    }
+    # State values preserve compatibility with projects generated before the
+    # boundary records were added to apr_layout.tsv.
+    if {!$have_die && [string is double -strict [gui_state_get apr_die_width_um]] && [string is double -strict [gui_state_get apr_die_height_um]]} {
+        set xmax [gui_state_get apr_die_width_um]; set ymax [gui_state_get apr_die_height_um]; set have_die 1
+    }
+    if {!$have_core && [string is double -strict [gui_state_get apr_core_width_um]] && [string is double -strict [gui_state_get apr_core_height_um]]} {
+        set core_x [gui_state_get apr_core_width_um]; set core_y [gui_state_get apr_core_height_um]; set have_core 1
+    }
+    if {!$have_core} { set core_x $xmax; set core_y $ymax }
+    set width [winfo width $canvas]; set height [winfo height $canvas]
+    if {$width < 40 || $height < 40} { return }
+    # Keep the die comfortably inside the viewport at every window size.
+    # The margin scales down on compact screens without turning the design
+    # into a tiny lower-corner thumbnail.
+    set margin [expr {max(18.0, min(40.0, min($width, $height) * 0.055))}]
+    set base_scale [expr {min(($width - 2.0*$margin)/$xmax, ($height - 2.0*$margin)/$ymax)}]
+    if {$base_scale <= 0} { set base_scale 1.0 }
+    set scale [expr {$base_scale * $::apr_zoom}]
+    # All placed objects are core-local.  Center the core inside the die,
+    # then center the die in the viewport before applying user pan.
+    set core_origin_x [expr {($xmax - $core_x) / 2.0}]
+    set core_origin_y [expr {($ymax - $core_y) / 2.0}]
+    set origin_x [expr {$width / 2.0 - $xmax * $scale / 2.0 + $::apr_pan_x}]
+    set origin_y [expr {$height / 2.0 + $ymax * $scale / 2.0 + $::apr_pan_y}]
+    set die_left $origin_x; set die_top [expr {$origin_y - $ymax*$scale}]
+    set die_right [expr {$origin_x + $xmax*$scale}]; set die_bottom $origin_y
+    $canvas create rectangle $die_left $die_top $die_right $die_bottom -outline "#5d7890" -width 1 -fill "#0c141d" -tags die
+    set core_left [expr {$origin_x + $core_origin_x*$scale}]
+    set core_right [expr {$core_left + $core_x*$scale}]
+    set core_bottom [expr {$origin_y - $core_origin_y*$scale}]
+    set core_top [expr {$core_bottom - $core_y*$scale}]
+    $canvas create rectangle $core_left $core_top $core_right $core_bottom -outline "#3d667b" -width 1 -dash {4 3} -fill "#152633" -tags core
+
+    # Heatmaps are analytical overlays, never the implicit default layout.
+    set metric_max 0.0
+    if {$::apr_show_heatmap} {
+    foreach row $::apr_grid_rows {
+        if {$::apr_heat_metric eq "ir"} {
+            set metric_max [expr {max($metric_max, [dict get $row ir])}]
+        } elseif {$::apr_heat_metric eq "power"} {
+            set metric_max [expr {max($metric_max, [dict get $row power])}]
+        } else {
+            set metric_max [expr {max($metric_max, [dict get $row cong])}]
+        }
+    }
+    if {$metric_max <= 0.0} { set metric_max 1.0 }
+    # Render the heatmap after physical objects below, so only this numeric
+    # maximum is collected here.  The cells and tracks must not obscure IR.
+    # The actual colored overlay is deliberately drawn last.
+    foreach row {} {
+        set gx [expr {$core_left + ([dict get $row x] - $core_x/24.0)*$scale}]
+        set gy [expr {$core_bottom - ([dict get $row y] - $core_y/24.0)*$scale}]
+        set cellw [expr {$core_x*$scale/12.0}]
+        set cellh [expr {$core_y*$scale/12.0}]
+        if {$::apr_heat_metric eq "ir"} {
+            set value [dict get $row ir]
+        } elseif {$::apr_heat_metric eq "power"} {
+            set value [dict get $row power]
+        } else {
+            set value [dict get $row cong]
+        }
+        set normalized [expr {min(1.0, max(0.0, $value / $metric_max))}]
+        set red [expr {int(min(255, 35 + 210*$normalized))}]
+        set blue [expr {int(max(25, 220 - 170*$normalized))}]
+        set color [format "#%02x%02x%02x" $red 70 $blue]
+        $canvas create rectangle $gx [expr {$gy-$cellh}] [expr {$gx+$cellw}] $gy -fill $color -outline "" -stipple gray50 -tags heatmap
+    }
+    }
+    # The APR viewport is physical, not a utilization chart: every standard
+    # cell retains its actual LEF width/height at every zoom level.
+    set visible_cells 0
+    if {$::apr_show_cells} {
+        foreach row $::apr_rows {
+            if {[dict get $row kind] ne "cell"} { continue }
+            set x1 [expr {$core_left + [dict get $row x1]*$scale}]
+            set y1 [expr {$core_bottom - [dict get $row y2]*$scale}]
+            set x2 [expr {$core_left + [dict get $row x2]*$scale}]
+            set y2 [expr {$core_bottom - [dict get $row y1]*$scale}]
+            $canvas create rectangle $x1 $y1 $x2 $y2 -fill [apr_cell_fill [dict get $row layer]] -outline "#84a2b6" -width 0.7 -tags cell
+            incr visible_cells
+        }
+    }
+    if {$::apr_show_fillers} {
+        foreach row $::apr_rows {
+            if {[dict get $row kind] ne "filler"} { continue }
+            set x1 [expr {$core_left + [dict get $row x1]*$scale}]; set y1 [expr {$core_bottom - [dict get $row y2]*$scale}]
+            set x2 [expr {$core_left + [dict get $row x2]*$scale}]; set y2 [expr {$core_bottom - [dict get $row y1]*$scale}]
+            $canvas create rectangle $x1 $y1 $x2 $y2 -fill "#314151" -outline "#5a7082" -width 0.5 -tags filler
+        }
+    }
+    # Pin rectangles and vias remain complete in the exchange model but are
+    # only materialized at useful physical zoom.  Rendering thousands of
+    # sub-micron shapes at overview would hide the real cell footprints and
+    # turn a layout into an unreadable coloured grid.
+    if {$::apr_show_cell_pins && $::apr_zoom >= 1.60} {
+        foreach row $::apr_rows {
+            if {[dict get $row kind] ne "cellpin"} { continue }
+            set x1 [expr {$core_left + [dict get $row x1]*$scale}]; set y1 [expr {$core_bottom - [dict get $row y2]*$scale}]
+            set x2 [expr {$core_left + [dict get $row x2]*$scale}]; set y2 [expr {$core_bottom - [dict get $row y1]*$scale}]
+            $canvas create rectangle $x1 $y1 $x2 $y2 -fill [apr_layer_color [dict get $row layer]] -outline "" -tags cellpin
+        }
+    }
+    set visible_routes 0
+    foreach row $::apr_rows {
+        if {[dict get $row kind] ne "route" || !$::apr_show_routes} { continue }
+        set net [dict get $row name]; set layer [dict get $row layer]
+        if {$::apr_clock_only && ![apr_is_clock_net $net]} { continue }
+        if {[info exists ::apr_layer_visible($layer)] && !$::apr_layer_visible($layer)} { continue }
+        set x1 [expr {$core_left + [dict get $row x1]*$scale}]; set y1 [expr {$core_bottom - [dict get $row y1]*$scale}]
+        set x2 [expr {$core_left + [dict get $row x2]*$scale}]; set y2 [expr {$core_bottom - [dict get $row y2]*$scale}]
+        set wire_width [apr_route_pixel_width $row $scale]
+        $canvas create line $x1 $y1 $x2 $y2 -fill [apr_layer_color $layer] -width $wire_width \
+            -capstyle round -joinstyle round -tags route
+        incr visible_routes
+    }
+    # Power-grid straps are physical geometry rather than signal routes.
+    # Render them beneath timing/analysis overlays with their real LEF-derived
+    # widths so VDD/VSS topology remains readable at overview and zoom.
+    foreach row $::apr_rows {
+        if {[dict get $row kind] ne "pdn"} { continue }
+        set layer [dict get $row layer]
+        if {[info exists ::apr_layer_visible($layer)] && !$::apr_layer_visible($layer)} { continue }
+        set x1 [expr {$core_left + [dict get $row x1]*$scale}]; set y1 [expr {$core_bottom - [dict get $row y1]*$scale}]
+        set x2 [expr {$core_left + [dict get $row x2]*$scale}]; set y2 [expr {$core_bottom - [dict get $row y2]*$scale}]
+        set color [expr {[dict get $row name] eq "VDD" ? "#df8b4b" : "#4f9ec4"}]
+        $canvas create line $x1 $y1 $x2 $y2 -fill $color -width [apr_route_pixel_width $row $scale] -capstyle round -tags pdn
+    }
+    if {$::apr_show_vias && $::apr_zoom >= 1.35} {
+        foreach row $::apr_rows {
+            if {[dict get $row kind] ne "via"} { continue }
+            set x1 [expr {$core_left + [dict get $row x1]*$scale}]; set y1 [expr {$core_bottom - [dict get $row y2]*$scale}]
+            set x2 [expr {$core_left + [dict get $row x2]*$scale}]; set y2 [expr {$core_bottom - [dict get $row y1]*$scale}]
+            set min_size 2.2
+            if {$x2-$x1 < $min_size} { set mid [expr {($x1+$x2)/2.0}]; set x1 [expr {$mid-$min_size/2.0}]; set x2 [expr {$mid+$min_size/2.0}] }
+            if {$y2-$y1 < $min_size} { set mid [expr {($y1+$y2)/2.0}]; set y1 [expr {$mid-$min_size/2.0}]; set y2 [expr {$mid+$min_size/2.0}] }
+            $canvas create rectangle $x1 $y1 $x2 $y2 -fill "#e3d49b" -outline "#fff3b0" -width 0.6 -tags via
+        }
+    }
+    set metric_label [expr {$::apr_heat_metric eq "ir" ? "IR drop" : ($::apr_heat_metric eq "power" ? "power hotspot" : "congestion")}]
+    # Analysis overlays are top-most by design.  A gray50 stipple retains the
+    # silhouette of cells/tracks while making IR/congestion visible at all
+    # overview scales; no physical object can cover the color field.
+    if {$::apr_show_heatmap} {
+        set cellw [expr {$core_x*$scale/12.0}]
+        set cellh [expr {$core_y*$scale/12.0}]
+        foreach row $::apr_grid_rows {
+            set gx [expr {$core_left + ([dict get $row x] - $core_x/24.0)*$scale}]
+            set gy [expr {$core_bottom - ([dict get $row y] - $core_y/24.0)*$scale}]
+            if {$::apr_heat_metric eq "ir"} {
+                set value [dict get $row ir]
+            } elseif {$::apr_heat_metric eq "power"} {
+                set value [dict get $row power]
+            } else {
+                set value [dict get $row cong]
+            }
+            set normalized [expr {min(1.0, max(0.0, $value / $metric_max))}]
+            set red [expr {int(min(255, 35 + 210*$normalized))}]
+            set blue [expr {int(max(25, 220 - 170*$normalized))}]
+            set color [format "#%02x%02x%02x" $red 70 $blue]
+            $canvas create rectangle $gx [expr {$gy-$cellh}] [expr {$gx+$cellw}] $gy \
+                -fill $color -outline "" -stipple gray50 -tags {heatmap analysis_top}
+        }
+        set legend_x [expr {$core_left+8}]
+        set legend_y [expr {$core_top+8}]
+        foreach {i label color} {0 Low #2346dc 1 Moderate #8f46a3 2 High #e14654 3 Peak #f56a19} {
+            set lx [expr {$legend_x + $i*64}]
+            $canvas create rectangle $lx $legend_y [expr {$lx+11}] [expr {$legend_y+11}] -fill $color -outline "" -tags analysis_top
+            $canvas create text [expr {$lx+15}] [expr {$legend_y+6}] -anchor w -text $label -fill $::C_TEXT -font {Helvetica 7 bold} -tags analysis_top
+        }
+        set unit [expr {$::apr_heat_metric eq "ir" ? "mV" : ($::apr_heat_metric eq "power" ? "relative" : "demand")}]
+        $canvas create text $legend_x [expr {$legend_y+22}] -anchor w -text "[string totitle $metric_label]: 0 to [format %.3f $metric_max] $unit" -fill $::C_HIGHLIGHT -font {Helvetica 8 bold} -tags analysis_top
+    }
+    foreach row $::apr_rows {
+        if {[dict get $row kind] ne "critical" || !$::apr_show_critical} { continue }
+        set net [dict get $row name]; set layer [dict get $row layer]
+        if {$::apr_clock_only && ![apr_is_clock_net $net]} { continue }
+        if {[info exists ::apr_layer_visible($layer)] && !$::apr_layer_visible($layer)} { continue }
+        set x1 [expr {$core_left + [dict get $row x1]*$scale}]; set y1 [expr {$core_bottom - [dict get $row y1]*$scale}]
+        set x2 [expr {$core_left + [dict get $row x2]*$scale}]; set y2 [expr {$core_bottom - [dict get $row y2]*$scale}]
+        set wire_width [apr_route_pixel_width $row $scale]
+        # Keep the native route below visible: criticality is an overlay, not
+        # a replacement of the metal stack.  The stippled salmon trace has
+        # exactly the LEF-derived metal width, no arrows and no opaque halo.
+        # This preserves both layer color and physical-width cues in a dense
+        # routing overview while retaining a recognizable timing path.
+        set critical_width $wire_width
+        $canvas create line $x1 $y1 $x2 $y2 -fill "#ff806d" -width $critical_width -stipple gray50 \
+            -capstyle round -joinstyle round -tags critical
+        apr_draw_via_marker $canvas $x1 $y1 $critical_width "#ffb29f"
+        apr_draw_via_marker $canvas $x2 $y2 $critical_width "#ffb29f"
+        incr visible_routes
+    }
+    # Critical-path marks are emitted after normal routes. Keep the selected
+    # analysis field unequivocally top-most even when timing highlighting is
+    # enabled at the same time as IR/power/congestion display.
+    if {$::apr_show_heatmap} { $canvas raise analysis_top }
+    # A port must remain legible at overview scale.  The exchange coordinates
+    # are a physical 0.36 um pin shape, so draw an outward boundary marker
+    # with its logical name after all physical and analytical overlays.
+    if {$::apr_show_pins} {
+        foreach row $::apr_rows {
+            if {[dict get $row kind] ne "pin"} { continue }
+            set px [expr {$core_left + (([dict get $row x1] + [dict get $row x2]) / 2.0) * $scale}]
+            set py [expr {$core_bottom - (([dict get $row y1] + [dict get $row y2]) / 2.0) * $scale}]
+            set direction [string toupper [dict get $row layer]]
+            set marker 7.0
+            if {$direction eq "INPUT"} {
+                set points [list [expr {$px-$marker}] $py $px [expr {$py-$marker}] $px [expr {$py+$marker}]]
+                set label_x [expr {$px+$marker+4}]; set anchor w
+            } elseif {$direction eq "OUTPUT"} {
+                set points [list [expr {$px+$marker}] $py $px [expr {$py-$marker}] $px [expr {$py+$marker}]]
+                set label_x [expr {$px-$marker-4}]; set anchor e
+            } else {
+                set points [list $px [expr {$py-$marker}] [expr {$px-$marker}] [expr {$py+$marker}] [expr {$px+$marker}] [expr {$py+$marker}]]
+                set label_x $px; set anchor s
+            }
+            $canvas create polygon $points -fill "#f5c542" -outline "#fff1a1" -width 1.2 -tags {pin pin_top}
+            $canvas create text $label_x $py -anchor $anchor -text "[dict get $row name] ($direction)" -fill "#fff1a1" -font {Helvetica 8 bold} -tags {pin_label pin_top}
+        }
+    }
+    $canvas raise pin_top
+    set overlay [expr {$::apr_show_heatmap ? "$metric_label [format %.3f $metric_max]" : "no overlay"}]
+    if {[winfo exists .toparea.right.pages.apr.main.layout.toolbar.meta]} {
+        set lod_note [expr {$::apr_zoom < 1.60 ? " | pins/vias appear from 160%" : ""}]
+        .toparea.right.pages.apr.main.layout.toolbar.meta configure -text "[string totitle $::apr_view]  |  $visible_cells cells  |  $visible_routes routes  |  $overlay  |  [format %.0f%% [expr {$::apr_zoom*100}]]$lod_note"
+    }
+    if {$::apr_clock_only && $visible_routes == 0} {
+        $canvas create text [expr {$width/2.0}] [expr {$height/2.0}] -text "No clock net or sequential clock sink was emitted for this design." -anchor center -fill $::C_WARN -font {Helvetica 10 bold} -tags notice
+    }
+    $canvas configure -scrollregion [$canvas bbox all]
+}
+
+proc update_apr_page {} {
+    load_apr_layout_from_state
+    load_apr_grid_from_state
+    apr_refresh_display_controls
+    if {[winfo exists .toparea.right.pages.apr.status]} {
+        set cells [gui_state_get apr_cells_count 0]
+        set routes [gui_state_get apr_routes_count 0]
+        set ir [gui_state_get apr_ir_drop_mv "-"]
+        .toparea.right.pages.apr.status configure -text "Signoff: [gui_state_get apr_signoff_status NOT_RUN] | DRC: [gui_state_get apr_drc_status NOT_RUN] | LVS: [gui_state_get apr_lvs_status NOT_RUN] | DFT: [gui_state_get apr_dft_status NOT_RUN] | $cells cells / $routes routes / IR $ir mV"
+    }
+    render_apr_layout
+    render_apr_dashboard
+}
+
 proc update_summary_page {} {
     if {[gui_state_get step_status] eq "failed"} {
         set lint_value "Check console"
@@ -2990,9 +3942,9 @@ proc update_summary_page {} {
         power  "[format %.4f $::power_total] mW" "○" $::C_DIM \
         formal $::formal_result $formal_status $formal_color \
     ] {
-        if {[winfo exists .toparea.right.pages.summary.body.$key.v]} {
-            .toparea.right.pages.summary.body.$key.v configure -text $value
-            .toparea.right.pages.summary.body.$key.s configure -text $status -fg $color
+        if {[winfo exists .toparea.right.pages.summary.hpane.metrics.body.$key.v]} {
+            .toparea.right.pages.summary.hpane.metrics.body.$key.v configure -text $value
+            .toparea.right.pages.summary.hpane.metrics.body.$key.s configure -text $status -fg $color
         }
     }
     render_hierarchy_treemap
@@ -3001,11 +3953,11 @@ proc update_summary_page {} {
 # ===================== Page Switching =====================
 proc set_page {page} {
     set ::current_page $page
-    foreach p {config rtl sim synth timing power area formal summary} {
+    foreach p {config rtl sim synth timing power area apr formal summary} {
         if {[winfo exists .toparea.right.pages.$p]} { pack forget .toparea.right.pages.$p }
     }
     if {[winfo exists .toparea.right.pages.$page]} { pack .toparea.right.pages.$page -fill both -expand 1 }
-    foreach p {config rtl sim synth timing power area formal summary} {
+    foreach p {config rtl sim synth timing power area apr formal summary} {
         if {[winfo exists .toparea.left.$p]} { .toparea.left.$p configure -bg $::C_PANEL -fg $::C_DIM }
     }
     if {[winfo exists .toparea.left.$page]} { .toparea.left.$page configure -bg $::C_ACCENT -fg $::C_HIGHLIGHT }
@@ -3017,6 +3969,10 @@ proc set_page {page} {
         after idle render_power_chart
     } elseif {$page eq "area"} {
         after idle render_area_chart
+    } elseif {$page eq "apr"} {
+        # A canvas can be unmapped when the exchange state arrives. Re-read
+        # physical artifacts on every APR entry, then render after geometry.
+        after idle {update_apr_page; set_apr_view $::apr_view}
     } elseif {$page eq "timing"} {
         after idle render_timing_path_graph
     } elseif {$page eq "formal"} {
@@ -3055,13 +4011,14 @@ proc gui_run_autodump {} {
     }
 
     foreach spec {
-        {synth   .toparea.right.pages.synth.gate_canvas                 render_gate_netlist      synth_canvas}
+        {synth   .toparea.right.pages.synth.hpane.left.canvas_frame.canvas render_gate_netlist      synth_canvas}
         {timing  .toparea.right.pages.timing.vpane.graph.main.right.canvas render_timing_path_graph timing_canvas}
         {sim     .toparea.right.pages.sim.vpane.wave.main.view.canvas   render_waveform          waveform_canvas}
-        {formal  .toparea.right.pages.formal.points_canvas              render_formal_points_graph formal_canvas}
+        {formal  .toparea.right.pages.formal.hpane.points.points_canvas render_formal_points_graph formal_canvas}
         {power   .toparea.right.pages.power.main.chart.canvas           render_power_chart        power_canvas}
         {area    .toparea.right.pages.area.main.chart.canvas            render_area_chart         area_canvas}
         {summary .toparea.right.pages.summary.hpane.hier.canvas         render_hierarchy_treemap hierarchy_canvas}
+        {apr     .toparea.right.pages.apr.main.layout.viewer.canvas     render_apr_layout        apr_layout}
     } {
         lassign $spec page canvas renderer stem
         catch {set_page $page}
@@ -3070,6 +4027,66 @@ proc gui_run_autodump {} {
         update idletasks
         puts $fp [format "%-10s %s" $stem [gui_canvas_summary $canvas]]
         gui_write_canvas_postscript $canvas [file join $outdir "${stem}.ps"]
+    }
+    # Formal is three separate equivalence contracts, not alternate text in
+    # one report.  Export every selected stage so GUI regression verifies the
+    # tab handler, stage-specific report selection, and readable diagram.
+    set formal_canvas .toparea.right.pages.formal.hpane.points.points_canvas
+    foreach view {rtl_gate rtl_apr gate_apr} {
+        catch {set_page formal; set_formal_view $view}
+        update idletasks
+        catch {render_formal_points_graph}
+        update idletasks
+        puts $fp [format "formal_%-8s %s" $view [gui_canvas_summary $formal_canvas]]
+        gui_write_canvas_postscript $formal_canvas [file join $outdir "formal_${view}.ps"]
+    }
+    # APR views have deliberately different object and overlay policies.
+    # Export each one so visual regression checks cannot silently validate
+    # only the default Layout view.
+    set apr_canvas .toparea.right.pages.apr.main.layout.viewer.canvas
+    set apr_dashboard .toparea.right.pages.apr.main.report.split.chart.canvas
+    foreach view {layout placement routing clock timing power congestion area signoff} {
+        catch {set_page apr; set_apr_view $view}
+        update idletasks
+        catch {render_apr_layout}
+        catch {render_apr_dashboard}
+        update idletasks
+        puts $fp [format "apr_viewport %-6s canvas=%dx%d viewer=%dx%d root=%dx%d" $view \
+            [winfo width $apr_canvas] [winfo height $apr_canvas] \
+            [winfo width [winfo parent $apr_canvas]] [winfo height [winfo parent $apr_canvas]] \
+            [winfo width .] [winfo height .]]
+        puts $fp [format "apr_%-6s %s" $view [gui_canvas_summary $apr_canvas]]
+        gui_write_canvas_postscript $apr_canvas [file join $outdir "apr_${view}.ps"]
+        puts $fp [format "apr_dash_%-6s %s" $view [gui_canvas_summary $apr_dashboard]]
+        gui_write_canvas_postscript $apr_dashboard [file join $outdir "apr_dash_${view}.ps"]
+    }
+    # Exercise viewport controls in the live widget.  A zoom regression must
+    # change the physical extent; Fit then restores the complete die.
+    catch {set_page apr; set_apr_view routing; apr_zoom_fit; apr_zoom_in; apr_zoom_in; apr_zoom_in}
+    update idletasks
+    puts $fp [format "apr_zoomed %s" [gui_canvas_summary $apr_canvas]]
+    gui_write_canvas_postscript $apr_canvas [file join $outdir "apr_zoomed.ps"]
+    catch {apr_zoom_fit}
+
+    # Opt-in geometry regression for the native GUI.  This is intentionally
+    # environment-gated so normal diagnostic exports never alter a user's
+    # window; CI can verify that the viewer grows and its fit transform follows
+    # both compact and large application windows.
+    if {[info exists ::env(AI_DIGITAL_GUI_RESIZE_TEST)]} {
+        foreach {label geometry} {compact 1024x720 large 1600x1000 tall 1600x1400} {
+            wm geometry . $geometry
+            after 120
+            update
+            catch {set_page apr; set_apr_view layout; apr_zoom_fit}
+            update
+            puts $fp [format "apr_resize %-7s root=%dx%d page=%dx%d main=%dx%d canvas=%dx%d %s" $label \
+                [winfo width .] [winfo height .] \
+                [winfo width .toparea.right.pages.apr] [winfo height .toparea.right.pages.apr] \
+                [winfo width .toparea.right.pages.apr.main] [winfo height .toparea.right.pages.apr.main] \
+                [winfo width $apr_canvas] [winfo height $apr_canvas] \
+                [gui_canvas_summary $apr_canvas]]
+            gui_write_canvas_postscript $apr_canvas [file join $outdir "apr_resize_${label}.ps"]
+        }
     }
 
     close $fp
@@ -3166,7 +4183,49 @@ menu .menubar.flow -tearoff 0 -bg $::C_PANEL -fg $::C_TEXT -activebackground $::
 .menubar add cascade -label "Flow" -menu .menubar.flow -underline 0
 .menubar.flow add command -label "Full Flow" -command {console_log "ai_digital ▸ /full" "cmd"; pipe_send "/full"}
 .menubar.flow add command -label "Lint" -command {console_log "ai_digital ▸ /lint $::current_module" "cmd"; pipe_send "/lint $::current_module"}
-.menubar.flow add command -label "Synthesis" -command {console_log "ai_digital ▸ /synth $::current_module" "cmd"; pipe_send "/synth $::current_module"}
+menu .menubar.synthesis -tearoff 0 -bg $::C_PANEL -fg $::C_TEXT -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT
+.menubar add cascade -label "Synthesis" -menu .menubar.synthesis
+.menubar.synthesis add command -label "Run Synthesis" -command {gui_run_stage "/synth $::current_module" "Native synthesis"}
+.menubar.synthesis add separator
+.menubar.synthesis add command -label "Netlist View" -command {set_synth_view synth}
+.menubar.synthesis add command -label "Timing View" -command {set_synth_view timing}
+.menubar.synthesis add command -label "Power View" -command {set_synth_view power}
+.menubar.synthesis add command -label "Area View" -command {set_synth_view area}
+.menubar.synthesis add separator
+.menubar.synthesis add command -label "Optimization Policy..." -command show_synthesis_options_dialog
+menu .menubar.apr -tearoff 0 -bg $::C_PANEL -fg $::C_TEXT -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT
+.menubar add cascade -label "APR" -menu .menubar.apr
+.menubar.apr add command -label "Run Native APR" -command {gui_run_stage "/apr run" "Native APR"}
+.menubar.apr add command -label "Physical Settings" -command {gui_run_stage "/apr config" "APR configuration"}
+.menubar.apr add command -label "LLM Prediction (Advisory)" -command {gui_run_stage "/apr predict" "APR LLM prediction"}
+.menubar.apr add command -label "Show LLM Prediction" -command {gui_run_stage "/apr predict show" "APR LLM prediction"}
+.menubar.apr add separator
+.menubar.apr add command -label "Layout View" -command {set_page apr; set_apr_view layout}
+.menubar.apr add command -label "Placement View" -command {set_page apr; set_apr_view placement}
+.menubar.apr add command -label "Routing View" -command {set_page apr; set_apr_view routing}
+.menubar.apr add command -label "Clock Tree View" -command {set_page apr; set_apr_view clock}
+.menubar.apr add command -label "Timing View" -command {set_page apr; set_apr_view timing}
+.menubar.apr add command -label "Power / IR View" -command {set_page apr; set_apr_view power}
+.menubar.apr add command -label "Congestion View" -command {set_page apr; set_apr_view congestion}
+.menubar.apr add command -label "Area View" -command {set_page apr; set_apr_view area}
+.menubar.apr add command -label "Signoff View" -command {set_page apr; set_apr_view signoff}
+.menubar.apr add separator
+.menubar.apr add command -label "Show Congestion Map" -command {set_page apr; set_apr_view congestion; set_apr_heat_metric cong}
+.menubar.apr add command -label "Show IR Drop Map" -command {set_page apr; set_apr_view power; set_apr_heat_metric ir}
+.menubar.apr add command -label "Show Power Hotspots" -command {set_page apr; set_apr_view power; set_apr_heat_metric power}
+.menubar.apr add command -label "Show All Routes" -command {set_page apr; set_apr_view routing}
+.menubar.apr add separator
+.menubar.apr add command -label "Zoom In" -command {set_page apr; apr_zoom_in}
+.menubar.apr add command -label "Zoom Out" -command {set_page apr; apr_zoom_out}
+.menubar.apr add command -label "Fit Die to View" -command {set_page apr; apr_zoom_fit}
+menu .menubar.optimization -tearoff 0 -bg $::C_PANEL -fg $::C_TEXT -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT
+.menubar add cascade -label "Optimization" -menu .menubar.optimization -underline 0
+menu .menubar.optimization.synthesis -tearoff 0 -bg $::C_PANEL -fg $::C_TEXT -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT
+.menubar.optimization add cascade -label "Synthesis" -menu .menubar.optimization.synthesis
+.menubar.optimization.synthesis add command -label "Pass Policy..." -command show_synthesis_options_dialog
+menu .menubar.optimization.analysis -tearoff 0 -bg $::C_PANEL -fg $::C_TEXT -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT
+.menubar.optimization add cascade -label "Analysis" -menu .menubar.optimization.analysis
+.menubar.optimization.analysis add command -label "Timing, Power, Formal: Mandatory" -state disabled
 menu .menubar.help -tearoff 0 -bg $::C_PANEL -fg $::C_TEXT -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT
 .menubar add cascade -label "Help" -menu .menubar.help -underline 0
 .menubar.help add command -label "About" -command {tk_messageBox -title "About" -message "AI Digital v$::APP_VERSION\nRTL Design & Analysis Suite\n\nPipe-integrated CLI mode"}
@@ -3180,12 +4239,14 @@ frame .toparea.left -width 180 -bg $::C_PANEL -bd 0 -highlightthickness 0
 pack .toparea.left -side left -fill y -anchor nw
 label .toparea.left.title -text "  Flow Steps" -fg $::C_HIGHLIGHT -bg $::C_PANEL -font {Helvetica 11 bold}
 pack .toparea.left.title -fill x -pady {10 6}
-set ::steps {config "⚙ Config" rtl "📄 RTL" sim "▶ Simulation" synth "⚙ Synthesis" timing "⏱ Timing" power "⚡ Power" area "📐 Area" formal "✓ Formal" summary "📊 Summary"}
+set ::steps {config "⚙ Config" rtl "📄 RTL" sim "▶ Simulation" synth "⚙ Synthesis + Analysis" apr "▦ APR" formal "✓ Formal" summary "📊 Summary"}
 foreach {key label} $::steps {
+    set step_command [list set_page $key]
+    if {$key eq "synth"} { set step_command [list set_synth_view synth] }
     button .toparea.left.$key -text $label -bg $::C_PANEL -fg $::C_DIM \
         -activebackground "#33334a" -activeforeground $::C_HIGHLIGHT \
         -relief flat -borderwidth 0 -anchor w -padx 14 -pady 2 \
-        -font {Helvetica 10} -command [list set_page $key]
+        -font {Helvetica 10} -command $step_command
     pack .toparea.left.$key -fill x -ipady 5
 }
 frame .toparea.left.sep1 -bg $::C_BORDER -height 1; pack .toparea.left.sep1 -fill x -pady {12 6}
@@ -3260,15 +4321,15 @@ frame $rtl_frame.bar -bg $::C_PANEL
 pack $rtl_frame.bar -fill x
 label $rtl_frame.bar.title -text "  RTL Source" -fg $::C_HIGHLIGHT -bg $::C_PANEL -font {Helvetica 9 bold}
 pack $rtl_frame.bar.title -side left -padx 4 -pady 2
-text $p.code -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
-pack $p.code -fill both -expand 1 -padx 2 -pady 2 -in $rtl_frame
+text $rtl_frame.code -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
+pack $rtl_frame.code -fill both -expand 1 -padx 2 -pady 2
 set tb_frame [frame $p.hpane.tb -bg $::C_INPUT_BG]
 frame $tb_frame.bar -bg $::C_PANEL
 pack $tb_frame.bar -fill x
 label $tb_frame.bar.title -text "  Testbench" -fg $::C_HIGHLIGHT -bg $::C_PANEL -font {Helvetica 9 bold}
 pack $tb_frame.bar.title -side left -padx 4 -pady 2
-text $p.tb -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
-pack $p.tb -fill both -expand 1 -padx 2 -pady 2 -in $tb_frame
+text $tb_frame.tb -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
+pack $tb_frame.tb -fill both -expand 1 -padx 2 -pady 2
 $p.hpane add $rtl_frame -width 560 -sticky news
 $p.hpane add $tb_frame -width 420 -sticky news
 pack forget $p
@@ -3334,23 +4395,20 @@ frame $log_frame.bar -bg $::C_PANEL
 pack $log_frame.bar -fill x
 label $log_frame.bar.title -text "  Simulation Log" -fg $::C_DIM -bg $::C_PANEL -font {Helvetica 9 bold}
 pack $log_frame.bar.title -side left -padx 4 -pady 2
-text $p.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
-pack $p.out -fill both -expand 1 -in $log_frame -padx 2 -pady 2
+text $log_frame.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
+pack $log_frame.out -fill both -expand 1 -padx 2 -pady 2
 $p.vpane add $wave_frame -height 340 -sticky news
 $p.vpane add $log_frame -height 180 -sticky news
 pack forget $p
 
 # --- Page: Synthesis (horizontal layout: diagram | text) ---
 set p [frame .toparea.right.pages.synth -bg $::C_BG]
-frame $p.toolbar -bg $::C_PANEL; pack $p.toolbar -fill x
-button $p.toolbar.run -text "Run Synthesis" -command {console_log "ai_digital ▸ /synth $::current_module" "cmd"; pipe_send "/synth $::current_module"} -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat -padx 8
-pack $p.toolbar.run -side left -padx 4 -pady 2
-label $p.toolbar.status -text "(not run)" -fg $::C_DIM -bg $::C_PANEL; pack $p.toolbar.status -side left -padx 8
+synth_tab_bar $p synth
 
 # Stats bar
 frame $p.stats -bg $::C_INPUT_BG -bd 1 -highlightbackground $::C_BORDER -highlightthickness 1
 pack $p.stats -fill x -padx 6 -pady 4
-foreach {key label} {cells "Cells:" dff "DFFs:" area "Area (GE):" depth "Logic Depth:"} {
+foreach {key label} {cells "Cells:" dff "DFFs:" area "Area (µm²):" depth "Logic Depth:"} {
     frame $p.stats.$key -bg $::C_INPUT_BG; pack $p.stats.$key -fill x -ipady 2
     label $p.stats.$key.l -text "  $label" -fg $::C_DIM -bg $::C_INPUT_BG -width 15 -anchor w -font {Helvetica 10}
     label $p.stats.$key.v -text "0" -fg $::C_HIGHLIGHT -bg $::C_INPUT_BG -anchor e -font {Helvetica 10 bold}
@@ -3376,54 +4434,56 @@ pack $left_frame.zoom.fit -side right -padx 2; pack $left_frame.zoom.out -side r
 # Canvas with scrollbars
 frame $left_frame.canvas_frame -bg $::C_INPUT_BG
 pack $left_frame.canvas_frame -fill both -expand 1
-canvas $p.gate_canvas -bg $::C_INPUT_BG -highlightthickness 0 -width 400 -height 300
-scrollbar $p.gate_canvas_v -orient vertical -command [list $p.gate_canvas yview] -bg $::C_PANEL -troughcolor $::C_BG
-scrollbar $p.gate_canvas_h -orient horizontal -command [list $p.gate_canvas xview] -bg $::C_PANEL -troughcolor $::C_BG
-$p.gate_canvas configure -yscrollcommand [list $p.gate_canvas_v set] -xscrollcommand [list $p.gate_canvas_h set]
+canvas $left_frame.canvas_frame.canvas -bg $::C_INPUT_BG -highlightthickness 0 -width 400 -height 300
+scrollbar $left_frame.canvas_frame.vs -orient vertical -command [list $left_frame.canvas_frame.canvas yview] -bg $::C_PANEL -troughcolor $::C_BG
+scrollbar $left_frame.canvas_frame.hs -orient horizontal -command [list $left_frame.canvas_frame.canvas xview] -bg $::C_PANEL -troughcolor $::C_BG
+$left_frame.canvas_frame.canvas configure -yscrollcommand [list $left_frame.canvas_frame.vs set] -xscrollcommand [list $left_frame.canvas_frame.hs set]
 # Mouse wheel zoom
-bind $p.gate_canvas <Button-4> {gate_zoom_in; break}
-bind $p.gate_canvas <Button-5> {gate_zoom_out; break}
-bind $p.gate_canvas <MouseWheel> {
+bind $left_frame.canvas_frame.canvas <Button-4> {gate_zoom_in; break}
+bind $left_frame.canvas_frame.canvas <Button-5> {gate_zoom_out; break}
+bind $left_frame.canvas_frame.canvas <MouseWheel> {
     if {%D > 0} {gate_zoom_in} else {gate_zoom_out}
     break
 }
-bind $p.gate_canvas <ButtonPress-1> {canvas_pan_mark %W %x %y}
-bind $p.gate_canvas <B1-Motion> {canvas_pan_drag %W %x %y}
-bind $p.gate_canvas <Configure> {after idle render_gate_netlist}
-pack $p.gate_canvas_v -side right -fill y -in $left_frame.canvas_frame
-pack $p.gate_canvas_h -side bottom -fill x -in $left_frame.canvas_frame
-pack $p.gate_canvas -fill both -expand 1 -in $left_frame.canvas_frame
+bind $left_frame.canvas_frame.canvas <ButtonPress-1> {canvas_pan_mark %W %x %y}
+bind $left_frame.canvas_frame.canvas <B1-Motion> {canvas_pan_drag %W %x %y}
+bind $left_frame.canvas_frame.canvas <Configure> {after idle render_gate_netlist}
+pack $left_frame.canvas_frame.vs -side right -fill y
+pack $left_frame.canvas_frame.hs -side bottom -fill x
+pack $left_frame.canvas_frame.canvas -fill both -expand 1
 
 # Right pane: text netlist
 set right_frame [frame $p.hpane.right -bg $::C_INPUT_BG]
 label $right_frame.title -text "  Gate Netlist" -fg $::C_DIM -bg $::C_PANEL -font {Helvetica 9 bold} -anchor w
 pack $right_frame.title -fill x -padx 2 -pady 1
-text $p.gate_text -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 0 -font {Courier 8} -width 30
-scrollbar $right_frame.scroll -command [list $p.gate_text yview] -bg $::C_PANEL -troughcolor $::C_BG
-$p.gate_text configure -yscrollcommand [list $right_frame.scroll set]
+text $right_frame.gate_text -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 0 -font {Courier 8} -width 30
+scrollbar $right_frame.scroll -command [list $right_frame.gate_text yview] -bg $::C_PANEL -troughcolor $::C_BG
+$right_frame.gate_text configure -yscrollcommand [list $right_frame.scroll set]
 pack $right_frame.scroll -side right -fill y
-pack $p.gate_text -fill both -expand 1 -padx 2 -pady 2 -in $right_frame
+pack $right_frame.gate_text -fill both -expand 1 -padx 2 -pady 2
 
 $p.hpane add $left_frame -width 500 -sticky news
 $p.hpane add $right_frame -width 200 -sticky news
+set synth_analysis_frame [frame $p.analysis -bg $::C_INPUT_BG -bd 1 -highlightbackground $::C_BORDER -highlightthickness 1]
+label $synth_analysis_frame.title -text "  Synthesis Analysis Summary" -fg $::C_HIGHLIGHT -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
+pack $synth_analysis_frame.title -fill x
+text $synth_analysis_frame.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 0 -font {Courier 8} -height 7 -state disabled -wrap none
+scrollbar $synth_analysis_frame.scroll -command [list $synth_analysis_frame.out yview] -bg $::C_PANEL -troughcolor $::C_BG
+$synth_analysis_frame.out configure -yscrollcommand [list $synth_analysis_frame.scroll set]
+pack $synth_analysis_frame.scroll -side right -fill y
+pack $synth_analysis_frame.out -fill both -expand 1 -padx 2 -pady 2
+pack $synth_analysis_frame -side bottom -fill x -padx 6 -pady {2 5}
+frame $p.actions -bg $::C_PANEL
+pack $p.actions -side bottom -fill x -padx 6 -pady {0 5}
+label $p.actions.note -text "Native synthesis creates the gate netlist and updates all post-synthesis views." -bg $::C_PANEL -fg $::C_DIM -font {Helvetica 9}
+button $p.actions.run -text "Run Synthesis" -command {gui_run_stage "/synth $::current_module" "Native synthesis"} -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat -padx 14 -pady 5
+pack $p.actions.note -side left -padx 8 -pady 5
+pack $p.actions.run -side right -padx 6 -pady 3
 pack forget $p
 
 # --- Page: Timing ---
 set p [frame .toparea.right.pages.timing -bg $::C_BG]
-frame $p.toolbar -bg $::C_PANEL; pack $p.toolbar -fill x
-label $p.toolbar.fl -text "Freq (MHz):" -fg $::C_TEXT -bg $::C_PANEL -font {Helvetica 10}
-entry $p.toolbar.freq -width 8 -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -highlightbackground $::C_BORDER
-$p.toolbar.freq insert 0 "100"
-button $p.toolbar.run -text "Analyze" -command {
-    set ::constraint_freq [.toparea.right.pages.timing.toolbar.freq get]
-    console_log "ai_digital ▸ /set freq $::constraint_freq" "cmd"
-    pipe_send "/set freq $::constraint_freq"
-    after 120 {
-        console_log "ai_digital ▸ /timing $::current_module" "cmd"
-        pipe_send "/timing $::current_module"
-    }
-} -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat -padx 8
-pack $p.toolbar.fl -side left -padx 4; pack $p.toolbar.freq -side left; pack $p.toolbar.run -side left -padx 8 -pady 2
+synth_tab_bar $p timing
 panedwindow $p.vpane -orient vertical -bg $::C_BORDER -sashwidth 4
 pack $p.vpane -fill both -expand 1 -padx 6 -pady 4
 set graph_frame [frame $p.vpane.graph -bg $::C_INPUT_BG]
@@ -3472,17 +4532,28 @@ frame $text_frame.bar -bg $::C_PANEL
 pack $text_frame.bar -fill x
 label $text_frame.bar.title -text "  Timing Report" -fg $::C_DIM -bg $::C_PANEL -font {Helvetica 9 bold}
 pack $text_frame.bar.title -side left -padx 4 -pady 2
-text $p.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
-pack $p.out -fill both -expand 1 -in $text_frame -padx 2 -pady 2
+text $text_frame.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
+pack $text_frame.out -fill both -expand 1 -padx 2 -pady 2
 $p.vpane add $graph_frame -height 360 -sticky news
 $p.vpane add $text_frame -height 190 -sticky news
+frame $p.actions -bg $::C_PANEL
+pack $p.actions -side bottom -fill x -padx 6 -pady {0 5}
+label $p.actions.fl -text "Frequency (MHz):" -fg $::C_TEXT -bg $::C_PANEL -font {Helvetica 9}
+entry $p.actions.freq -width 8 -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -highlightbackground $::C_BORDER
+$p.actions.freq insert 0 "100"
+button $p.actions.run -text "Run Timing Analysis" -command {
+    set ::constraint_freq [.toparea.right.pages.timing.actions.freq get]
+    gui_run_stage "/set freq $::constraint_freq" "Timing constraint update"
+    after 120 {gui_run_stage "/timing $::current_module" "Timing analysis"}
+} -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat -padx 14 -pady 5
+pack $p.actions.fl -side left -padx {8 4} -pady 5
+pack $p.actions.freq -side left -pady 4
+pack $p.actions.run -side right -padx 6 -pady 3
 pack forget $p
 
 # --- Page: Power ---
 set p [frame .toparea.right.pages.power -bg $::C_BG]
-frame $p.toolbar -bg $::C_PANEL; pack $p.toolbar -fill x
-button $p.toolbar.run -text "Analyze Power" -command {console_log "ai_digital ▸ /power $::current_module" "cmd"; pipe_send "/power $::current_module"} -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat -padx 8
-pack $p.toolbar.run -side left -padx 4 -pady 2
+synth_tab_bar $p power
 frame $p.stats -bg $::C_INPUT_BG -bd 1 -highlightbackground $::C_BORDER -highlightthickness 1
 pack $p.stats -fill x -padx 6 -pady 4
 foreach {key label} {total "Total Power:" static "Static:" dynamic "Dynamic:"} {
@@ -3512,10 +4583,17 @@ pack $power_report_frame.scroll -side right -fill y
 pack $power_report_frame.out -fill both -expand 1 -padx 2 -pady 2
 $p.main add $power_chart_frame -width 620 -sticky news
 $p.main add $power_report_frame -width 420 -sticky news
+frame $p.actions -bg $::C_PANEL
+pack $p.actions -side bottom -fill x -padx 6 -pady {0 5}
+label $p.actions.note -text "Multi-corner static and dynamic power, shown per operating point." -bg $::C_PANEL -fg $::C_DIM -font {Helvetica 9}
+button $p.actions.run -text "Run Power Analysis" -command {gui_run_stage "/power $::current_module" "Multi-corner power analysis"} -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat -padx 14 -pady 5
+pack $p.actions.note -side left -padx 8 -pady 5
+pack $p.actions.run -side right -padx 6 -pady 3
 pack forget $p
 
 # --- Page: Area ---
 set p [frame .toparea.right.pages.area -bg $::C_BG]
+synth_tab_bar $p area
 frame $p.stats -bg $::C_INPUT_BG -bd 1 -highlightbackground $::C_BORDER -highlightthickness 1
 pack $p.stats -fill x -padx 6 -pady 4
 foreach {key label} {ge "Area (GE):" um2 "Area (um^2):" cells "Cell Count:"} {
@@ -3535,18 +4613,128 @@ pack $area_chart_frame.canvas -fill both -expand 1
 set area_report_frame [frame $p.main.report -bg $::C_INPUT_BG]
 label $area_report_frame.title -text "  Area Report" -fg $::C_DIM -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
 pack $area_report_frame.title -fill x -pady {3 2}
-text $p.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
-pack $p.out -fill both -expand 1 -in $area_report_frame -padx 2 -pady 2
+text $area_report_frame.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
+pack $area_report_frame.out -fill both -expand 1 -padx 2 -pady 2
 $p.main add $area_chart_frame -width 520 -sticky news
 $p.main add $area_report_frame -width 520 -sticky news
+frame $p.actions -bg $::C_PANEL
+pack $p.actions -side bottom -fill x -padx 6 -pady {0 5}
+label $p.actions.note -text "Standard-cell composition and total synthesized area." -bg $::C_PANEL -fg $::C_DIM -font {Helvetica 9}
+button $p.actions.run -text "Refresh Area Analysis" -command {gui_run_stage "/area" "Area analysis"} -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat -padx 14 -pady 5
+pack $p.actions.note -side left -padx 8 -pady 5
+pack $p.actions.run -side right -padx 6 -pady 3
+pack forget $p
+
+# --- Page: APR ---
+set p [frame .toparea.right.pages.apr -bg $::C_BG]
+apr_tab_bar $p
+label $p.status -text "Signoff: NOT_RUN | DRC: NOT_RUN | LVS: NOT_RUN | DFT: NOT_RUN" -fg $::C_DIM -bg $::C_PANEL -font {Helvetica 9} -anchor w
+pack $p.status -fill x -padx 8 -pady {2 4}
+frame $p.main -bg $::C_BG
+pack $p.main -fill both -expand 1 -padx 6 -pady 4
+bind $p.main <Configure> {apr_main_configure %h}
+set apr_layout_frame [frame $p.main.layout -bg $::C_INPUT_BG]
+label $apr_layout_frame.title -text "  Floorplan / Placement / Routing" -fg $::C_HIGHLIGHT -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
+frame $apr_layout_frame.toolbar -bg $::C_PANEL
+button $apr_layout_frame.toolbar.fit -text "Fit" -command apr_zoom_fit -bg $::C_PANEL -fg $::C_TEXT -relief flat -padx 7
+button $apr_layout_frame.toolbar.one -text "1:1" -command {set ::apr_zoom 1.0; render_apr_layout} -bg $::C_PANEL -fg $::C_TEXT -relief flat -padx 7
+button $apr_layout_frame.toolbar.minus -text "−" -command apr_zoom_out -bg $::C_PANEL -fg $::C_TEXT -relief flat -padx 7
+button $apr_layout_frame.toolbar.plus -text "+" -command apr_zoom_in -bg $::C_PANEL -fg $::C_TEXT -relief flat -padx 7
+label $apr_layout_frame.toolbar.meta -text "Layout  |  waiting for APR data" -bg $::C_PANEL -fg $::C_DIM -font {Helvetica 8}
+pack $apr_layout_frame.toolbar.fit $apr_layout_frame.toolbar.one $apr_layout_frame.toolbar.minus $apr_layout_frame.toolbar.plus -side left -padx {3 0} -pady 2
+pack $apr_layout_frame.toolbar.meta -side right -padx 6
+frame $apr_layout_frame.body -bg $::C_INPUT_BG
+frame $apr_layout_frame.controls -bg $::C_INPUT_BG -width 145
+grid propagate $apr_layout_frame.controls 0
+label $apr_layout_frame.controls.header -text "DISPLAY CONTROLS" -fg $::C_HIGHLIGHT -bg $::C_PANEL -font {Helvetica 8 bold}
+pack $apr_layout_frame.controls.header -fill x
+label $apr_layout_frame.controls.objects_title -text "Objects" -fg $::C_DIM -bg $::C_INPUT_BG -anchor w -font {Helvetica 8 bold}
+pack $apr_layout_frame.controls.objects_title -fill x -padx 5 -pady {5 1}
+foreach {key label} {apr_show_cells "Standard cells (LEF size)" apr_show_cell_pins "Cell pin geometry" apr_show_fillers "DFM filler cells" apr_show_routes "Signal routes" apr_show_vias "Layer-transition vias" apr_show_critical "Critical path" apr_show_heatmap "Physical heatmap" apr_show_pins "I/O pins and labels" apr_clock_only "Clock nets only"} {
+    checkbutton $apr_layout_frame.controls.$key -text $label -variable ::$key -command render_apr_layout \
+        -bg $::C_INPUT_BG -fg $::C_TEXT -activebackground $::C_INPUT_BG -activeforeground $::C_HIGHLIGHT \
+        -selectcolor $::C_PANEL -anchor w -font {Helvetica 8}
+    pack $apr_layout_frame.controls.$key -fill x -padx 4 -pady 1
+}
+label $apr_layout_frame.controls.layers_title -text "Routing layers" -fg $::C_DIM -bg $::C_INPUT_BG -anchor w -font {Helvetica 8 bold}
+pack $apr_layout_frame.controls.layers_title -fill x -padx 5 -pady {7 1}
+frame $apr_layout_frame.controls.layers -bg $::C_INPUT_BG
+pack $apr_layout_frame.controls.layers -fill x
+label $apr_layout_frame.controls.count -text "Cells: 0  |  Layers: 0" -fg $::C_DIM -bg $::C_INPUT_BG -justify left -anchor w -font {Helvetica 8}
+pack $apr_layout_frame.controls.count -fill x -padx 5 -pady {8 2}
+frame $apr_layout_frame.viewer -bg $::C_INPUT_BG
+# Grid every direct child of the physical workspace.  Pack had retained the
+# canvas's 480px initial request after the outer APR page grew, which created
+# the lower-half thumbnail reported during vertical window resizing.
+grid $apr_layout_frame.title -row 0 -column 0 -sticky ew -pady {3 2}
+grid $apr_layout_frame.toolbar -row 1 -column 0 -sticky ew
+grid $apr_layout_frame.body -row 2 -column 0 -sticky news
+grid rowconfigure $apr_layout_frame 2 -weight 1
+grid columnconfigure $apr_layout_frame 0 -weight 1
+grid $apr_layout_frame.controls -in $apr_layout_frame.body -row 0 -column 0 -sticky ns -padx {3 2} -pady 3
+grid $apr_layout_frame.viewer -in $apr_layout_frame.body -row 0 -column 1 -sticky news -padx {1 3} -pady 3
+grid rowconfigure $apr_layout_frame.body 0 -weight 1
+grid columnconfigure $apr_layout_frame.body 1 -weight 1
+grid columnconfigure $apr_layout_frame.body 0 -minsize 145
+canvas $apr_layout_frame.viewer.canvas -bg $::C_INPUT_BG -highlightthickness 0 -cursor fleur
+set ::apr_canvas_path $apr_layout_frame.viewer.canvas
+bind $apr_layout_frame.viewer.canvas <Configure> {apr_canvas_configure %w %h}
+bind $apr_layout_frame.viewer.canvas <ButtonPress-1> {apr_pan_mark %x %y}
+bind $apr_layout_frame.viewer.canvas <B1-Motion> {apr_pan_drag %x %y}
+bind $apr_layout_frame.viewer.canvas <MouseWheel> {if {%D > 0} {apr_zoom_in} else {apr_zoom_out}}
+bind $apr_layout_frame.viewer.canvas <Button-4> {apr_zoom_in}
+bind $apr_layout_frame.viewer.canvas <Button-5> {apr_zoom_out}
+grid $apr_layout_frame.viewer.canvas -row 0 -column 0 -sticky news
+grid rowconfigure $apr_layout_frame.viewer 0 -weight 1
+grid columnconfigure $apr_layout_frame.viewer 0 -weight 1
+set apr_report_frame [frame $p.main.report -bg $::C_INPUT_BG]
+panedwindow $apr_report_frame.split -orient vertical -bg $::C_BORDER -sashwidth 4
+pack $apr_report_frame.split -fill both -expand 1 -padx 2 -pady 2
+set apr_chart_frame [frame $apr_report_frame.split.chart -bg $::C_INPUT_BG]
+label $apr_chart_frame.title -text "  APR Physical Analytics" -fg $::C_HIGHLIGHT -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
+pack $apr_chart_frame.title -fill x
+canvas $apr_chart_frame.canvas -bg $::C_INPUT_BG -highlightthickness 0 -height 220
+bind $apr_chart_frame.canvas <Configure> {after idle render_apr_dashboard}
+pack $apr_chart_frame.canvas -fill both -expand 1
+set apr_details_frame [frame $apr_report_frame.split.details -bg $::C_INPUT_BG]
+label $apr_details_frame.title -text "  Physical Signoff Report" -fg $::C_HIGHLIGHT -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
+pack $apr_details_frame.title -fill x -pady {1 2}
+text $apr_details_frame.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 9} -highlightbackground $::C_BORDER -state disabled -wrap none
+scrollbar $apr_details_frame.scroll -command [list $apr_details_frame.out yview] -bg $::C_PANEL -troughcolor $::C_BG
+$apr_details_frame.out configure -yscrollcommand [list $apr_details_frame.scroll set]
+pack $apr_details_frame.scroll -side right -fill y
+pack $apr_details_frame.out -fill both -expand 1 -padx 2 -pady 2
+$apr_report_frame.split add $apr_chart_frame -height 235 -minsize 150 -stretch always -sticky news
+$apr_report_frame.split add $apr_details_frame -height 285 -minsize 170 -stretch always -sticky news
+# A classic Tk panedwindow preserves the children's initial height request
+# during a vertical toplevel resize.  The physical viewer must instead remain
+# proportional to its parent at every window height, so use a weighted grid.
+# The report is still split vertically for its chart and detailed table.
+grid $apr_layout_frame -in $p.main -row 0 -column 0 -sticky news -padx {0 3}
+grid $apr_report_frame -in $p.main -row 0 -column 1 -sticky news -padx {3 0}
+grid rowconfigure $p.main 0 -weight 1
+grid columnconfigure $p.main 0 -weight 7 -minsize 420
+grid columnconfigure $p.main 1 -weight 3 -minsize 280
+frame $p.actions -bg $::C_PANEL
+pack $p.actions -side bottom -fill x -padx 6 -pady {0 5}
+label $p.actions.note -text "Native floorplan, placement, CTS, routing, extraction, timing, power, IR and signoff." -bg $::C_PANEL -fg $::C_DIM -font {Helvetica 9}
+button $p.actions.refresh -text "Refresh Results" -command refresh_apr_page -bg $::C_PANEL -fg $::C_TEXT -relief flat -padx 10 -pady 5
+button $p.actions.run -text "Run APR" -command {gui_run_stage "/apr run" "Native APR"} -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat -padx 14 -pady 5
+pack $p.actions.note -side left -padx 8 -pady 5
+pack $p.actions.run -side right -padx 6 -pady 3
+pack $p.actions.refresh -side right -padx 2 -pady 3
+after idle {set_apr_view layout}
 pack forget $p
 
 # --- Page: Formal ---
 set p [frame .toparea.right.pages.formal -bg $::C_BG]
+formal_tab_bar $p
 frame $p.toolbar -bg $::C_PANEL; pack $p.toolbar -fill x
 button $p.toolbar.run -text "Run Verification" -command {console_log "ai_digital ▸ /formal $::current_module" "cmd"; pipe_send "/formal $::current_module"} -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat -padx 8
 pack $p.toolbar.run -side left -padx 4 -pady 2
 label $p.toolbar.rl -text "Result: " -fg $::C_DIM -bg $::C_PANEL; pack $p.toolbar.rl -side left -padx 8
+label $p.toolbar.stages -text "Stages: RTL→Synth NOT_RUN | RTL→APR NOT_RUN | Synth→APR NOT_RUN" -fg $::C_DIM -bg $::C_PANEL -font {Helvetica 8}
+pack $p.toolbar.stages -side right -padx 6
 label $p.result -text "  (not run)  " -fg $::C_DIM -bg $::C_INPUT_BG -font {Helvetica 12 bold} -bd 1 -highlightbackground $::C_BORDER -highlightthickness 1
 pack $p.result -side left
 panedwindow $p.hpane -orient horizontal -bg $::C_BORDER -sashwidth 4
@@ -3556,18 +4744,19 @@ frame $formal_report_frame.bar -bg $::C_PANEL
 pack $formal_report_frame.bar -fill x
 label $formal_report_frame.bar.title -text "  Formal Report" -fg $::C_HIGHLIGHT -bg $::C_PANEL -font {Helvetica 9 bold}
 pack $formal_report_frame.bar.title -side left -padx 4 -pady 2
-text $p.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
-pack $p.out -fill both -expand 1 -in $formal_report_frame -padx 2 -pady 2
+text $formal_report_frame.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -bd 1 -font {Courier 10} -highlightbackground $::C_BORDER -state disabled
+pack $formal_report_frame.out -fill both -expand 1 -padx 2 -pady 2
 set formal_points_frame [frame $p.hpane.points -bg $::C_INPUT_BG]
 frame $formal_points_frame.bar -bg $::C_PANEL
 pack $formal_points_frame.bar -fill x
 label $formal_points_frame.bar.title -text "  Verified Equivalence Points" -fg $::C_HIGHLIGHT -bg $::C_PANEL -font {Helvetica 9 bold}
 pack $formal_points_frame.bar.title -side left -padx 4 -pady 2
-canvas $p.points_canvas -bg $::C_INPUT_BG -highlightthickness 0
-bind $p.points_canvas <Configure> {after idle render_formal_points_graph}
-pack $p.points_canvas -fill both -expand 1 -in $formal_points_frame -padx 2 -pady 2
+canvas $formal_points_frame.points_canvas -bg $::C_INPUT_BG -highlightthickness 0
+bind $formal_points_frame.points_canvas <Configure> {after idle render_formal_points_graph}
+pack $formal_points_frame.points_canvas -fill both -expand 1 -padx 2 -pady 2
 $p.hpane add $formal_report_frame -width 520 -sticky news
 $p.hpane add $formal_points_frame -width 420 -sticky news
+after idle {set_formal_view rtl_gate}
 pack forget $p
 
 # --- Page: Summary ---
@@ -3580,10 +4769,10 @@ pack $p.header.m -side left -padx 4 -pady 2; pack $p.header.v -side left; pack $
 panedwindow $p.hpane -orient horizontal -bg $::C_BORDER -sashwidth 4
 pack $p.hpane -fill both -expand 1 -padx 6 -pady 0
 set metrics_frame [frame $p.hpane.metrics -bg $::C_INPUT_BG]
-frame $p.body -bg $::C_INPUT_BG -bd 1 -highlightbackground $::C_BORDER -highlightthickness 1
-pack $p.body -fill both -expand 1 -in $metrics_frame
+frame $metrics_frame.body -bg $::C_INPUT_BG -bd 1 -highlightbackground $::C_BORDER -highlightthickness 1
+pack $metrics_frame.body -fill both -expand 1
 foreach {key label} {lint "Lint Check" synth "Synthesis" area "Area" timing "Timing" power "Power" formal "Formal Verification"} {
-    set row [frame $p.body.$key -bg $::C_INPUT_BG]; pack $row -fill x -ipady 4
+    set row [frame $metrics_frame.body.$key -bg $::C_INPUT_BG]; pack $row -fill x -ipady 4
     label $row.m -text "  $label" -fg $::C_TEXT -bg $::C_INPUT_BG -width 20 -anchor w -font {Helvetica 10}
     label $row.v -text "-" -fg $::C_DIM -bg $::C_INPUT_BG -width 25 -anchor w -font {Helvetica 10}
     label $row.s -text "○" -fg $::C_DIM -bg $::C_INPUT_BG -width 8 -anchor w -font {Helvetica 10}

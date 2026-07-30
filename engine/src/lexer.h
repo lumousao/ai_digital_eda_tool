@@ -3,7 +3,7 @@
  *
  * References:
  * - Verilator src/V3Lex.cpp
- * - Yosys frontends/verilog/verilog_lexer.l
+ * - Native Verilog lexical analysis
  */
 
 #ifndef LEXER_H

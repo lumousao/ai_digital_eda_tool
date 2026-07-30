@@ -235,8 +235,13 @@ public: // temporarily public for debugging
         std::string r;
         for (char c : s) {
             if (c == ' ' || c == '\t' || c == '(' || c == ')') continue;
-            // Normalize: '*' → '*' (keep), '+' → '+' (keep), '!' → '!' (keep)
-            r += c;
+            // Liberty source data commonly uses '&'/'|' while the native
+            // RTL mapper uses '*'/'+'.  Canonicalize both spellings before
+            // comparison so imported foundry libraries retain their native
+            // Boolean functions without leaving generic cells unmapped.
+            if (c == '&') r += '*';
+            else if (c == '|') r += '+';
+            else r += c;
         }
         return r;
     }

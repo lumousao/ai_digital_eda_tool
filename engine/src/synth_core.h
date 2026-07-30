@@ -7,8 +7,8 @@
  * - passes/opt/opt_expr.cc: Expression optimization
  * - frontends/verilog/verilog_parser.y: Verilog parsing
  *
- * This is a simplified reimplementation inspired by open-source EDA,
- * not a direct copy of Yosys code.
+ * This is a local synthesis implementation using the repository's own RTLIL
+ * compatibility data structures and pass orchestration.
  */
 
 #ifndef SYNTH_CORE_H
@@ -20,12 +20,12 @@
 #include <map>
 #include <functional>
 
-namespace YosysCore {
+namespace NativeSynthCore {
 
 /**
  * Synthesis engine that converts behavioral RTL to gate-level netlist.
  *
- * Synthesis flow (reference: Yosys passes/synth/synth.cc):
+ * Synthesis flow:
  * 1. proc: Convert always blocks to switch/assignment trees
  * 2. opt: Optimize expressions (const folding, dead code)
  * 3. techmap: Map to technology primitives (AND, OR, NOT, etc.)
@@ -70,7 +70,7 @@ public:
     std::string to_verilog(RTLIL::Module *module);
 
 private:
-    // Synthesis passes (reference: Yosys passes/synth/)
+    // Native synthesis passes
     void proc_extract(RTLIL::Module *module);
     void opt_expr(RTLIL::Module *module);
     void techmap(RTLIL::Module *module);
@@ -82,6 +82,6 @@ private:
     void map_mul(RTLIL::Module *module, RTLIL::Cell *cell);
 };
 
-} // namespace YosysCore
+} // namespace NativeSynthCore
 
-#endif /* YOSYS_CORE_H */
+#endif /* NATIVE_SYNTH_CORE_H */

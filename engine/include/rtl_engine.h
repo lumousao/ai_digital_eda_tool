@@ -318,6 +318,20 @@ typedef struct SynthResult {
     size_t num_cell_types;    /* Number of cell types */
 } SynthResult;
 
+typedef struct RtlSynthesisOptions {
+    int constprop;
+    int dead_code_elimination;
+    int common_subexpression_elimination;
+    int expression_optimization;
+    int demorgan;
+    int width_reduction;
+    int resource_sharing;
+    int fsm_extraction;
+    int logic_minimization;
+    int retiming;
+    int boundary_optimization;
+} RtlSynthesisOptions;
+
 /**
  * Run real logic synthesis on RTL code.
  * Generates a gate-level netlist with standard cell instances.
@@ -339,6 +353,11 @@ SynthResult rtl_synthesize_real(const char *rtl_code, const char *module_name);
  */
 SynthResult rtl_synthesize_real_with_lib(const char *rtl_code, const char *module_name,
                                           const char *liberty_path);
+
+/** Run native logic synthesis with an explicit per-pass policy. */
+SynthResult rtl_synthesize_real_with_options(const char *rtl_code, const char *module_name,
+                                              const char *liberty_path,
+                                              const RtlSynthesisOptions *options);
 
 /**
  * Frequency-optimized synthesis.

@@ -1,5 +1,5 @@
 /**
- * Optimization Passes - Industrial-grade implementation based on Yosys
+ * Optimization Passes - local RTL optimization implementation
  *
  * Features:
  * - Constant propagation

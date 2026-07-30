@@ -9,6 +9,7 @@ use colored::Colorize;
 
 #[allow(unused_imports)]
 use crate::agent::{Agent, ThinkingMode};
+use crate::apr::{self, AprConfig};
 use crate::data_api::{DataApi, FlowSnapshotBuilder, FlowDecision, FlowAction};
 use crate::gui_exchange::{self, GuiSyncContext, GuiTechnologyCorner};
 use crate::engine::{self, Design, LintResult, SynthStats, TimingReport};
@@ -244,9 +245,45 @@ fn guarded_decision_after_bad_llm_format(
 
 #[cfg(test)]
 mod compact_decision_tests {
-    use super::{guarded_decision_after_bad_llm_format, parse_compact_llm_decision, DetailLogger};
+    use super::{guarded_decision_after_bad_llm_format, parse_compact_llm_decision, DetailLogger, Repl};
     use crate::data_api::FlowAction;
+    use crate::engine::PowerAnalysisResult;
+    use crate::tech::{CornerType, LibCorner};
     use std::fs;
+    use std::path::PathBuf;
+
+    fn power_corner(name: &str, corner_type: CornerType, voltage: f64, temperature: f64) -> LibCorner {
+        LibCorner {
+            file_path: PathBuf::new(),
+            lib_name: name.to_string(),
+            process: "test55".to_string(),
+            corner_type,
+            voltage,
+            temperature,
+            process_value: 1.0,
+            rc_type: "typ".to_string(),
+            short_name: name.to_string(),
+            cell_count: 1,
+            time_unit: "1ns".to_string(),
+            voltage_unit: "1V".to_string(),
+            leakage_power_unit: "1nW".to_string(),
+            capacitive_load_unit: "1pf".to_string(),
+            default_operating_conditions: "OP".to_string(),
+        }
+    }
+
+    fn baseline_power() -> PowerAnalysisResult {
+        PowerAnalysisResult {
+            total_power_uw: 130.0,
+            static_power_uw: 20.0,
+            dynamic_power_uw: 110.0,
+            internal_power_uw: 40.0,
+            switching_power_uw: 50.0,
+            clock_power_uw: 20.0,
+            leakage_power_uw: 20.0,
+            report: "Power Analysis Report (estimated)".to_string(),
+        }
+    }
 
     #[test]
     fn compact_decision_requires_an_exact_action_token() {
@@ -306,8 +343,31 @@ mod compact_decision_tests {
         let contents = fs::read_to_string(&path).expect("read detail log");
         assert!(contents.contains("first-entry"));
         assert!(contents.contains("second-entry"));
-        assert_eq!(contents.matches("AI Digital v0.6.8 Detail Log").count(), 1);
+        assert_eq!(contents.matches("AI Digital v0.7.0 Detail Log").count(), 1);
         fs::remove_dir_all(&dir).expect("remove temporary log directory");
+    }
+
+    #[test]
+    fn estimated_pvt_power_is_distinct_and_conserves_components() {
+        let reference = power_corner("tt_1p20_25", CornerType::TT, 1.20, 25.0);
+        let fast_hot = power_corner("ff_1p32_125", CornerType::FF, 1.32, 125.0);
+        let slow_cold = power_corner("ss_1p08_m40", CornerType::SS, 1.08, -40.0);
+        let mut tt = baseline_power();
+        let mut ff = baseline_power();
+        let mut ss = baseline_power();
+
+        Repl::apply_estimated_pvt_scaling(&mut tt, &reference, &reference);
+        Repl::apply_estimated_pvt_scaling(&mut ff, &fast_hot, &reference);
+        Repl::apply_estimated_pvt_scaling(&mut ss, &slow_cold, &reference);
+
+        for result in [&tt, &ff, &ss] {
+            assert!((result.total_power_uw - result.static_power_uw - result.dynamic_power_uw).abs() < 1e-9);
+            assert!(result.report.contains("ESTIMATED_PVT"));
+        }
+        assert!((tt.total_power_uw - ff.total_power_uw).abs() > 1.0);
+        assert!((tt.total_power_uw - ss.total_power_uw).abs() > 1.0);
+        assert!(ff.static_power_uw > tt.static_power_uw);
+        assert!(ss.static_power_uw < tt.static_power_uw);
     }
 }
 
@@ -353,7 +413,7 @@ impl DetailLogger {
         let mut writer = std::io::BufWriter::new(file);
         use std::io::Write;
         if new_file {
-            let _ = writeln!(writer, "=== AI Digital v0.6.8 Detail Log ===");
+            let _ = writeln!(writer, "=== AI Digital v0.7.0 Detail Log ===");
             let _ = writeln!(writer, "=== JSON-line format: [timestamp] [LEVEL] [CATEGORY] {{json data}} ===");
         }
         let _ = writer.flush();
@@ -967,11 +1027,12 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/synth", "             - Synthesize current RTL"),
     ("/sim", "               - Run simulation on current RTL"),
     ("/formal", "            - Run formal verification"),
-    ("/full", "              - Run full flow (sim + synth + formal)"),
+    ("/full", "              - Run complete local flow (sim + synth + STA/power + APR + 3-stage formal)"),
     ("/stats", "             - Show synthesis statistics"),
     ("/area", "              - Show area report"),
     ("/timing", "            - Run timing analysis"),
     ("/power", "             - Show power report"),
+    ("/apr", "               - Run/configure native floorplan, P&R, OCV and IR analysis"),
     ("/flow run", "          - Run LLM-driven full flow"),
     ("/flow status", "       - Show flow progress"),
     ("/flow decide", "       - Manually trigger LLM flow decision"),
@@ -981,6 +1042,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/libs", "              - List available liberty libraries"),
     ("/api", "               - Show/switch API configuration"),
     ("/config", "            - Show configuration"),
+    ("/opt", "               - Configure native synthesis optimization passes"),
     ("/set", "               - Set parameter (e.g. /set freq 200)"),
     ("/reset", "             - Reset design state"),
     ("/clean", "             - Clean workspace files"),
@@ -1509,6 +1571,8 @@ pub struct Repl {
     gui_step_status: String,
     gui_status_text: String,
     gui_last_error: String,
+    synthesis_options: project::SynthesisOptions,
+    apr_options: project::AprOptions,
 }
 
 // LLM decision enum for step-wise consultation
@@ -1571,6 +1635,8 @@ impl Repl {
             gui_step_status: "idle".to_string(),
             gui_status_text: String::new(),
             gui_last_error: String::new(),
+            synthesis_options: project::SynthesisOptions::default(),
+            apr_options: project::AprOptions::default(),
         }
     }
 
@@ -1651,6 +1717,7 @@ impl Repl {
             last_error: self.gui_last_error.clone(),
             active_technology,
             technology_corners,
+            synthesis_options: self.synthesis_options.clone(),
         };
 
         match gui_exchange::write_state(&ctx) {
@@ -1768,6 +1835,8 @@ impl Repl {
 
         if let Some(config) = self.project_manager.load_config() {
             self.constraint_freq = config.clock_frequency_mhz.round().max(1.0) as i32;
+            self.synthesis_options = config.synthesis_options;
+            self.apr_options = config.apr_options;
             if let Some(technology) = config.technology {
                 if self.corner_db.set_active_process(&technology).is_err() {
                     self.gui_last_error = format!("Saved technology '{}' is not available", technology);
@@ -1795,7 +1864,76 @@ impl Repl {
         config.technology = self.corner_db.active_process.clone();
         config.liberty_file = self.corner_db.get_default_liberty()
             .map(|path| path.to_string_lossy().to_string());
+        config.synthesis_options = self.synthesis_options.clone();
+        config.apr_options = self.apr_options.clone();
         self.project_manager.save_config(&config)
+    }
+
+    /// Run a technology-data gate before any flow branch can ask an LLM to
+    /// repair source code.  A bad/partial PDK is external design input, not a
+    /// semantic RTL fault.  The report is persisted for both CLI and GUI and
+    /// deliberately contains no retry path.
+    fn technology_preflight(&mut self, project_dir: &Path, require_power_signoff: bool) -> Result<(), String> {
+        let coverage = self.corner_db.active_coverage()
+            .ok_or_else(|| "TECHNOLOGY_COVERAGE_BLOCKED: no active technology library".to_string())?;
+        let report_dir = project_dir.join("report");
+        fs::create_dir_all(&report_dir).map_err(|e| e.to_string())?;
+        fs::write(report_dir.join("technology_coverage_report.txt"), coverage.text_report())
+            .map_err(|e| e.to_string())?;
+        let json = serde_json::to_string_pretty(&coverage).map_err(|e| e.to_string())?;
+        fs::write(report_dir.join("technology_coverage_report.json"), json)
+            .map_err(|e| e.to_string())?;
+
+        if let Some(ref mut logger) = self.detail_logger {
+            logger.log("TECHNOLOGY", "COVERAGE", &format!(
+                "\"technology\":\"{}\",\"synthesis_ready\":{},\"power_signoff_ready\":{},\"apr_ready\":{},\"findings\":\"{}\"",
+                coverage.technology, coverage.synthesis_ready, coverage.power_signoff_ready,
+                coverage.apr_ready, coverage.blocked_reason().replace('"', "'")
+            ));
+        }
+        let allowed = coverage.synthesis_ready && (!require_power_signoff || coverage.power_signoff_ready);
+        if !allowed {
+            let category = if require_power_signoff { "POWER_SIGNOFF_BLOCKED" } else { "TECHNOLOGY_COVERAGE_BLOCKED" };
+            let reason = format!("{}: {}. See report/technology_coverage_report.txt", category, coverage.blocked_reason());
+            self.last_iteration_reason = reason.clone();
+            self.gui_set_step("technology", "blocked", &reason);
+            return Err(reason);
+        }
+        Ok(())
+    }
+
+    /// Check the result of technology mapping.  This second gate catches
+    /// Liberty files that look complete by name but do not expose compatible
+    /// Boolean functions to the native mapper.  It is intentionally evaluated
+    /// before every synthesis-review/optimization decision.
+    fn validate_mapped_technology(&mut self, project_dir: &Path, synth_info: &SynthInfo) -> Result<(), String> {
+        let residual = synth_info.cells.iter()
+            .filter(|(cell, count)| *count > 0 && cell.starts_with("$_"))
+            .map(|(cell, count)| format!("{} x{}", cell, count))
+            .collect::<Vec<_>>();
+        let report_path = project_dir.join("report").join("technology_mapping_coverage.txt");
+        let mut report = String::from("Technology Mapping Coverage\n===========================\n");
+        report.push_str(&format!("Technology: {}\n", self.corner_db.active_process.as_deref().unwrap_or("none")));
+        report.push_str(&format!("Mapped cells: {}\n", synth_info.cell_count));
+        report.push_str(&format!("Residual generic cells: {}\n", if residual.is_empty() { "none".to_string() } else { residual.join(", ") }));
+        if residual.is_empty() {
+            report.push_str("Status: READY\nAll synthesized instances have concrete technology cell names.\n");
+            let _ = fs::write(report_path, report);
+            return Ok(());
+        }
+        report.push_str("Status: TECHNOLOGY_COVERAGE_BLOCKED\nA concrete PDK mapping is required before timing, power, APR, or automatic source changes.\n");
+        let _ = fs::write(report_path, report);
+        let reason = format!(
+            "TECHNOLOGY_COVERAGE_BLOCKED: {} generic netlist cells remain unmapped ({})",
+            residual.iter().filter_map(|entry| entry.rsplit_once('x').and_then(|(_, count)| count.parse::<usize>().ok())).sum::<usize>(),
+            residual.join(", ")
+        );
+        self.last_iteration_reason = reason.clone();
+        if let Some(ref mut logger) = self.detail_logger {
+            logger.log("TECHNOLOGY", "MAPPING_BLOCKED", &format!("\"reason\":\"{}\"", reason.replace('"', "'")));
+        }
+        self.gui_set_step("technology", "blocked", &reason);
+        Err(reason)
     }
 
     fn detect_project_module(&self, project_dir: &Path) -> Option<String> {
@@ -1914,8 +2052,8 @@ impl Repl {
         // Log initial system state
         if let Some(ref mut logger) = self.detail_logger {
             let sys = engine::get_system_info();
-            logger.log_separator("AI Digital v0.6.8 Session Start");
-            logger.log("SYS", "INIT", &format!("\"version\":\"0.6.8\",\"cpu_cores\":{},\"cpu_threads\":{},\"cpu_model\":\"{}\",\"total_ram_mb\":{},\"available_ram_mb\":{},\"load_1min\":{:.2},\"process_rss_mb\":{}",
+            logger.log_separator("AI Digital v0.7.0 Session Start");
+            logger.log("SYS", "INIT", &format!("\"version\":\"0.7.0\",\"cpu_cores\":{},\"cpu_threads\":{},\"cpu_model\":\"{}\",\"total_ram_mb\":{},\"available_ram_mb\":{},\"load_1min\":{:.2},\"process_rss_mb\":{}",
                 sys.cpu_cores, sys.cpu_threads, sys.cpu_model, sys.total_ram_mb, sys.available_ram_mb, sys.load_1min, sys.process_rss_mb));
             logger.log("SYS", "PROJECT", &format!("\"path\":\"{}\"", project_dir.display()));
             // Log configuration
@@ -1951,7 +2089,7 @@ impl Repl {
 
     pub fn run(&mut self) {
         oprintln!("{}", "╔══════════════════════════════════════════╗".bright_cyan());
-        oprintln!("{}", "║        AI Digital v0.6.8                 ║".bright_cyan());
+        oprintln!("{}", "║        AI Digital v0.7.0                 ║".bright_cyan());
         oprintln!("{}", "║  Generate · Lint · Synthesize · Optimize ║".bright_cyan());
         oprintln!("{}", "╚══════════════════════════════════════════╝".bright_cyan());
         oprintln!();
@@ -1985,9 +2123,15 @@ impl Repl {
         loop {
             let project_name = self.project_manager.current_name()
                 .unwrap_or_else(|| "no project".to_string());
+            let prompt_color = match self.turn_count % 4 {
+                1 => "ai_digital".bright_magenta().bold(),
+                2 => "ai_digital".bright_blue().bold(),
+                3 => "ai_digital".bright_green().bold(),
+                _ => "ai_digital".bright_cyan().bold(),
+            };
             let prompt = format!(
                 "{} {} {} {} ",
-                "ai_digital".bright_cyan().bold(),
+                prompt_color,
                 "│".bright_black(),
                 format!("project:{}", project_name).bright_white(),
                 "▸".bright_green().bold()
@@ -2118,6 +2262,7 @@ impl Repl {
             "/quit" | "/exit" | "/q" | "quit" | "exit" | "q" => return true,
             "/help" | "/h" => self.show_help(),
             "/config" => self.show_config(),
+            "/opt" | "/options" => self.cmd_optimization_options(args),
             "/modules" => self.show_modules(),
             "/tech" => self.cmd_tech(args),
             "/libs" => self.cmd_libs(),
@@ -2131,6 +2276,7 @@ impl Repl {
             "/area" => self.cmd_area(),
             "/timing" => self.cmd_timing(args),
             "/power" => self.cmd_power(),
+            "/apr" | "/physical" => self.cmd_apr(args),
             "/export" => self.cmd_export(args),
             "/api" => self.cmd_api(args),
             "/project" => self.cmd_project(args),
@@ -2178,7 +2324,124 @@ impl Repl {
         oprintln!("  {}:", "Configuration".bright_cyan().bold());
         oprintln!("    {}", self.llm.config_summary());
         oprintln!("    Workspace: {}", self.workspace.display());
+        oprintln!("    Full-flow stages: lint, simulation, synthesis, timing, power, formal, reports (mandatory)");
+        oprintln!("    Use /opt to configure semantics-preserving synthesis passes.");
         oprintln!();
+    }
+
+    fn print_optimization_options(&self) {
+        oprintln!("  {}", "Native Synthesis Optimization Policy".bright_cyan().bold());
+        oprintln!("    Full-flow stages are fixed and always run. Only local, semantics-preserving passes are configurable.");
+        for (name, enabled, description) in [
+            ("constprop", self.synthesis_options.constprop, "constant propagation"),
+            ("dead_code_elimination", self.synthesis_options.dead_code_elimination, "remove unreachable/redundant logic"),
+            ("common_subexpression_elimination", self.synthesis_options.common_subexpression_elimination, "share identical combinational expressions"),
+            ("expression_optimization", self.synthesis_options.expression_optimization, "simplify Boolean expressions"),
+            ("demorgan", self.synthesis_options.demorgan, "DeMorgan/inverter normalization"),
+            ("width_reduction", self.synthesis_options.width_reduction, "reduce proven-unused signal widths"),
+            ("resource_sharing", self.synthesis_options.resource_sharing, "share compatible combinational resources"),
+            ("fsm_extraction", self.synthesis_options.fsm_extraction, "extract and optimize combinational FSM logic"),
+            ("logic_minimization", self.synthesis_options.logic_minimization, "two-level and local logic minimization"),
+            ("retiming", self.synthesis_options.retiming, "safe combinational retiming transform"),
+            ("boundary_optimization", self.synthesis_options.boundary_optimization, "cross-module combinational boundary cleanup"),
+        ] {
+            let state = if enabled { "ON".green() } else { "OFF".yellow() };
+            oprintln!("    {:<14} {:<16} {}", name, state, description.dimmed());
+        }
+    }
+
+    fn set_synthesis_option(&mut self, name: &str, enabled: bool) -> Result<(), String> {
+        match name {
+            "constprop" => self.synthesis_options.constprop = enabled,
+            "dead_code_elimination" | "dce" => self.synthesis_options.dead_code_elimination = enabled,
+            "common_subexpression_elimination" | "cse" => self.synthesis_options.common_subexpression_elimination = enabled,
+            "expression_optimization" | "expr_opt" => self.synthesis_options.expression_optimization = enabled,
+            "demorgan" => self.synthesis_options.demorgan = enabled,
+            "width_reduction" | "wreduce" => self.synthesis_options.width_reduction = enabled,
+            "resource_sharing" | "resource_share" => self.synthesis_options.resource_sharing = enabled,
+            "fsm_extraction" | "fsm_extract" => self.synthesis_options.fsm_extraction = enabled,
+            "logic_minimization" | "logic_min" => self.synthesis_options.logic_minimization = enabled,
+            "retiming" => self.synthesis_options.retiming = enabled,
+            "boundary_optimization" | "boundary_opt" => self.synthesis_options.boundary_optimization = enabled,
+            _ => return Err("Unknown pass. Run /opt show for the available native synthesis passes.".to_string()),
+        }
+        self.persist_project_technology()?;
+        self.gui_set_step("config", "passed", &format!("Synthesis pass {}: {}", name, if enabled { "ON" } else { "OFF" }));
+        Ok(())
+    }
+
+    fn cmd_optimization_options(&mut self, args: &str) {
+        let tokens: Vec<&str> = args.split_whitespace().collect();
+        if tokens.is_empty() {
+            oprintln!();
+            self.print_optimization_options();
+            if self.pipe_mode {
+                oprintln!("  Use /opt synth <pass> <on|off>, /opt show, or /opt reset.");
+                oprintln!();
+                return;
+            }
+            oprintln!("\n  Enter '<pass> <on|off>', 'show', 'reset', or 'done'.");
+            loop {
+                match terminal::readline("opt > ", &|_| Vec::new()) {
+                    Ok(line) => {
+                        let line = line.trim();
+                        if matches!(line, "done" | "exit" | "quit") { break; }
+                        if line == "show" { self.print_optimization_options(); continue; }
+                        if line == "reset" {
+                            self.synthesis_options = project::SynthesisOptions::default();
+                            match self.persist_project_technology() {
+                                Ok(()) => oprintln!("  {} Restored the verified default pass policy.", "✓".green()),
+                                Err(error) => oprintln!("  {} {}", "✗".red(), error),
+                            }
+                            continue;
+                        }
+                        let nested: Vec<&str> = line.split_whitespace().collect();
+                        let (pass, state) = match nested.as_slice() {
+                            [pass, state] => (*pass, *state),
+                            _ => { oprintln!("  Usage: <pass> <on|off>, show, reset, or done"); continue; }
+                        };
+                        let enabled = match state {
+                            "on" | "enable" => true,
+                            "off" | "disable" => false,
+                            _ => { oprintln!("  State must be on or off"); continue; }
+                        };
+                        match self.set_synthesis_option(pass, enabled) {
+                            Ok(()) => oprintln!("  {} {}: {}", "✓".green(), pass, if enabled { "ON" } else { "OFF" }),
+                            Err(error) => oprintln!("  {} {}", "✗".red(), error),
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            oprintln!();
+            return;
+        }
+        if tokens == ["show"] {
+            self.print_optimization_options();
+            return;
+        }
+        if tokens == ["reset"] {
+            self.synthesis_options = project::SynthesisOptions::default();
+            match self.persist_project_technology() {
+                Ok(()) => oprintln!("  {} Restored the verified default pass policy.", "✓".green()),
+                Err(error) => oprintln!("  {} {}", "✗".red(), error),
+            }
+            return;
+        }
+        let pass_index = if tokens.first() == Some(&"synth") { 1 } else { 0 };
+        if tokens.len() != pass_index + 2 {
+            oprintln!("  {} Usage: /opt synth <pass> <on|off>", "Hint:".yellow());
+            return;
+        }
+        let enabled = match tokens[pass_index + 1] {
+            "on" | "enable" => true,
+            "off" | "disable" => false,
+            _ => { oprintln!("  {} State must be on or off", "✗".red()); return; }
+        };
+        match self.set_synthesis_option(tokens[pass_index], enabled) {
+            Ok(()) => oprintln!("  {} {}: {}", "✓".green(), tokens[pass_index], if enabled { "ON" } else { "OFF" }),
+            Err(error) => oprintln!("  {} {}", "✗".red(), error),
+        }
     }
 
     fn show_modules(&self) {
@@ -2313,6 +2576,11 @@ impl Repl {
         let syn_dir = project_dir.join("syn");
         fs::create_dir_all(&syn_dir).ok();
 
+        if let Err(reason) = self.technology_preflight(&project_dir, false) {
+            oprintln!("  {} {}", "✗".red(), reason);
+            return;
+        }
+
         let rtl_code = self.current_rtl.as_ref().unwrap().clone();
 
         self.start_status(&format!("Synthesizing {}", mod_name));
@@ -2327,7 +2595,7 @@ impl Repl {
         }
 
         // Synthesize (same as process_all)
-        match self.run_yosys_synthesis(&rtl_code, &mod_name, &syn_dir) {
+        match self.run_native_synthesis(&rtl_code, &mod_name, &syn_dir) {
             Ok(synth_info) => {
                 self.stop_status("Synthesis completed", true);
                 oprintln!("  {} Synthesis completed", "✓".green());
@@ -2533,6 +2801,7 @@ impl Repl {
                                 dff_count: stats.dff_count,
                                 wire_count: stats.wire_count,
                                 area_ge: 0.0, area_um2: 0.0,
+                                cell_area_um2: std::collections::BTreeMap::new(),
                                 area_from_lib: false, lib_name: String::new(),
                                 cells: Vec::new(), total_gates: 0,
                                 port_count: 0, port_bits: 0, wire_bits: 0,
@@ -2623,7 +2892,7 @@ impl Repl {
         // Run synthesis first (needed for formal verification)
         self.start_status("Running synthesis for formal verification");
         self.gui_set_step("formal", "running", &format!("Formal verification for {}", mod_name));
-        let synth_result = self.run_yosys_synthesis(&rtl_code, &mod_name, &syn_dir);
+        let synth_result = self.run_native_synthesis(&rtl_code, &mod_name, &syn_dir);
 
         match synth_result {
             Ok(synth_info) => {
@@ -2637,11 +2906,13 @@ impl Repl {
                         if let Some(verdict) = FormalVerdict::from_report(&result) {
                             if verdict.is_equivalent() {
                                 self.stop_status("Formal verification: EQUIVALENT", true);
-                                oprintln!("  {} RTL vs gate-level: EQUIVALENT", "✓".green());
+                                oprintln!("  {} Formal: all equivalence stages passed", "✓".green());
+                                for line in result.lines().filter(|line| line.starts_with("Stage ")) { oprintln!("    {}", line); }
                                 self.gui_set_step("formal", "passed", "EQUIVALENT");
                             } else {
                                 self.stop_status("Formal verification: DIFFERENT", false);
-                                oprintln!("  {} RTL vs gate-level: DIFFERENT", "✗".red());
+                                oprintln!("  {} Formal: one or more equivalence stages failed or are blocked", "✗".red());
+                                for line in result.lines().filter(|line| line.starts_with("Stage ")) { oprintln!("    {}", line); }
                                 self.gui_set_step("formal", "failed", "DIFFERENT");
                             }
                         } else {
@@ -3053,24 +3324,95 @@ impl Repl {
                 .collect::<Vec<_>>()
         });
         results.sort_by_key(|(index, _, _)| *index);
-        for (_, result, _) in results.iter_mut() {
-            if gate_netlist.is_empty() || !result.power.report.contains("Power Analysis Report (estimated)") {
-                continue;
-            }
-            if let Some(lib_path) = self.corner_db.liberty_path_for_corner(&result.corner) {
-                let retry = engine::analyze_power_with_activity(
-                    &gate_netlist,
-                    module_name,
-                    &lib_path.to_string_lossy(),
-                    freq_mhz as f64,
-                    activity_json.as_deref(),
-                );
-                if retry.report.contains("Power Analysis Report (liberty NLDM)") {
-                    result.power = retry;
+
+        // A Liberty parser failure must never silently produce identical values
+        // for every PVT corner.  The native engine supplies a netlist/activity
+        // based baseline; apply the local, explicitly non-signoff PVT model at
+        // this layer where full corner metadata is available.  A retry cannot
+        // repair a deterministic parser failure and only repeats expensive work.
+        let reference_corner = corner_timings
+            .iter()
+            .map(|(corner, _)| corner)
+            .filter(|corner| corner.corner_type == CornerType::TT)
+            .min_by(|a, b| {
+                (a.temperature - 25.0).abs()
+                    .partial_cmp(&(b.temperature - 25.0).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.short_name.cmp(&b.short_name))
+            })
+            .or_else(|| corner_timings.first().map(|(corner, _)| corner));
+        if let Some(reference_corner) = reference_corner {
+            for (_, result, _) in results.iter_mut() {
+                if !Self::power_result_uses_liberty(result) {
+                    Self::apply_estimated_pvt_scaling(&mut result.power, &result.corner, reference_corner);
                 }
             }
         }
         results.into_iter().map(|(_, result, _)| result).collect()
+    }
+
+    /// Scale a netlist/activity power baseline for a characterized PVT corner.
+    /// This is deliberately conservative and is marked ESTIMATED_PVT throughout
+    /// the output. Dynamic power follows C*V^2*f with a small temperature and
+    /// process-capacitance term. Leakage follows voltage and a 46 C doubling
+    /// approximation, with FF/SS process multipliers. It is not an NLDM model.
+    fn apply_estimated_pvt_scaling(
+        power: &mut engine::PowerAnalysisResult,
+        corner: &LibCorner,
+        reference: &LibCorner,
+    ) {
+        let reference_voltage = reference.voltage.max(0.1);
+        let voltage_ratio = (corner.voltage.max(0.05) / reference_voltage).clamp(0.25, 3.0);
+        let delta_temperature = (corner.temperature - reference.temperature).clamp(-150.0, 150.0);
+        let (dynamic_process, leakage_process) = match corner.corner_type {
+            CornerType::FF => (1.06, 1.50),
+            CornerType::SS => (0.94, 0.60),
+            CornerType::TT => (1.00, 1.00),
+        };
+        let dynamic_scale = (voltage_ratio * voltage_ratio
+            * (1.0 + 0.0015 * delta_temperature).max(0.50)
+            * dynamic_process)
+            .clamp(0.10, 8.0);
+        let leakage_scale = (voltage_ratio.powf(1.5)
+            * (std::f64::consts::LN_2 * delta_temperature / 46.0).exp()
+            * leakage_process)
+            .clamp(0.02, 30.0);
+
+        power.leakage_power_uw *= leakage_scale;
+        power.static_power_uw = power.leakage_power_uw;
+        power.switching_power_uw *= dynamic_scale;
+        power.internal_power_uw *= dynamic_scale;
+        power.clock_power_uw *= dynamic_scale;
+        power.dynamic_power_uw = power.switching_power_uw
+            + power.internal_power_uw
+            + power.clock_power_uw;
+        power.total_power_uw = power.static_power_uw + power.dynamic_power_uw;
+        power.report = format!(
+            "Power Analysis Report (estimated PVT)\n\
+             ================================\n\
+             Source: ESTIMATED_PVT (not valid for signoff)\n\
+             Reference corner: {} {} {:.3}V {:.1}C\n\
+             Applied corner: {} {} {:.3}V {:.1}C\n\
+             Dynamic scale: {:.6} | Leakage scale: {:.6}\n\
+             Leakage: {:.2} uW | Internal: {:.2} uW\n\
+             Switching: {:.2} uW | Clock: {:.2} uW\n\
+             Total: {:.2} uW\n",
+            reference.short_name,
+            reference.corner_type,
+            reference.voltage,
+            reference.temperature,
+            corner.short_name,
+            corner.corner_type,
+            corner.voltage,
+            corner.temperature,
+            dynamic_scale,
+            leakage_scale,
+            power.leakage_power_uw,
+            power.internal_power_uw,
+            power.switching_power_uw,
+            power.clock_power_uw,
+            power.total_power_uw,
+        );
     }
 
     fn current_activity_json_for_power(&self, module_name: &str) -> Option<String> {
@@ -3106,6 +3448,16 @@ impl Repl {
         result.power.report.contains("Power Analysis Report (liberty NLDM)")
     }
 
+    fn power_result_source(result: &CornerPowerResult) -> &'static str {
+        if Self::power_result_uses_liberty(result) {
+            "NLDM"
+        } else if result.power.report.contains("Power Analysis Report (estimated PVT)") {
+            "ESTIMATED_PVT"
+        } else {
+            "ESTIMATED"
+        }
+    }
+
     fn all_power_results_use_liberty(results: &[CornerPowerResult]) -> bool {
         !results.is_empty() && results.iter().all(Self::power_result_uses_liberty)
     }
@@ -3135,7 +3487,7 @@ impl Repl {
                 result.power.static_power_uw,
                 result.power.dynamic_power_uw,
                 result.power.total_power_uw,
-                if Self::power_result_uses_liberty(result) { "NLDM" } else { "ESTIMATED" },
+                Self::power_result_source(result),
             ));
         }
         if !Self::all_power_results_use_liberty(results) {
@@ -3160,6 +3512,56 @@ impl Repl {
             final_llm_decision,
             formal_report,
         }
+    }
+
+    /// Persist the evidence collected before a power signoff gate blocks the flow.
+    /// A blocked signoff is still a completed analysis run, so every report must
+    /// describe the current netlist, timing, formal verdict, and PVT values.
+    fn write_blocked_power_report(
+        &self,
+        project_dir: &Path,
+        module_name: &str,
+        synth_info: &SynthInfo,
+        timing: Option<&TimingReport>,
+        scan_results: &[TimingReport],
+        corner_timings: &[(LibCorner, TimingReport)],
+        constraint_powers: &[CornerPowerResult],
+        max_powers: &[CornerPowerResult],
+        max_freq: i32,
+        lint_passed: bool,
+        formal_ok: Option<bool>,
+        formal_report: &str,
+        reason: &str,
+    ) {
+        let freq_ratio = if self.constraint_freq > 0 && max_freq > 0 {
+            max_freq as f64 / self.constraint_freq as f64
+        } else {
+            1.0
+        };
+        let decision = format!("POWER_SIGNOFF_BLOCKED: {}", reason);
+        let extras = self.build_report_extras(
+            Some(constraint_powers),
+            Some(max_powers),
+            Some(decision.as_str()),
+            Some(formal_report),
+        );
+        let _ = generate_report_rpt_with_extras(
+            project_dir,
+            module_name,
+            synth_info,
+            timing,
+            None,
+            self.constraint_freq,
+            max_freq,
+            freq_ratio,
+            "blocked",
+            Some(scan_results),
+            Some(corner_timings),
+            Some(true),
+            lint_passed,
+            formal_ok,
+            extras,
+        );
     }
 
     fn llm_decision_summary(step: &str, decision: &LlmDecision) -> String {
@@ -3491,6 +3893,11 @@ impl Repl {
         self.init_log();
         self.log(&format!("Module: {}", mod_name));
         self.log(&format!("Constraint: {} MHz\n", self.constraint_freq));
+        if let Err(reason) = self.technology_preflight(&project_dir, false) {
+            oprintln!("  {} {}", "✗".red(), reason);
+            self.stop_status("Technology coverage blocked", false);
+            return;
+        }
         // Log system info at flow start
         let flow_sys = engine::get_system_info();
         if let Some(ref mut logger) = self.detail_logger {
@@ -3519,7 +3926,7 @@ impl Repl {
 
         // === Step 1: Save/Auto-generate testbench ===
         self.start_status("Starting full flow...");
-        let mut steps = StepTracker::new(9);
+        let mut steps = StepTracker::new(10);
         steps.step("Saving testbench");
         let tb_code = if let Some(ref tb) = tb_code {
             fs::write(&tb_path, tb).ok();
@@ -3804,7 +4211,7 @@ impl Repl {
             logger.log_memory_usage("before_synthesis");
         }
         self.synth_verbose = true;
-        let synth_result = self.run_yosys_synthesis(&rtl_code, &mod_name, &syn_dir);
+        let synth_result = self.run_native_synthesis(&rtl_code, &mod_name, &syn_dir);
         self.synth_verbose = false;
         let synth_elapsed = synth_start.elapsed();
         let mem_after_synth = engine::get_process_memory_mb();
@@ -3825,6 +4232,12 @@ impl Repl {
                 ));
                 steps.substep(&format!("Logic depth: {} levels (estimated from combinational path)", synth_info.logic_depth));
                 steps.substep(&format!("Area: {:.0} GE (gate equivalents, 1 GE = 2-input NAND)", synth_info.area_ge));
+
+                if let Err(reason) = self.validate_mapped_technology(&project_dir, &synth_info) {
+                    steps.step_fail(&reason);
+                    self.stop_status("Technology mapping blocked", false);
+                    return;
+                }
 
                 // Pre-declare scale_corrected_synth for use in auto-fix iteration blocks
                 let mut scale_corrected_synth: Option<SynthInfo> = None;
@@ -3895,7 +4308,7 @@ impl Repl {
                                 }
                                 self.current_rtl = Some(new_rtl.clone());
                                 // Re-run synthesis with fixed RTL
-                                match self.run_yosys_synthesis(&new_rtl, &mod_name, &syn_dir) {
+                                match self.run_native_synthesis(&new_rtl, &mod_name, &syn_dir) {
                                     Ok(new_synth) => {
                                         let cell_cnt = new_synth.cell_count;
                                         let comb_cnt = cell_cnt.saturating_sub(new_synth.dff_count);
@@ -4064,7 +4477,7 @@ impl Repl {
                             }
                         }
                         // Re-synthesize with corrected RTL
-                        match self.run_yosys_synthesis(&updated_rtl, &mod_name, &syn_dir) {
+                        match self.run_native_synthesis(&updated_rtl, &mod_name, &syn_dir) {
                             Ok(new_synth) => {
                                 oprintln!("    {} Re-synthesis: {} cells, {:.0} GE, {} DFFs, depth {}",
                                     "✓".green(), new_synth.cell_count, new_synth.area_ge,
@@ -4378,7 +4791,23 @@ impl Repl {
                     }
                 }
 
-                // === Step 9: Formal verification ===
+                // === Step 9: Native APR ===
+                // APR is a mandatory physical implementation stage of the
+                // complete flow, not an optional post-processing command.
+                steps.step("Running native APR (floorplan, placement, route and signoff)");
+                steps.substep("Floorplan -> placement -> global route -> detail route -> DRC/LVS/DFT");
+                steps.update_log("Launching native physical implementation and post-route analyses...");
+                self.cmd_apr("run");
+                let apr_netlist = project_dir.join("apr").join("apr_netlist.v");
+                let apr_report = project_dir.join("apr").join("apr_report.json");
+                if !apr_netlist.is_file() || !apr_report.is_file() {
+                    steps.step_fail("APR did not produce required netlist/report artifacts");
+                    self.gui_set_error("APR did not produce required netlist/report artifacts");
+                    return;
+                }
+                steps.step_ok("APR floorplan, placement, route, DRC/LVS/DFT and physical analyses completed");
+
+                // === Step 10: Formal verification ===
                 let mut formal_ok = None;
                 let mut formal_report_text = String::new();
                 steps.step("Running formal verification (RTL vs Gate-level)");
@@ -4416,7 +4845,7 @@ impl Repl {
                                                 let _ = fs::write(src_dir.join(format!("{}.v", mod_name)), &new_rtl);
                                             }
                                             oprintln!("  {} RTL updated, re-running synthesis...", "✓".green());
-                                            match self.run_yosys_synthesis(&new_rtl, &mod_name, &syn_dir) {
+                                            match self.run_native_synthesis(&new_rtl, &mod_name, &syn_dir) {
                                                 Ok(_) => {
                                                     let new_formal = self.run_formal_verification(&new_rtl, &mod_name, &syn_dir, &formal_dir);
                                                     if let Ok(ref fr) = new_formal {
@@ -4546,41 +4975,79 @@ impl Repl {
                 }
 
                 if !constraint_corner_powers.is_empty() || !max_corner_powers.is_empty() {
+                    // Persist the freshly computed table before deciding whether
+                    // signoff may proceed. GUI synchronization must show this
+                    // run's PVT values even when a source-quality gate fails.
+                    let current_power_report = format!(
+                        "{}{}",
+                        self.format_multi_corner_power_results(
+                            &constraint_corner_powers,
+                            self.constraint_freq,
+                            "Multi-Corner Power Analysis",
+                        ),
+                        self.format_multi_corner_power_results(
+                            &max_corner_powers,
+                            max_found,
+                            "Max Frequency Power",
+                        ),
+                    );
+                    let _ = fs::write(syn_dir.join("power_report.txt"), current_power_report);
                     let power_liberty_ok = Self::all_power_results_use_liberty(&constraint_corner_powers)
                         && Self::all_power_results_use_liberty(&max_corner_powers);
-                    let power_decision = self.consult_power_review(
-                        &mod_name,
-                        &synth_info,
-                        timing_review,
-                        self.constraint_freq,
-                        max_found,
-                        &constraint_corner_powers,
-                        &max_corner_powers,
-                    );
+                    let power_decision = if power_liberty_ok {
+                        self.consult_power_review(
+                            &mod_name, &synth_info, timing_review, self.constraint_freq,
+                            max_found, &constraint_corner_powers, &max_corner_powers,
+                        )
+                    } else {
+                        // A source-coverage failure is a deterministic local
+                        // signoff outcome. It is not an LLM decision and must
+                        // not spend API quota or turn an offline run into an
+                        // unrelated API failure.
+                        LlmDecision::Proceed("estimated_pvt_signoff_blocked".to_string())
+                    };
                     llm_stage_decisions.push(Self::llm_decision_summary("Power", &power_decision));
                     match power_decision {
                         LlmDecision::Proceed(_) if power_liberty_ok => {}
                         LlmDecision::Proceed(reason) => {
                             let detail = format!(
-                                "Power analysis did not use liberty for all corners: constraint={}, max={}; API returned proceed: {}",
+                                "Power signoff blocked: all corners require Liberty NLDM coverage; constraint={}, max={}; decision={}",
                                 Self::power_source_summary(&constraint_corner_powers),
                                 Self::power_source_summary(&max_corner_powers),
                                 reason
                             );
                             self.last_iteration_reason = detail.clone();
                             steps.step_fail(&detail);
-                            self.gui_set_error(&detail);
+                            self.write_blocked_power_report(
+                                &project_dir, &mod_name, &synth_info, timing_review,
+                                &scan_results, &corner_timings, &constraint_corner_powers,
+                                &max_corner_powers, max_found, lint.passed, formal_ok,
+                                &formal_report_text, &detail,
+                            );
+                            self.gui_set_step("power", "blocked", &detail);
                             return;
                         }
                         LlmDecision::Iterate(reason) => {
                             self.last_iteration_reason = format!("Power: LLM requested iteration - {}", reason);
                             steps.step_fail(&format!("Power API advisory required: {}", reason));
+                            self.write_blocked_power_report(
+                                &project_dir, &mod_name, &synth_info, timing_review,
+                                &scan_results, &corner_timings, &constraint_corner_powers,
+                                &max_corner_powers, max_found, lint.passed, formal_ok,
+                                &formal_report_text, &self.last_iteration_reason,
+                            );
                             self.auto_optimize(&synth_info, &[reason], &rtl_code, tb_code.as_deref(), sdc_code.as_deref(), &mod_name);
                             return;
                         }
                         LlmDecision::Abort(reason) => {
                             self.last_iteration_reason = format!("Power: LLM requested abort - {}", reason);
                             steps.step_fail(&format!("Power API advisory abort: {}", reason));
+                            self.write_blocked_power_report(
+                                &project_dir, &mod_name, &synth_info, timing_review,
+                                &scan_results, &corner_timings, &constraint_corner_powers,
+                                &max_corner_powers, max_found, lint.passed, formal_ok,
+                                &formal_report_text, &self.last_iteration_reason,
+                            );
                             self.gui_set_error(&reason);
                             return;
                         }
@@ -4753,7 +5220,7 @@ impl Repl {
                                 logger.log_autofix_diagnosis(&diagnosis);
                             }
                             // Re-try synthesis
-                            match self.run_yosys_synthesis(&new_rtl, &mod_name, &syn_dir) {
+                            match self.run_native_synthesis(&new_rtl, &mod_name, &syn_dir) {
                                 Ok(new_synth) if new_synth.cell_count > 0 => {
                                     oprintln!("  {} Synthesis fixed! {} cells, {:.0} GE", "✓".green(), new_synth.cell_count, new_synth.area_ge);
                                     self.current_rtl = Some(new_rtl.clone());
@@ -4936,6 +5403,17 @@ impl Repl {
             }
         }
 
+        // APR is also required on the post-auto-fix continuation path.  Do
+        // not let a recovered synthesis bypass physical implementation.
+        oprintln!();
+        oprintln!("  ▶ Running native APR...");
+        self.cmd_apr("run");
+        if !project_dir.join("apr").join("apr_netlist.v").is_file() {
+            oprintln!("  {} APR did not produce an APR netlist", "✗".red());
+            self.gui_set_error("APR did not produce an APR netlist");
+            return;
+        }
+
         // Formal verification
         oprintln!();
         oprintln!("  ▶ Running formal verification...");
@@ -4943,7 +5421,8 @@ impl Repl {
         match formal_result {
             Ok(ref result) => {
                 if let Some(verdict) = FormalVerdict::from_report(result) {
-                    oprintln!("  {} RTL vs gate-level: {}", if verdict.is_equivalent() { "✓".green() } else { "✗".red() }, verdict.cli_label());
+                    oprintln!("  {} Formal aggregate: {}", if verdict.is_equivalent() { "✓".green() } else { "✗".red() }, verdict.cli_label());
+                    for line in result.lines().filter(|line| line.starts_with("Stage ")) { oprintln!("    {}", line); }
                 } else {
                     oprintln!("  {} Formal verification returned an unrecognized verdict", "✗".red());
                     self.gui_set_error("Formal verification returned an unrecognized verdict");
@@ -5541,6 +6020,278 @@ impl Repl {
         }
     }
 
+    /// Native APR command.  `/apr config` is a focused physical-options
+    /// console; every `/apr run` still executes all physical stages.
+    fn cmd_apr(&mut self, args: &str) {
+        let args = args.trim();
+        if args == "config" || args == "settings" {
+            oprintln!();
+            oprintln!("  {}", "Native APR Configuration".bright_cyan().bold());
+            oprintln!("    utilization: {:.3}", self.apr_options.core_utilization);
+            oprintln!("    aspect ratio: {:.3}", self.apr_options.aspect_ratio);
+            if self.apr_options.voltage_override {
+                oprintln!("    voltage: {:.3} V (user override)", self.apr_options.voltage_v);
+            } else {
+                let nominal = self.corner_db.get_active_group()
+                    .and_then(|group| group.get_synthesis_corner())
+                    .map(|corner| corner.voltage)
+                    .unwrap_or(self.apr_options.voltage_v);
+                oprintln!("    voltage: {:.3} V (active Liberty nominal)", nominal);
+            }
+            oprintln!("    OCV derates: early {:.3}, late {:.3}", self.apr_options.ocv_early_derate, self.apr_options.ocv_late_derate);
+            oprintln!("  Commands: /apr config utilization <0.35..0.85>, /apr config aspect <value>, /apr config voltage <V>, /apr config ocv <early> <late>");
+            oprintln!("            /apr predict (explicit LLM advisory), /apr predict show");
+            return;
+        }
+        if let Some(value) = args.strip_prefix("config utilization ") {
+            match value.trim().parse::<f64>() {
+                Ok(v) if (0.35..=0.85).contains(&v) => { self.apr_options.core_utilization = v; let _ = self.persist_project_technology(); oprintln!("  {} APR utilization set to {:.3}", "✓".green(), v); }
+                _ => oprintln!("  {} Utilization must be between 0.35 and 0.85", "✗".red()),
+            }
+            return;
+        }
+        if let Some(value) = args.strip_prefix("config aspect ") {
+            match value.trim().parse::<f64>() {
+                Ok(v) if (0.25..=4.0).contains(&v) => { self.apr_options.aspect_ratio = v; let _ = self.persist_project_technology(); oprintln!("  {} APR aspect ratio set to {:.3}", "✓".green(), v); }
+                _ => oprintln!("  {} Aspect ratio must be between 0.25 and 4.0", "✗".red()),
+            }
+            return;
+        }
+        if let Some(value) = args.strip_prefix("config voltage ") {
+            match value.trim().parse::<f64>() {
+                Ok(v) if (0.1..=5.0).contains(&v) => { self.apr_options.voltage_v = v; self.apr_options.voltage_override = true; let _ = self.persist_project_technology(); oprintln!("  {} APR voltage set to {:.3} V", "✓".green(), v); }
+                _ => oprintln!("  {} Voltage must be between 0.1 and 5.0 V", "✗".red()),
+            }
+            return;
+        }
+        if let Some(values) = args.strip_prefix("config ocv ") {
+            let values: Vec<f64> = values.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+            if values.len() == 2 && (0.5..=1.0).contains(&values[0]) && (1.0..=1.5).contains(&values[1]) {
+                self.apr_options.ocv_early_derate = values[0];
+                self.apr_options.ocv_late_derate = values[1];
+                let _ = self.persist_project_technology();
+                oprintln!("  {} APR OCV derates set to early {:.3}, late {:.3}", "✓".green(), values[0], values[1]);
+            } else { oprintln!("  {} Usage: /apr config ocv <early 0.5..1.0> <late 1.0..1.5>", "✗".red()); }
+            return;
+        }
+        let Some(project_dir) = self.current_project.clone() else {
+            oprintln!("  {} No project loaded. Use /project open or /project new first.", "✗".red());
+            return;
+        };
+        if self.detail_logger.is_none() {
+            self.init_log();
+        }
+        if args == "predict show" {
+            let path = project_dir.join("apr").join("llm_prediction.txt");
+            match fs::read_to_string(&path) {
+                Ok(report) => self.print_section("APR LLM prediction (advisory)", &report, 0),
+                Err(_) => oprintln!("  {} No APR prediction. Run /apr predict after a completed APR run.", "⚠".yellow()),
+            }
+            return;
+        }
+        if args == "predict" {
+            let apr_dir = project_dir.join("apr");
+            let report_path = apr_dir.join("apr_report.json");
+            let timing_path = apr_dir.join("timing_report.txt");
+            let power_path = apr_dir.join("power_report.txt");
+            let area_path = apr_dir.join("area_report.txt");
+            let Some(apr_json) = fs::read_to_string(&report_path).ok() else {
+                oprintln!("  {} No native APR result. Run /apr run before requesting a prediction.", "✗".red());
+                return;
+            };
+            let prompt = format!(
+                "APR result JSON:\n{}\n\nTIMING:\n{}\n\nPOWER:\n{}\n\nAREA:\n{}\n\nReturn an advisory only. Predict the highest-risk next physical issue, rank up to three bounded experiments, and state expected direction for WNS/TNS, congestion, IR, area, and runtime. Do not claim signoff and do not invent unavailable measurements. Use concise Markdown tables.",
+                apr_json,
+                fs::read_to_string(timing_path).unwrap_or_default(),
+                fs::read_to_string(power_path).unwrap_or_default(),
+                fs::read_to_string(area_path).unwrap_or_default(),
+            );
+            oprintln!("  {} Requesting APR prediction (advisory only; no physical option will be changed automatically)...", "▶".bright_cyan());
+            let messages = [
+                Message::system("You are a physical-design review agent. Analyze only supplied native APR evidence. Be conservative, quantitative, and distinguish a measured result from a prediction."),
+                Message::user(&prompt),
+            ];
+            match self.llm.chat_compact(&messages, 900) {
+                Ok((response, _usage)) => {
+                    let output = format!("APR LLM Prediction (advisory, not applied)\n================================================\n\n{}\n", response.trim());
+                    let path = apr_dir.join("llm_prediction.txt");
+                    match fs::write(&path, &output) {
+                        Ok(()) => {
+                            if let Some(ref mut logger) = self.detail_logger {
+                                logger.log("APR_DEBUG", "LLM_PREDICTION", "advisory generated; no APR parameter was changed automatically");
+                            }
+                            self.gui_sync_state();
+                            self.print_section("APR LLM prediction (advisory)", &output, 0);
+                        }
+                        Err(error) => oprintln!("  {} Could not write APR prediction: {}", "✗".red(), error),
+                    }
+                }
+                Err(error) => {
+                    if let Some(ref mut logger) = self.detail_logger {
+                        logger.log("APR_DEBUG", "LLM_PREDICTION_ERROR", &error);
+                    }
+                    oprintln!("  {} APR prediction request failed: {}", "✗".red(), error);
+                }
+            }
+            return;
+        }
+        if matches!(args, "status" | "files" | "debug") {
+            let apr_dir = project_dir.join("apr");
+            if args == "debug" {
+                let path = project_dir.join("logs").join("detail.log");
+                match fs::read_to_string(path) {
+                    Ok(log) => {
+                        let events: Vec<&str> = log.lines().filter(|line| line.contains("APR_DEBUG")).collect();
+                        oprintln!("\n  {} ({} events)", "APR debug events".bright_cyan().bold(), events.len());
+                        for line in events.iter().rev().take(40).rev() { oprintln!("  {}", line); }
+                    }
+                    Err(_) => oprintln!("  {} No detail.log yet. Run /apr first.", "⚠".yellow()),
+                }
+                return;
+            }
+            if args == "files" {
+                oprintln!("\n  {}", "APR output artifacts".bright_cyan().bold());
+                for name in ["apr_netlist.v", "floorplan.def", "final.def", "final.gds", "detail_route.tsv", "native_parasitics.spef", "timing_report.txt", "power_report.txt", "area_report.txt", "drc_report.txt", "lvs_report.txt", "dft_report.txt", "ir_drop.tsv", "congestion.tsv", "power_hotspots.tsv"] {
+                    let path = apr_dir.join(name);
+                    match fs::metadata(&path) { Ok(meta) => oprintln!("    {} {:>10} bytes", name.green(), meta.len()), Err(_) => oprintln!("    {} {}", name.red(), "MISSING".red()) }
+                }
+                return;
+            }
+            let run_status = fs::read_to_string(apr_dir.join("run_status.json")).ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+            if run_status.as_ref().and_then(|value| value.get("status").and_then(|value| value.as_str())) == Some("BLOCKED") {
+                oprintln!("  {} Native APR is blocked; previous physical artifacts are stale and must not be used.", "✗".red());
+                if let Some(error) = run_status.as_ref().and_then(|value| value.get("error").and_then(|value| value.as_str())) { oprintln!("    {error}"); }
+                return;
+            }
+            let report = fs::read_to_string(apr_dir.join("apr_report.json")).ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+            match report {
+                Some(report) => {
+                    oprintln!("\n  {}", "APR status".bright_cyan().bold());
+                    for (key, label) in [("signoff_ready", "Signoff"), ("drc_status", "DRC"), ("lvs_status", "LVS"), ("dft_status", "DFT")] {
+                        oprintln!("    {:<12} {}", label, report.get(key).map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string()));
+                    }
+                    oprintln!("    {:<12} {}", "IR drop", report.get("ir_drop_mv").and_then(|v| v.as_f64()).map(|v| format!("{v:.3} mV")).unwrap_or_else(|| "unknown".to_string()));
+                    oprintln!("    {:<12} {}", "WNS / TNS", match (report.get("wns_ns").and_then(|v| v.as_f64()), report.get("tns_ns").and_then(|v| v.as_f64())) { (Some(wns), Some(tns)) => format!("{wns:.3} ns / {tns:.3} ns"), _ => "unknown".to_string() });
+                    oprintln!("    {:<12} {}", "Total power", report.get("total_power_mw").and_then(|v| v.as_f64()).map(|v| format!("{v:.6} mW")).unwrap_or_else(|| "unknown".to_string()));
+                    oprintln!("    {:<12} {}", "critical", report.get("critical_routes").and_then(|v| v.as_array()).map(|v| v.len().to_string()).unwrap_or_else(|| "0".to_string()));
+                }
+                None => oprintln!("  {} No APR result. Run /apr run first.", "⚠".yellow()),
+            }
+            return;
+        }
+        if args == "report" {
+            let path = project_dir.join("apr").join("apr_report.txt");
+            match fs::read_to_string(path) { Ok(report) => self.print_section("Native APR report", &report, 0), Err(_) => oprintln!("  {} No APR report. Run /apr first.", "⚠".yellow()) }
+            return;
+        }
+        if !args.is_empty() && args != "run" {
+            oprintln!("  {} Usage: /apr [run|report|status|files|debug|config|predict|predict show]", "✗".red());
+            return;
+        }
+        let Some(module_name) = self.current_module.clone() else {
+            oprintln!("  {} No active module. Run /synth <module> first.", "✗".red());
+            return;
+        };
+        let Some(rtl) = self.current_rtl.clone() else {
+            oprintln!("  {} No RTL loaded.", "✗".red());
+            return;
+        };
+        if let Err(reason) = self.technology_preflight(&project_dir, false) {
+            oprintln!("  {} {}", "✗".red(), reason);
+            return;
+        }
+        let Some(coverage) = self.corner_db.active_coverage() else { return; };
+        if !coverage.apr_ready {
+            let reason = format!("TECHNOLOGY_COVERAGE_BLOCKED: APR requires matching LEF macros and at least two routing layers. {}", coverage.blocked_reason());
+            self.gui_set_step("apr", "blocked", &reason);
+            oprintln!("  {} {}", "✗".red(), reason);
+            return;
+        }
+        let syn_dir = project_dir.join("syn");
+        if let Err(error) = fs::create_dir_all(&syn_dir) { oprintln!("  {} {}", "✗".red(), error); return; }
+        self.gui_set_step("apr", "running", &format!("Native APR for {}", module_name));
+        self.start_status(&format!("Running native APR for {}", module_name));
+        if let Some(ref mut logger) = self.detail_logger {
+            logger.log("APR_DEBUG", "START", &format!("module={} technology={}", module_name, self.corner_db.active_process.clone().unwrap_or_default()));
+        }
+        let synth_info = match self.run_native_synthesis(&rtl, &module_name, &syn_dir) {
+            Ok(info) => info,
+            Err(error) => { self.stop_status("APR synthesis failed", false); self.gui_set_error(&error); oprintln!("  {} {}", "✗".red(), error); return; }
+        };
+        if let Some(ref mut logger) = self.detail_logger {
+            logger.log("APR_DEBUG", "FLOORPLAN_INPUT", &format!("cells={} utilization={:.3} aspect={:.3}", synth_info.cell_count, self.apr_options.core_utilization, self.apr_options.aspect_ratio));
+        }
+        if let Err(reason) = self.validate_mapped_technology(&project_dir, &synth_info) {
+            self.stop_status("APR technology mapping blocked", false);
+            oprintln!("  {} {}", "✗".red(), reason);
+            return;
+        }
+        let gate_path = syn_dir.join(format!("{}_synth_gate.v", module_name));
+        let gate = match fs::read_to_string(&gate_path) { Ok(value) => value, Err(error) => { self.stop_status("APR netlist unavailable", false); oprintln!("  {} {}", "✗".red(), error); return; } };
+        let clock_period = self.read_sdc_clock_period(&project_dir.join("sdc").join(format!("{}.sdc", module_name)))
+            .unwrap_or_else(|| 1000.0 / self.constraint_freq.max(1) as f64);
+        let power_mw = Self::apr_nldm_power_mw(&syn_dir.join("power_report.txt"));
+        let library_voltage = self.corner_db.get_active_group()
+            .and_then(|group| group.get_synthesis_corner())
+            .map(|corner| corner.voltage)
+            .unwrap_or(self.apr_options.voltage_v);
+        let apr_voltage = if self.apr_options.voltage_override { self.apr_options.voltage_v } else { library_voltage };
+        let critical_nets = fs::read_to_string(syn_dir.join("timing_report.txt"))
+            .ok()
+            .map(|report| critical_nets_from_report(&report, &gate))
+            .unwrap_or_default();
+        let config = AprConfig {
+            module_name: module_name.clone(), clock_period_ns: clock_period, voltage_v: apr_voltage,
+            core_utilization: self.apr_options.core_utilization, aspect_ratio: self.apr_options.aspect_ratio,
+            ocv_early_derate: self.apr_options.ocv_early_derate, ocv_late_derate: self.apr_options.ocv_late_derate, power_mw, critical_nets,
+        };
+        let lef_dir = PathBuf::from(&coverage.lef_directory);
+        match apr::run(&project_dir, &lef_dir, &gate, &config) {
+            Ok(result) => {
+                let status = if result.signoff_ready { "passed" } else { "blocked" };
+                self.stop_status("Native APR completed", result.signoff_ready);
+                oprintln!("  {} Floorplan {:.1} x {:.1} um, {} cells, {:.1} um routed", if result.signoff_ready { "✓".green() } else { "⚠".yellow() }, result.core_width_um, result.core_height_um, result.cells.len(), result.total_wire_length_um);
+                oprintln!("    OCV setup {:.4} ns, hold {:.4} ns | IR {:.3} mV | DRC overlap {} route overflow {}", result.ocv_late_slack_ns, result.ocv_early_hold_slack_ns, result.ir_drop_mv, result.placement_overlaps, result.routing_overflow);
+                oprintln!("    Outputs: netlist={} DEF={} GDS={} detail-route={}", result.apr_netlist_path, result.final_def_path, result.gds_path, result.detail_route_path);
+                oprintln!("    Analysis: timing={} power={} area={} grid-points={} critical-routes={}", result.timing_report_path, result.power_report_path, result.area_report_path, result.ir_grid.len(), result.critical_routes.len());
+                oprintln!("    Signoff checks: DRC={} LVS={} DFT={}", result.drc_status, result.lvs_status, result.dft_status);
+                if let Some(ref mut logger) = self.detail_logger {
+                    for (stage, detail) in [
+                        ("FLOORPLAN", format!("core={:.3}x{:.3} die={:.3}x{:.3}", result.core_width_um, result.core_height_um, result.die_width_um, result.die_height_um)),
+                        ("PLACEMENT", format!("cells={} overlaps={} utilization={:.4}", result.cells.len(), result.placement_overlaps, result.utilization)),
+                        ("GLOBAL_ROUTE", format!("segments={} overflow={}", result.routes.len(), result.routing_overflow)),
+                        ("DETAIL_ROUTE", format!("segments={} wire_um={:.3}", result.routes.len(), result.total_wire_length_um)),
+                        ("TIMING", format!("setup={:.6} hold={:.6} ocv_setup={:.6}", result.setup_slack_ns, result.hold_slack_ns, result.ocv_late_slack_ns)),
+                        ("POWER", format!("source={} ir_mv={:.3}", result.power_source, result.ir_drop_mv)),
+                        ("IR_DROP", format!("grid_points={} worst_v={:.6}", result.ir_grid.len(), result.ir_worst_voltage_v)),
+                        ("DRC", result.drc_status.clone()), ("LVS", result.lvs_status.clone()), ("DFT", result.dft_status.clone())
+                    ] { logger.log("APR_DEBUG", stage, &detail); }
+                }
+                self.gui_set_step("apr", status, &format!("{} cells, {:.3} mV IR, OCV setup {:.3} ns", result.cells.len(), result.ir_drop_mv, result.ocv_late_slack_ns));
+            }
+            Err(error) => {
+                let marker = serde_json::json!({"status": "BLOCKED", "error": error});
+                let _ = fs::write(project_dir.join("apr").join("run_status.json"), format!("{}\n", marker));
+                self.stop_status("Native APR blocked", false);
+                self.gui_set_step("apr", "blocked", &error);
+                oprintln!("  {} {}", "✗".red(), error);
+            }
+        }
+    }
+
+    fn apr_nldm_power_mw(path: &Path) -> Option<f64> {
+        let content = fs::read_to_string(path).ok()?;
+        let mut max_uw = None::<f64>;
+        for line in content.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 7 || !fields.last().is_some_and(|field| field.eq_ignore_ascii_case("NLDM")) || !fields[2].ends_with('V') { continue; }
+            if let Ok(total) = fields[5].parse::<f64>() { max_uw = Some(max_uw.map_or(total, |current| current.max(total))); }
+        }
+        max_uw.map(|value| value / 1000.0)
+    }
+
     fn cmd_area(&mut self) {
         let mod_name = match self.current_module.clone() {
             Some(n) => n,
@@ -5555,7 +6306,7 @@ impl Repl {
                 .map(|p| p.join("syn"))
                 .unwrap_or_else(|| self.workspace.clone());
             self.start_status(&format!("Analyzing area for {}", mod_name));
-            match self.run_yosys_synthesis(&rtl, &mod_name, &syn_dir) {
+            match self.run_native_synthesis(&rtl, &mod_name, &syn_dir) {
                 Ok(synth_info) => {
                     self.stop_status("Area analysis completed", true);
                     print_area_report(&synth_info);
@@ -5610,7 +6361,7 @@ impl Repl {
 
         self.gui_set_step("timing", "running", &format!("Timing analysis for {}", mod_name));
         self.start_status(&format!("Analyzing timing for {}", mod_name));
-        match self.run_yosys_synthesis(&rtl, &mod_name, &syn_dir) {
+        match self.run_native_synthesis(&rtl, &mod_name, &syn_dir) {
             Ok(synth_info) => {
                 let sdc_path = sdc_dir.join(format!("{}.sdc", mod_name));
                 let clock_period = self.read_sdc_clock_period(&sdc_path)
@@ -5818,8 +6569,14 @@ impl Repl {
             if let Some(dir) = &report_dir {
                 fs::create_dir_all(dir).ok();
             }
+            if let Some(dir) = project_dir.as_ref() {
+                if let Err(reason) = self.technology_preflight(dir, true) {
+                    oprintln!("  {} {}", "✗".red(), reason);
+                    return;
+                }
+            }
             self.start_status(&format!("Analyzing power for {}", mod_name));
-            match self.run_yosys_synthesis(&rtl, &mod_name, &syn_dir) {
+            match self.run_native_synthesis(&rtl, &mod_name, &syn_dir) {
                 Ok(synth_info) => {
                     self.update_status_log("Generating power report...");
                     let gate_path = syn_dir.join(format!("{}_synth_gate.v", mod_name));
@@ -5987,6 +6744,50 @@ impl Repl {
     fn cmd_tech(&mut self, args: &str) {
         let args = args.trim();
 
+        if args == "import-sky130" || args.starts_with("import-sky130 ") {
+            let source = args.strip_prefix("import-sky130").unwrap_or_default().trim();
+            let libs_root = self.corner_db.lib_dir.clone();
+            let project_root = libs_root.parent().unwrap_or(&libs_root);
+            let reference = if source.is_empty() {
+                project_root.join("..").join("skywater-pdk-libs-sky130_fd_sc_hd-main")
+            } else {
+                PathBuf::from(source)
+            };
+            let lef_root = project_root.join("lef");
+            self.start_status("Importing Sky130 source timing and LEF data");
+            match tech::import_sky130_reference(&reference, &libs_root, &lef_root) {
+                Ok(summary) => {
+                    let multi_corner = self.corner_db.multi_corner;
+                    self.corner_db = CornerDatabase::auto_detect(&libs_root);
+                    self.corner_db.set_multi_corner(multi_corner);
+                    if let Err(error) = self.corner_db.set_active_process("sky130_fd_sc_hd") {
+                        self.stop_status("Sky130 import validation failed", false);
+                        oprintln!("  {} Imported files but could not select Sky130: {}", "✗".red(), error);
+                        return;
+                    }
+                    self.active_liberty = self.corner_db.get_default_liberty();
+                    let coverage = self.corner_db.active_coverage();
+                    let ready = coverage.as_ref().is_some_and(|value| value.power_signoff_ready && value.apr_ready);
+                    if ready {
+                        let _ = self.persist_project_technology();
+                        self.stop_status("Sky130 source import completed", true);
+                        oprintln!("  {} Imported {} corners x {} cells and {} LEF macros", "✓".green(), summary.corners, summary.cells_per_corner, summary.lef_macros);
+                        oprintln!("    Liberty: {}", summary.output_lib_dir.display());
+                        oprintln!("    LEF:     {}", summary.output_lef_dir.display());
+                    } else {
+                        let reason = coverage.map(|value| value.blocked_reason()).unwrap_or_else(|| "coverage scan failed".to_string());
+                        self.stop_status("Sky130 import coverage blocked", false);
+                        oprintln!("  {} Import completed but coverage remains blocked: {}", "✗".red(), reason);
+                    }
+                }
+                Err(error) => {
+                    self.stop_status("Sky130 source import failed", false);
+                    oprintln!("  {} {}", "✗".red(), error);
+                }
+            }
+            return;
+        }
+
         if args.is_empty() {
             // Show current technology and all corners
             if self.corner_db.processes.is_empty() {
@@ -6048,6 +6849,7 @@ impl Repl {
 
             oprintln!();
             oprintln!("  Commands: /tech all (multi-corner ON), /tech single (OFF), /tech <process_name> to switch process");
+            oprintln!("            /tech import-sky130 [reference_dir] to rebuild Sky130 Liberty/LEF from local source JSON");
             oprintln!("  Available processes: {}", self.corner_db.list_processes().join(", "));
         } else {
             match args {
@@ -7059,6 +7861,11 @@ impl Repl {
         self.init_log();
         self.log(&format!("Module: {}", module_name));
         self.log(&format!("Constraint: {} MHz\n", self.constraint_freq));
+        if let Err(reason) = self.technology_preflight(&project_dir, false) {
+            oprintln!("  {} {}", "✗".red(), reason);
+            self.stop_status("Technology coverage blocked", false);
+            return;
+        }
 
         // === Save ALL modules from RTL to src/ ===
         let all_modules = extract_all_modules(rtl_code);
@@ -7120,7 +7927,7 @@ impl Repl {
                 module_name, rtl_code.lines().count(), rtl_code.len(),
                 tb_code.is_some(), sdc_code.is_some()));
         }
-        let mut steps = StepTracker::new(9);
+        let mut steps = StepTracker::new(10);
         steps.step("Saving testbench");
         steps.step("Preparing testbench");
         let tb_path = tb_dir.join(format!("{}_tb.v", module_name));
@@ -7407,7 +8214,7 @@ impl Repl {
         steps.substep("[5/5] Mapping to CMOS standard cells ($_AND_, $_OR_, $_DFF_P_, etc.)");
         steps.update_log("Building gate-level netlist, estimating area & delay...");
         let synth_start = std::time::Instant::now();
-        let synth_result = self.run_yosys_synthesis(&rtl_code, &module_name, &syn_dir);
+        let synth_result = self.run_native_synthesis(&rtl_code, &module_name, &syn_dir);
         match synth_result {
             Ok(synth_info) => {
                 let synth_elapsed = synth_start.elapsed();
@@ -7424,6 +8231,12 @@ impl Repl {
                 ));
                 steps.substep(&format!("Logic depth: {} levels (estimated from combinational path)", synth_info.logic_depth));
                 steps.substep(&format!("Area: {:.0} GE (gate equivalents, 1 GE = 2-input NAND)", synth_info.area_ge));
+
+                if let Err(reason) = self.validate_mapped_technology(&project_dir, &synth_info) {
+                    steps.step_fail(&reason);
+                    self.stop_status("Technology mapping blocked", false);
+                    return;
+                }
 
                 // LLM decision: synthesis complete
                 let cells_s = synth_info.cell_count.to_string();
@@ -7753,7 +8566,21 @@ impl Repl {
                     }
                 }
 
-                // === Step 9: Formal verification ===
+                // === Step 9: Native APR ===
+                steps.step("Running native APR (floorplan, placement, route and signoff)");
+                steps.substep("Floorplan -> placement -> global route -> detail route -> DRC/LVS/DFT");
+                steps.update_log("Launching native physical implementation and post-route analyses...");
+                self.cmd_apr("run");
+                let apr_netlist = project_dir.join("apr").join("apr_netlist.v");
+                let apr_report = project_dir.join("apr").join("apr_report.json");
+                if !apr_netlist.is_file() || !apr_report.is_file() {
+                    steps.step_fail("APR did not produce required netlist/report artifacts");
+                    self.gui_set_error("APR did not produce required netlist/report artifacts");
+                    return;
+                }
+                steps.step_ok("APR floorplan, placement, route, DRC/LVS/DFT and physical analyses completed");
+
+                // === Step 10: Formal verification ===
                 steps.step("Running formal verification (RTL vs Gate-level)");
                 steps.substep("Algorithm: Port structure equivalence checking");
                 steps.substep("[1/3] Extracting port signatures from RTL and gate-level netlist");
@@ -7882,41 +8709,74 @@ impl Repl {
                 }
 
                 if !constraint_corner_powers.is_empty() || !max_corner_powers.is_empty() {
+                    // Keep the GUI exchange source coherent when a failed
+                    // signoff gate terminates this full-flow invocation.
+                    let current_power_report = format!(
+                        "{}{}",
+                        self.format_multi_corner_power_results(
+                            &constraint_corner_powers,
+                            self.constraint_freq,
+                            "Multi-Corner Power Analysis",
+                        ),
+                        self.format_multi_corner_power_results(
+                            &max_corner_powers,
+                            max_found,
+                            "Max Frequency Power",
+                        ),
+                    );
+                    let _ = fs::write(syn_dir.join("power_report.txt"), current_power_report);
                     let power_liberty_ok = Self::all_power_results_use_liberty(&constraint_corner_powers)
                         && Self::all_power_results_use_liberty(&max_corner_powers);
-                    let power_decision = self.consult_power_review(
-                        &module_name,
-                        &synth_info,
-                        timing_review,
-                        self.constraint_freq,
-                        max_found,
-                        &constraint_corner_powers,
-                        &max_corner_powers,
-                    );
+                    let power_decision = if power_liberty_ok {
+                        self.consult_power_review(
+                            &module_name, &synth_info, timing_review, self.constraint_freq,
+                            max_found, &constraint_corner_powers, &max_corner_powers,
+                        )
+                    } else {
+                        LlmDecision::Proceed("estimated_pvt_signoff_blocked".to_string())
+                    };
                     llm_stage_decisions.push(Self::llm_decision_summary("Power", &power_decision));
                     match power_decision {
                         LlmDecision::Proceed(_) if power_liberty_ok => {}
                         LlmDecision::Proceed(reason) => {
                             let detail = format!(
-                                "Power analysis did not use liberty for all corners: constraint={}, max={}; API returned proceed: {}",
+                                "Power signoff blocked: all corners require Liberty NLDM coverage; constraint={}, max={}; decision={}",
                                 Self::power_source_summary(&constraint_corner_powers),
                                 Self::power_source_summary(&max_corner_powers),
                                 reason
                             );
                             self.last_iteration_reason = detail.clone();
                             steps.step_fail(&detail);
-                            self.gui_set_error(&detail);
+                            self.write_blocked_power_report(
+                                &project_dir, &module_name, &synth_info, timing_review,
+                                &scan_results, &corner_timings, &constraint_corner_powers,
+                                &max_corner_powers, max_found, lint.passed, formal_ok,
+                                &formal_report_text, &detail,
+                            );
+                            self.gui_set_step("power", "blocked", &detail);
                             return;
                         }
                         LlmDecision::Iterate(reason) => {
                             self.last_iteration_reason = format!("Power: LLM requested iteration - {}", reason);
                             steps.step_fail(&format!("Power API advisory required: {}", reason));
+                            self.write_blocked_power_report(
+                                &project_dir, &module_name, &synth_info, timing_review,
+                                &scan_results, &corner_timings, &constraint_corner_powers,
+                                &max_corner_powers, max_found, lint.passed, formal_ok,
+                                &formal_report_text, &self.last_iteration_reason,
+                            );
                             self.auto_optimize(&synth_info, &[reason], &rtl_code, tb_code.as_deref(), sdc_code.as_deref(), &module_name);
                             return;
                         }
                         LlmDecision::Abort(reason) => {
                             self.last_iteration_reason = format!("Power: LLM requested abort - {}", reason);
                             steps.step_fail(&format!("Power API advisory abort: {}", reason));
+                            self.write_blocked_power_report(
+                                &project_dir, &module_name, &synth_info, timing_review,
+                                &scan_results, &corner_timings, &constraint_corner_powers,
+                                &max_corner_powers, max_found, lint.passed, formal_ok,
+                                &formal_report_text, &self.last_iteration_reason,
+                            );
                             self.gui_set_error(&reason);
                             return;
                         }
@@ -7988,7 +8848,7 @@ impl Repl {
                                     }
                                     // Re-synthesize to verify fix
                                     let syn_dir = self.current_project.as_ref().unwrap().join("syn");
-                                    match self.run_yosys_synthesis(&new_rtl, &module_name, &syn_dir) {
+                                    match self.run_native_synthesis(&new_rtl, &module_name, &syn_dir) {
                                         Ok(fixed_synth) => {
                                             let comb = fixed_synth.cell_count.saturating_sub(fixed_synth.dff_count);
                                             if comb > 0 || fixed_synth.cell_count > fixed_synth.dff_count * 2 {
@@ -8179,7 +9039,7 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
                                 logger.log_autofix_result(true, &format!("new_rtl_{}_lines", new_rtl.lines().count()));
                             }
                             // Re-try synthesis with fixed RTL
-                            match self.run_yosys_synthesis(&new_rtl, &module_name, &syn_dir) {
+                            match self.run_native_synthesis(&new_rtl, &module_name, &syn_dir) {
                                 Ok(new_synth) if new_synth.cell_count > 0 => {
                                     oprintln!("  {} Synthesis fixed! {} cells, {:.0} GE", "✓".green(), new_synth.cell_count, new_synth.area_ge);
                                     if let Some(ref mut logger) = self.detail_logger {
@@ -8756,7 +9616,7 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
     }
 
     /// Run synthesis using built-in engine - analyzes ALL source files
-    fn run_yosys_synthesis(&mut self, code: &str, module_name: &str, syn_dir: &Path) -> Result<SynthInfo, String> {
+    fn run_native_synthesis(&mut self, code: &str, module_name: &str, syn_dir: &Path) -> Result<SynthInfo, String> {
         // Write RTL to temp file
         let rtl_path = syn_dir.join(format!("{}_synth.v", module_name));
         fs::write(&rtl_path, code).map_err(|e| e.to_string())?;
@@ -8786,14 +9646,15 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
             logger.log("SYNTH", "START", &format!("module={} all_code_size={}", module_name, all_code.len()));
         }
 
-        // Call real synthesis engine with liberty library if available
+        // Run the repository-native synthesis engine using the persisted
+        // semantics-preserving pass policy. Analysis stages are not controlled
+        // by this policy and remain mandatory in every full flow.
         let liberty_path = self.corner_db.get_default_liberty()
             .map(|p| p.to_string_lossy().to_string());
-        let synth_result = if let Some(ref lib) = liberty_path {
-            engine::synthesize_real_with_lib(&all_code, module_name, Some(lib))
-        } else {
-            engine::synthesize_real(&all_code, module_name)
-        };
+        let engine_options = engine::SynthesisOptions::from(&self.synthesis_options);
+        let synth_result = engine::synthesize_real_with_options(
+            &all_code, module_name, liberty_path.as_deref(), &engine_options,
+        );
 
         if !synth_result.success {
             return Err(format!("Synthesis failed: {}", synth_result.error));
@@ -8827,14 +9688,16 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
                 .unwrap_or(0);
             logger.log_synth_liberty(&liberty_path.as_deref().unwrap_or("none"), liberty_cell_count);
             logger.log_synth_cells(&synth_result.cell_counts.iter().map(|(t,c)| (t.clone(), *c)).collect::<Vec<_>>());
-            // Log per-pass intermediate synthesis detail
+            // Only report passes that were actually enabled for this run.
             logger.log_synth_intermediate("techmap", &format!("mapped {} cells to library gates", synth_result.cell_count));
-            logger.log_synth_intermediate("constprop", &format!("propagated constants across {} wires", synth_result.wire_count));
-            if synth_result.dff_count > 0 {
+            if self.synthesis_options.constprop {
+                logger.log_synth_intermediate("constprop", &format!("propagated constants across {} wires", synth_result.wire_count));
+            }
+            if self.synthesis_options.retiming && synth_result.dff_count > 0 {
                 logger.log_synth_intermediate("retiming", &format!("{} registers available for retiming", synth_result.dff_count));
             }
             let comb = synth_result.cell_count.saturating_sub(synth_result.dff_count);
-            if comb > 0 {
+            if self.synthesis_options.logic_minimization && comb > 0 {
                 logger.log_synth_intermediate("logic_min", &format!("{} combinational gates minimized", comb));
                 logger.log_synth_pass_detail("logic_min", comb, comb, "AOI/OAI merge");
             }
@@ -8848,6 +9711,10 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
         // Save gate-level netlist
         let gate_path = syn_dir.join(format!("{}_synth_gate.v", module_name));
         fs::write(&gate_path, &synth_result.gate_verilog).ok();
+        // Keep the exact native-engine report separate from the timing-input
+        // summary so consumers never confuse a pass policy with STA data.
+        let native_report_path = syn_dir.join(format!("{}_native_synth_report.txt", module_name));
+        fs::write(native_report_path, &synth_result.report).ok();
 
         // Build cells list
         let mut cells = Vec::new();
@@ -8856,6 +9723,10 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
             cells.push((cell_type.clone(), *count));
             total_gates += count;
         }
+        let cell_area_um2 = liberty_path.as_deref()
+            .map(Path::new)
+            .map(tech::liberty_cell_areas)
+            .unwrap_or_default();
 
         // Print synthesis report to CLI (only when called from top-level flow)
         if self.synth_verbose {
@@ -8886,6 +9757,7 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
             dff_count: synth_result.dff_count,
             area_ge: synth_result.area_ge,
             area_um2: synth_result.area_um2,
+            cell_area_um2,
             area_from_lib: synth_result.area_from_lib,
             lib_name: synth_result.lib_name,
             delay_ns: 0.0,
@@ -9580,7 +10452,7 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
                             let _ = fs::write(src_dir.join(format!("{}.v", module_name)), &new_rtl);
                         }
                         let syn_dir = self.current_project.as_ref().unwrap().join("syn");
-                        match self.run_yosys_synthesis(&new_rtl, module_name, &syn_dir) {
+                        match self.run_native_synthesis(&new_rtl, module_name, &syn_dir) {
                             Ok(fixed_synth) => {
                                 let comb = fixed_synth.cell_count.saturating_sub(fixed_synth.dff_count);
                                 if comb > 0 || fixed_synth.cell_count > fixed_synth.dff_count * 2 {
@@ -9783,7 +10655,7 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
 
                         // Lightweight re-run: only synthesize + timing + power
                         let syn_dir = self.current_project.as_ref().unwrap().join("syn");
-                        match self.run_yosys_synthesis(&new_rtl, module_name, &syn_dir) {
+                        match self.run_native_synthesis(&new_rtl, module_name, &syn_dir) {
                             Ok(new_synth) => {
                                 // Check if this result is better than the previous one
                                 let improved = if !is_sequential {
@@ -9854,7 +10726,7 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
         }
 
         // Always re-synthesize to ensure gate netlist is up-to-date with current RTL
-        self.run_yosys_synthesis(rtl_code, module_name, syn_dir)?;
+        self.run_native_synthesis(rtl_code, module_name, syn_dir)?;
 
         let gate_path = syn_dir.join(format!("{}_synth_gate.v", module_name));
 
@@ -9862,26 +10734,136 @@ oprintln!("  {} Auto-fix successful! {} cells ({} comb), {:.0} GE",
         let gate_code = fs::read_to_string(&gate_path)
             .map_err(|e| format!("Failed to read gate-level netlist: {}", e))?;
 
-        // Run formal verification using built-in checker
-        let equiv = engine::formal_check(rtl_code, &gate_code, module_name)
-            .map_err(|e| format!("Formal verification did not produce a proof verdict: {}", e))?;
+        fs::create_dir_all(formal_dir).map_err(|e| format!("Failed to create formal directory: {e}"))?;
 
-        // Save result
-        let (result_str, points_str) = build_formal_reports(equiv, rtl_code, &gate_code, module_name);
-        let _ = fs::write(formal_dir.join("equiv_result.txt"), &result_str);
-        let _ = fs::write(formal_dir.join("formal_report.txt"), &result_str);
-        let _ = fs::write(formal_dir.join("equiv_points.txt"), &points_str);
+        // Formal signoff is deliberately split into three independently
+        // reported comparisons.  APR is generated from the same native
+        // mapped netlist, but it is still treated as a separate artifact so
+        // stale/missing physical output cannot be mistaken for proof.
+        let stage1 = engine::formal_check(rtl_code, &gate_code, module_name)
+            .map(|ok| (ok, String::new()))
+            .unwrap_or_else(|e| (false, e));
+
+        let apr_path = self.current_project.as_ref()
+            .map(|p| p.join("apr").join("apr_netlist.v"));
+        let mut apr_error = String::new();
+        // Reuse APR only when the physical netlist exactly matches the gate
+        // netlist just synthesized above.  This allows `/full` to run APR as
+        // an explicit flow stage without doing it twice, while still rejecting
+        // stale physical artifacts after RTL or technology changes.
+        let fresh_existing_apr = apr_path.as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .filter(|code| code == &gate_code);
+        let apr_code = if let Some(code) = fresh_existing_apr {
+            Some(code)
+        } else if let Some(project_dir) = self.current_project.clone() {
+                let generated = (|| -> Result<String, String> {
+                    self.technology_preflight(&project_dir, false)?;
+                    let coverage = self.corner_db.active_coverage()
+                        .ok_or_else(|| "APR formal stage requires an active technology coverage".to_string())?;
+                    if !coverage.apr_ready {
+                        return Err(format!("APR technology coverage is not ready: {}", coverage.blocked_reason()));
+                    }
+                    let clock_period = self.read_sdc_clock_period(
+                        &project_dir.join("sdc").join(format!("{module_name}.sdc")))
+                        .unwrap_or_else(|| 1000.0 / self.constraint_freq.max(1) as f64);
+                    let voltage = if self.apr_options.voltage_override {
+                        self.apr_options.voltage_v
+                    } else {
+                        self.corner_db.get_active_group()
+                            .and_then(|group| group.get_synthesis_corner())
+                            .map(|corner| corner.voltage)
+                            .unwrap_or(self.apr_options.voltage_v)
+                    };
+                    let config = AprConfig {
+                        module_name: module_name.to_string(),
+                        clock_period_ns: clock_period,
+                        voltage_v: voltage,
+                        core_utilization: self.apr_options.core_utilization,
+                        aspect_ratio: self.apr_options.aspect_ratio,
+                        ocv_late_derate: self.apr_options.ocv_late_derate,
+                        ocv_early_derate: self.apr_options.ocv_early_derate,
+                        power_mw: Self::apr_nldm_power_mw(&syn_dir.join("power_report.txt")),
+                        critical_nets: fs::read_to_string(syn_dir.join("timing_report.txt"))
+                            .map(|report| critical_nets_from_report(&report, &gate_code))
+                            .unwrap_or_default(),
+                    };
+                    let result = apr::run(&project_dir, &PathBuf::from(&coverage.lef_directory), &gate_code, &config)?;
+                    fs::read_to_string(project_dir.join("apr").join("apr_netlist.v"))
+                        .map_err(|e| format!("APR completed but netlist could not be read: {e}"))
+                        .map(|code| {
+                            if let Some(ref mut logger) = self.detail_logger {
+                                logger.log("APR_DEBUG", "FORMAL_INPUT", &format!("apr_netlist={} signoff_ready={}", result.apr_netlist_path, result.signoff_ready));
+                            }
+                            code
+                        })
+                })();
+                match generated {
+                    Ok(code) => Some(code),
+                    Err(e) => { apr_error = e; None }
+                }
+        } else {
+            apr_error = "No project is loaded for APR formal stage".to_string();
+            None
+        };
+
+        let stage2 = match apr_code.as_ref() {
+            Some(code) => engine::formal_check(rtl_code, code, module_name)
+                .map(|ok| (ok, String::new()))
+                .unwrap_or_else(|e| (false, e)),
+            None => (false, if apr_error.is_empty() { "APR netlist is unavailable".to_string() } else { apr_error.clone() }),
+        };
+        let stage3 = match apr_code.as_ref() {
+            Some(code) => engine::formal_check(&gate_code, code, module_name)
+                .map(|ok| (ok, String::new()))
+                .unwrap_or_else(|e| (false, e)),
+            None => (false, if apr_error.is_empty() { "APR netlist is unavailable".to_string() } else { apr_error.clone() }),
+        };
+
+        let stage_line = |n: usize, lhs: &str, rhs: &str, path_lhs: &str, path_rhs: &str, result: &(bool, String)| {
+            let status = if result.1.is_empty() { if result.0 { "EQUIVALENT" } else { "DIFFERENT" } } else { "BLOCKED" };
+            let mut line = format!("Stage {n}: {lhs} vs {rhs}: {status}\n  lhs: {path_lhs}\n  rhs: {path_rhs}\n");
+            if !result.1.is_empty() { line.push_str(&format!("  reason: {}\n", result.1)); }
+            line
+        };
+        let gate_path_text = gate_path.to_string_lossy();
+        let apr_path_text = apr_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "<project>/apr/apr_netlist.v".to_string());
+        let mut result_str = String::new();
+        let all_pass = stage1.1.is_empty() && stage2.1.is_empty() && stage3.1.is_empty() && stage1.0 && stage2.0 && stage3.0;
+        result_str.push_str(if all_pass { "Formal Verification: PASS - all three equivalence stages passed\n\n" } else { "Formal Verification: FAIL/BLOCKED - one or more equivalence stages did not pass\n\n" });
+        result_str.push_str(&stage_line(1, "RTL", "synthesized gate-level netlist", &format!("<rtl:{module_name}>"), &gate_path_text, &stage1));
+        result_str.push_str(&stage_line(2, "RTL", "APR post-layout netlist", &format!("<rtl:{module_name}>"), &apr_path_text, &stage2));
+        result_str.push_str(&stage_line(3, "synthesized gate-level netlist", "APR post-layout netlist", &gate_path_text, &apr_path_text, &stage3));
+        result_str.push_str("\nVerified Equivalence Points:\n");
+        let (_, points_str) = build_formal_reports(all_pass, rtl_code, apr_code.as_deref().unwrap_or(&gate_code), module_name);
+        result_str.push_str(&points_str);
+        let stages_json = serde_json::json!({
+            "module": module_name,
+            "all_pass": all_pass,
+            "stages": [
+                {"id": 1, "lhs": "RTL", "rhs": "synthesized gate-level netlist", "lhs_path": format!("<rtl:{module_name}>"), "rhs_path": gate_path_text, "status": if stage1.1.is_empty() { if stage1.0 { "EQUIVALENT" } else { "DIFFERENT" } } else { "BLOCKED" }, "reason": stage1.1},
+                {"id": 2, "lhs": "RTL", "rhs": "APR post-layout netlist", "lhs_path": format!("<rtl:{module_name}>"), "rhs_path": apr_path_text, "status": if stage2.1.is_empty() { if stage2.0 { "EQUIVALENT" } else { "DIFFERENT" } } else { "BLOCKED" }, "reason": stage2.1},
+                {"id": 3, "lhs": "synthesized gate-level netlist", "rhs": "APR post-layout netlist", "lhs_path": gate_path_text, "rhs_path": apr_path_text, "status": if stage3.1.is_empty() { if stage3.0 { "EQUIVALENT" } else { "DIFFERENT" } } else { "BLOCKED" }, "reason": stage3.1}
+            ]
+        });
+        fs::write(formal_dir.join("equiv_result.txt"), &result_str).map_err(|e| e.to_string())?;
+        fs::write(formal_dir.join("formal_report.txt"), &result_str).map_err(|e| e.to_string())?;
+        fs::write(formal_dir.join("equiv_points.txt"), &points_str).map_err(|e| e.to_string())?;
+        fs::write(formal_dir.join("formal_stage_rtl_gate.txt"), stage_line(1, "RTL", "synthesized gate-level netlist", &format!("<rtl:{module_name}>"), &gate_path_text, &stage1)).map_err(|e| e.to_string())?;
+        fs::write(formal_dir.join("formal_stage_rtl_apr.txt"), stage_line(2, "RTL", "APR post-layout netlist", &format!("<rtl:{module_name}>"), &apr_path_text, &stage2)).map_err(|e| e.to_string())?;
+        fs::write(formal_dir.join("formal_stage_gate_apr.txt"), stage_line(3, "synthesized gate-level netlist", "APR post-layout netlist", &gate_path_text, &apr_path_text, &stage3)).map_err(|e| e.to_string())?;
+        fs::write(formal_dir.join("formal_stages.json"), serde_json::to_string_pretty(&stages_json).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
 
         if let Some(ref mut logger) = self.detail_logger {
             logger.log_formal(&result_str);
-            logger.log_formal_end(equiv, 0);
+            logger.log_formal_end(all_pass, 0);
         }
 
         Ok(result_str)
     }
 }
 
-/// Synthesis information parsed from Yosys output
+/// Synthesis information parsed from native synthesis output
 pub struct SynthInfo {
     #[allow(dead_code)]
     pub module_name: String,
@@ -9895,6 +10877,7 @@ pub struct SynthInfo {
     pub dff_count: usize,
     pub area_ge: f64,
     pub area_um2: f64,
+    pub cell_area_um2: std::collections::BTreeMap<String, f64>,
     pub area_from_lib: bool,
     pub lib_name: String,
     pub delay_ns: f64,
@@ -9902,7 +10885,7 @@ pub struct SynthInfo {
     pub logic_depth: usize,
     pub max_freq_mhz: f64,
     #[allow(dead_code)]
-    pub raw_output: String,  // Raw Yosys output for timing analysis
+    pub raw_output: String,  // Raw native synthesis output for timing analysis
 }
 
 #[derive(Clone, Debug)]
@@ -9978,12 +10961,12 @@ fn build_timing_input(
 
 /// Parse synthesis output (kept for debugging)
 #[allow(dead_code)]
-fn parse_synth_output(output: &str, module_name: &str) -> Result<SynthInfo, String> {
+fn parse_native_synth_output(output: &str, module_name: &str) -> Result<SynthInfo, String> {
     let mut info = SynthInfo {
         module_name: module_name.to_string(),
         wire_count: 0, wire_bits: 0, port_count: 0, port_bits: 0,
         cell_count: 0, total_gates: 0, cells: Vec::new(), dff_count: 0,
-        area_ge: 0.0, area_um2: 0.0, area_from_lib: false, lib_name: String::new(),
+        area_ge: 0.0, area_um2: 0.0, cell_area_um2: std::collections::BTreeMap::new(), area_from_lib: false, lib_name: String::new(),
         delay_ns: 0.0, power_mw: 0.0,
         logic_depth: 0, max_freq_mhz: 0.0, raw_output: String::new(),
     };
@@ -10088,7 +11071,7 @@ fn parse_synth_output(output: &str, module_name: &str) -> Result<SynthInfo, Stri
     }
 
     if !found_module {
-        return Err(format!("Module '{}' not found in Yosys output", module_name));
+        return Err(format!("Module '{}' not found in native synthesis output", module_name));
     }
 
     // Calculate area and timing from cell counts
@@ -10132,9 +11115,9 @@ fn parse_synth_output(output: &str, module_name: &str) -> Result<SynthInfo, Stri
 }
 
 /// Print synthesis information
-/// Estimate timing from Yosys gate-level statistics
+/// Estimate timing from native gate-level statistics
 #[allow(dead_code)]
-fn estimate_timing_from_yosys(info: &SynthInfo, _module_name: &str) -> TimingReport {
+fn estimate_timing_from_native_synth(info: &SynthInfo, _module_name: &str) -> TimingReport {
     // CMOS Liberty cell delays (from cmos_cells.lib, scaled for estimation)
     // These are simplified estimates; real timing comes from liberty file
     const D_NAND: f64 = 0.03; const D_NOR: f64 = 0.03;
@@ -11009,6 +11992,15 @@ fn area_breakdown_um2(info: &SynthInfo) -> Vec<(String, f64, usize)> {
         return vec![("Total".to_string(), info.area_um2, info.cell_count)];
     }
 
+    if !info.cell_area_um2.is_empty() {
+        return info.cells.iter().map(|(cell_type, count)| {
+            let unit_area = info.cell_area_um2.get(cell_type).copied().unwrap_or(0.0);
+            (cell_type.clone(), unit_area * *count as f64, *count)
+        }).collect();
+    }
+
+    // Legacy projects may only have aggregate area.  Keep this compatibility
+    // path separate from native Liberty-backed reporting above.
     let mut total_ge = 0.0f64;
     let mut ge_per_type: Vec<(&str, f64, usize)> = Vec::new();
     for (cell_type, count) in &info.cells {
@@ -11294,25 +12286,9 @@ fn print_flow_summary_tables(info: &SynthInfo, constraint_mhz: i32, max_freq_mhz
         oprintln!("  {:<30} {:>10} {:>10} {:>14}", "Cell Type", "Count", "Unit(um2)", "Total(um2)");
         oprintln!("  {:-<30} {:-<10} {:-<10} {:-<14}", "", "", "", "");
         if !info.cells.is_empty() {
-            let mut total_ge = 0.0f64;
-            let mut ge_per_type: Vec<(&str, f64, usize)> = Vec::new();
-            for (cell_type, count) in &info.cells {
-                let ge_per = get_ge_per_cell(cell_type);
-                total_ge += ge_per * *count as f64;
-                ge_per_type.push((cell_type.as_str(), ge_per, *count));
-            }
-            let um2_per_ge = if total_ge > 0.0 { info.area_um2 / total_ge } else { 0.5 };
-            let mut used_um2 = 0.0;
-            for (i, (ct, ge_per, cnt)) in ge_per_type.iter().enumerate() {
-                let est_um2 = if i == ge_per_type.len() - 1 {
-                    info.area_um2 - used_um2
-                } else {
-                    let a = ge_per * um2_per_ge * *cnt as f64;
-                    used_um2 += a;
-                    a
-                };
-                let unit_area = if *cnt > 0 { est_um2 / *cnt as f64 } else { 0.0 };
-                oprintln!("  {:<30} {:>10} {:>10.2} {:>14.2}", ct, cnt.to_string(), unit_area, est_um2);
+            for (cell_type, area_um2, count) in area_breakdown_um2(info) {
+                let unit_area = if count > 0 { area_um2 / count as f64 } else { 0.0 };
+                oprintln!("  {:<30} {:>10} {:>10.2} {:>14.2}", cell_type, count, unit_area, area_um2);
             }
         }
         oprintln!("  {:<30} {:>10} {:>10} {:>14.2}", "TOTAL", info.cell_count.to_string(), "um2", info.area_um2);
@@ -11868,6 +12844,19 @@ fn parse_timing_report_paths(report: &str) -> Vec<CriticalPathInfo> {
     paths
 }
 
+/// Map the lowest-slack complete STA path onto synthesized-netlist names.
+/// This rejects a stale report rather than drawing unrelated APR routes.
+fn critical_nets_from_report(report: &str, gate_netlist: &str) -> std::collections::BTreeSet<String> {
+    parse_timing_report_paths(report)
+        .into_iter()
+        .find(|path| path.available && !path.stages.is_empty())
+        .map(|path| path.stages.into_iter()
+            .map(|stage| stage.cell_name)
+            .filter(|net| !net.starts_with("1'b") && gate_netlist.contains(net))
+            .collect())
+        .unwrap_or_default()
+}
+
 fn padded_critical_paths(paths: &[CriticalPathInfo], limit: usize) -> Vec<CriticalPathInfo> {
     let mut out: Vec<CriticalPathInfo> = paths.iter().take(limit).cloned().collect();
     while out.len() < limit {
@@ -12091,7 +13080,8 @@ fn report_power_point_json(result: Option<&CornerPowerResult>, freq_mhz: i32) ->
                 "switching_uw": result.power.switching_power_uw,
                 "clock_uw": result.power.clock_power_uw,
                 "leakage_uw": result.power.leakage_power_uw,
-                "total_uw": result.power.total_power_uw
+                "total_uw": result.power.total_power_uw,
+                "source": Repl::power_result_source(result)
             })
         })
         .unwrap_or(serde_json::Value::Null)
@@ -12140,17 +13130,18 @@ fn generate_report_rpt_with_extras(project_dir: &Path, mod_name: &str, synth_inf
             .max(30);
         let mut table = String::new();
         table.push_str(&format!("  {} ({} MHz)\n", label, freq_mhz));
-        table.push_str(&format!("  {:<corner_width$} {:>10} {:>10} {:>10} {:>10} {:>10}\n", "Corner", "Type", "Voltage", "Static", "Dynamic", "Total"));
-        table.push_str(&format!("  {:-<corner_width$} {:-<10} {:-<10} {:-<10} {:-<10} {:-<10}\n", "", "", "", "", "", ""));
+        table.push_str(&format!("  {:<corner_width$} {:>10} {:>10} {:>10} {:>10} {:>10} {:>15}\n", "Corner", "Type", "Voltage", "Static", "Dynamic", "Total", "Source"));
+        table.push_str(&format!("  {:-<corner_width$} {:-<10} {:-<10} {:-<10} {:-<10} {:-<10} {:-<15}\n", "", "", "", "", "", "", ""));
         for result in powers {
             table.push_str(&format!(
-                "  {:<corner_width$} {:>10} {:>10} {:>10.1} {:>10.1} {:>10.1}\n",
+                "  {:<corner_width$} {:>10} {:>10} {:>10.1} {:>10.1} {:>10.1} {:>15}\n",
                 result.corner.short_name,
                 result.corner.corner_type,
                 format!("{}V", result.corner.voltage),
                 result.power.static_power_uw,
                 result.power.dynamic_power_uw,
                 result.power.total_power_uw,
+                Repl::power_result_source(result),
             ));
         }
         table
@@ -12160,7 +13151,7 @@ fn generate_report_rpt_with_extras(project_dir: &Path, mod_name: &str, synth_inf
     // HEADER
     // ════════════════════════════════════════════════════════════════════════════
     rpt.push_str(&format!("\n{}", "=" .repeat(78)));
-    rpt.push_str(&format!("\n{:^78}\n", format!("AI Digital v0.6.8 — Real NLDM Synthesis & STA Report")));
+    rpt.push_str(&format!("\n{:^78}\n", format!("AI Digital v0.7.0 — Native Synthesis & STA Report")));
     rpt.push_str(&format!("{}\n", "=".repeat(78)));
     rpt.push_str(&format!("  Module: {}  |  Generated: {}\n", mod_name, generated_at));
     rpt.push_str(&format!("  Constraint: {} MHz  |  Max Achievable: {} MHz  |  Ratio: {:.1}x\n", constraint_mhz, max_freq, freq_ratio));
@@ -12350,7 +13341,7 @@ fn generate_report_rpt_with_extras(project_dir: &Path, mod_name: &str, synth_inf
                 result.power.static_power_uw,
                 result.power.dynamic_power_uw,
                 result.power.total_power_uw,
-                format!("liberty_corner:{}", result.corner.short_name),
+                format!("{}:{}", Repl::power_result_source(result), result.corner.short_name),
             )
         })
         .unwrap_or_else(|| {
@@ -12367,7 +13358,7 @@ fn generate_report_rpt_with_extras(project_dir: &Path, mod_name: &str, synth_inf
                 result.power.static_power_uw,
                 result.power.dynamic_power_uw,
                 result.power.total_power_uw,
-                format!("liberty_corner:{}", result.corner.short_name),
+                format!("{}:{}", Repl::power_result_source(result), result.corner.short_name),
             )
         })
         .unwrap_or_else(|| {
@@ -12388,7 +13379,7 @@ fn generate_report_rpt_with_extras(project_dir: &Path, mod_name: &str, synth_inf
     if let Some(result) = selected_constraint_power {
         rpt.push_str(&format!(
             "  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}\n",
-            format!("Liberty {} @ Constr.", shorten_table_text(&result.corner.short_name, 14)),
+            format!("{} {} @ Constr.", Repl::power_result_source(result), shorten_table_text(&result.corner.short_name, 13)),
             "corner",
             result.power.static_power_uw,
             result.power.dynamic_power_uw,
@@ -12398,7 +13389,7 @@ fn generate_report_rpt_with_extras(project_dir: &Path, mod_name: &str, synth_inf
     if let Some(result) = selected_max_power {
         rpt.push_str(&format!(
             "  {:<30} {:>10} {:>12.2} {:>12.2} {:>12.2}\n",
-            format!("Liberty {} @ Max", shorten_table_text(&result.corner.short_name, 18)),
+            format!("{} {} @ Max", Repl::power_result_source(result), shorten_table_text(&result.corner.short_name, 16)),
             "corner",
             result.power.static_power_uw,
             result.power.dynamic_power_uw,
@@ -12525,7 +13516,7 @@ fn generate_report_rpt_with_extras(project_dir: &Path, mod_name: &str, synth_inf
     if let Some(corners) = corner_timings {
         rpt.push_str(&format!("  {:<30} {:>14}\n", "Corner Count", corners.len()));
     }
-    rpt.push_str(&format!("  {:<30} {:>14}\n", "Tool Version", "AI Digital v0.6.8"));
+    rpt.push_str(&format!("  {:<30} {:>14}\n", "Tool Version", "AI Digital v0.7.0"));
     rpt.push_str(&format!("\n\n"));
 
     rpt.push_str("  See report.json for machine-readable data.\n");
@@ -12535,12 +13526,19 @@ fn generate_report_rpt_with_extras(project_dir: &Path, mod_name: &str, synth_inf
 
     // Also write a machine-readable JSON report (enhanced)
     let json_path = report_dir.join("report.json");
+    let physical_cell_areas: std::collections::HashMap<_, _> = area_breakdown_um2(synth_info)
+        .into_iter()
+        .map(|(cell_type, total_area_um2, _)| (cell_type, total_area_um2))
+        .collect();
     let cells_json = synth_info.cells.iter().map(|(t, c)| {
+        let total_area_um2 = physical_cell_areas.get(t).copied().unwrap_or(0.0);
         serde_json::json!({
             "type": t,
             "count": c,
             "ge_per_cell": cell_ge_value(t),
-            "total_ge": cell_ge_value(t) * *c as f64
+            "total_ge": cell_ge_value(t) * *c as f64,
+            "unit_area_um2": if *c > 0 { total_area_um2 / *c as f64 } else { 0.0 },
+            "total_area_um2": total_area_um2
         })
     }).collect::<Vec<_>>();
     let critical_paths_json = critical_paths_top10.iter().map(|path| {
@@ -12611,7 +13609,8 @@ fn generate_report_rpt_with_extras(project_dir: &Path, mod_name: &str, synth_inf
                     "switching_uw": result.power.switching_power_uw,
                     "clock_uw": result.power.clock_power_uw,
                     "leakage_uw": result.power.leakage_power_uw,
-                    "total_uw": result.power.total_power_uw
+                    "total_uw": result.power.total_power_uw,
+                    "source": Repl::power_result_source(result)
                 })).collect::<Vec<_>>()
             })
             .unwrap_or_default()
@@ -12673,7 +13672,7 @@ fn generate_report_rpt_with_extras(project_dir: &Path, mod_name: &str, synth_inf
         "critical_paths": critical_paths_json
     }));
     let json = serde_json::json!({
-        "version": "0.6.8",
+        "version": "0.7.0",
         "timestamp": generated_at,
         "module": mod_name,
         "constraint_mhz": constraint_mhz,

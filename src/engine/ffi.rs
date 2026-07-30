@@ -5,6 +5,21 @@
 use std::os::raw::c_char;
 
 #[repr(C)]
+pub struct RtlSynthesisOptions {
+    pub constprop: i32,
+    pub dead_code_elimination: i32,
+    pub common_subexpression_elimination: i32,
+    pub expression_optimization: i32,
+    pub demorgan: i32,
+    pub width_reduction: i32,
+    pub resource_sharing: i32,
+    pub fsm_extraction: i32,
+    pub logic_minimization: i32,
+    pub retiming: i32,
+    pub boundary_optimization: i32,
+}
+
+#[repr(C)]
 pub struct RtlDesign {
     _private: [u8; 0],
 }
@@ -221,6 +236,12 @@ extern "C" {
         rtl_code: *const c_char,
         module_name: *const c_char,
         liberty_path: *const c_char,
+    ) -> SynthResultFFI;
+    pub fn rtl_synthesize_real_with_options(
+        rtl_code: *const c_char,
+        module_name: *const c_char,
+        liberty_path: *const c_char,
+        options: *const RtlSynthesisOptions,
     ) -> SynthResultFFI;
     pub fn rtl_synthesize_freq_optimized(
         rtl_code: *const c_char,

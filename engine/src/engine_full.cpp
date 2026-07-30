@@ -454,7 +454,7 @@ EngineResult runFullFlow(const std::string &filename) {
 }
 
 std::string getEngineVersion() {
-    return "0.6.8";
+    return "0.7.0";
 }
 
 std::string getEngineBuildInfo() {

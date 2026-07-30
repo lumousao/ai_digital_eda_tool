@@ -300,6 +300,11 @@ impl Design {
         let c_lib = std::ffi::CString::new(liberty_file).unwrap();
         let c_corner = std::ffi::CString::new(corner_type).unwrap();
 
+        // The native timing engine owns process-global library/logging state.
+        // Keep corner scheduling parallel at the Rust layer, but serialize the
+        // non-reentrant FFI section so concurrently selected corners cannot
+        // overwrite each other's parser state.
+        let _ffi_guard = engine_ffi_lock();
         unsafe {
             let report = rtl_timing_analysis_corner(
                 c_output.as_ptr(), c_name.as_ptr(),
@@ -810,6 +815,86 @@ pub fn synthesize_real(rtl_code: &str, module_name: &str) -> SynthRealResult {
     synthesize_real_with_lib(rtl_code, module_name, None)
 }
 
+/// Native synthesis pass policy. These are local, semantics-preserving passes;
+/// workflow stages such as timing, power, and formal are never disabled here.
+#[derive(Clone, Debug)]
+pub struct SynthesisOptions {
+    pub constprop: bool,
+    pub dead_code_elimination: bool,
+    pub common_subexpression_elimination: bool,
+    pub expression_optimization: bool,
+    pub demorgan: bool,
+    pub width_reduction: bool,
+    pub resource_sharing: bool,
+    pub fsm_extraction: bool,
+    pub logic_minimization: bool,
+    pub retiming: bool,
+    pub boundary_optimization: bool,
+}
+
+impl From<&crate::project::SynthesisOptions> for SynthesisOptions {
+    fn from(options: &crate::project::SynthesisOptions) -> Self {
+        Self {
+            constprop: options.constprop,
+            dead_code_elimination: options.dead_code_elimination,
+            common_subexpression_elimination: options.common_subexpression_elimination,
+            expression_optimization: options.expression_optimization,
+            demorgan: options.demorgan,
+            width_reduction: options.width_reduction,
+            resource_sharing: options.resource_sharing,
+            fsm_extraction: options.fsm_extraction,
+            logic_minimization: options.logic_minimization,
+            retiming: options.retiming,
+            boundary_optimization: options.boundary_optimization,
+        }
+    }
+}
+
+/// Run native synthesis with an explicit per-pass policy.
+pub fn synthesize_real_with_options(rtl_code: &str, module_name: &str,
+                                    liberty_path: Option<&str>, options: &SynthesisOptions) -> SynthRealResult {
+    let c_rtl = std::ffi::CString::new(rtl_code).unwrap();
+    let c_mod = std::ffi::CString::new(module_name).unwrap();
+    let c_lib = liberty_path.map(|path| std::ffi::CString::new(path).unwrap());
+    let ffi_options = ffi::RtlSynthesisOptions {
+        constprop: options.constprop as i32,
+        dead_code_elimination: options.dead_code_elimination as i32,
+        common_subexpression_elimination: options.common_subexpression_elimination as i32,
+        expression_optimization: options.expression_optimization as i32,
+        demorgan: options.demorgan as i32,
+        width_reduction: options.width_reduction as i32,
+        resource_sharing: options.resource_sharing as i32,
+        fsm_extraction: options.fsm_extraction as i32,
+        logic_minimization: options.logic_minimization as i32,
+        retiming: options.retiming as i32,
+        boundary_optimization: options.boundary_optimization as i32,
+    };
+    let _ffi_guard = engine_ffi_lock();
+    unsafe {
+        let result = ffi::rtl_synthesize_real_with_options(
+            c_rtl.as_ptr(), c_mod.as_ptr(),
+            c_lib.as_ref().map_or(std::ptr::null(), |path| path.as_ptr()),
+            &ffi_options,
+        );
+        let mut cell_counts = Vec::new();
+        if !result.cell_types.is_null() && !result.cell_type_counts.is_null() {
+            for i in 0..result.num_cell_types {
+                cell_counts.push((cstr_to_string(*result.cell_types.add(i)), *result.cell_type_counts.add(i)));
+            }
+        }
+        let out = SynthRealResult {
+            gate_verilog: cstr_to_string(result.gate_verilog), report: cstr_to_string(result.report),
+            cell_count: result.cell_count, wire_count: result.wire_count, dff_count: result.dff_count,
+            port_count: result.port_count, area_ge: result.area_ge, area_um2: result.area_um2,
+            area_from_lib: result.area_from_lib != 0, lib_name: cstr_to_string(result.lib_name),
+            logic_depth: result.logic_depth, success: result.success != 0,
+            error: cstr_to_string(result.error), cell_counts,
+        };
+        ffi::rtl_synth_result_free(&result as *const _ as *mut _);
+        out
+    }
+}
+
 /// Frequency-optimized synthesis: iteratively optimizes to meet target frequency ratio
 pub fn synthesize_freq_optimized(rtl_code: &str, module_name: &str, liberty_path: Option<&str>,
                                   constraint_mhz: i32, target_ratio: f64) -> SynthRealResult {
@@ -960,6 +1045,9 @@ pub fn analyze_power_with_activity(
         .as_ref()
         .map(|json| json.as_ptr())
         .unwrap_or(std::ptr::null());
+    // Liberty loading shares native engine state with timing and synthesis.
+    // A concurrent power corner must not race a timing/power parser instance.
+    let _ffi_guard = engine_ffi_lock();
     unsafe {
         let r = ffi::rtl_power_analyze(
             c_netlist.as_ptr(), c_mod.as_ptr(), c_lib.as_ptr(),
@@ -996,7 +1084,7 @@ pub fn get_sim_coverage_json(rtl_code: &str, tb_code: &str, module_name: &str) -
 
 #[cfg(test)]
 mod tests {
-    use super::{formal_check, simulate_with_limit, synthesize_real};
+    use super::{formal_check, simulate_with_limit, synthesize_real, synthesize_real_with_options, SynthesisOptions};
     use std::collections::{BTreeSet, HashMap};
     use std::fs;
 
@@ -1358,6 +1446,33 @@ endmodule
                 .expect("formal checker returned no verdict"),
             "formal equivalence check reported non-equivalent procedural multiplier"
         );
+    }
+
+    #[test]
+    fn explicit_synthesis_policy_reaches_the_native_engine() {
+        let rtl = r#"
+module policy_probe(input a, input b, output y);
+    assign y = a & b;
+endmodule
+"#;
+        let options = SynthesisOptions {
+            constprop: false,
+            dead_code_elimination: true,
+            common_subexpression_elimination: true,
+            expression_optimization: true,
+            demorgan: true,
+            width_reduction: true,
+            resource_sharing: false,
+            fsm_extraction: true,
+            logic_minimization: false,
+            retiming: true,
+            boundary_optimization: true,
+        };
+        let result = synthesize_real_with_options(rtl, "policy_probe", None, &options);
+        assert!(result.success, "native synthesis failed: {}", result.error);
+        assert!(result.report.contains("constprop=0"));
+        assert!(result.report.contains("resource_share=0"));
+        assert!(result.report.contains("logic_min=0"));
     }
 
     #[test]

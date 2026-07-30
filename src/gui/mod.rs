@@ -18,14 +18,14 @@ pub fn run() -> Result<(), String> {
     let script_path = find_gui_script()?;
 
     println!("╔══════════════════════════════════════════╗");
-    println!("║   AI Digital v0.6.8 — GUI Mode          ║");
+    println!("║   AI Digital v0.7.0 — GUI Mode          ║");
     println!("╚══════════════════════════════════════════╝");
     println!();
     println!("  Launching Tcl/Tk GUI...");
 
     // Try wish first, then tclsh
     let wish = find_wish().ok_or_else(|| {
-        "Tcl/Tk not found. Install with: dnf install tcl tk".to_string()
+        "Tcl/Tk not found. Install it with: Fedora/RHEL: dnf install tcl tk; Debian/Ubuntu: apt-get install tcl tk".to_string()
     })?;
 
     println!("  Using: {}", wish);
