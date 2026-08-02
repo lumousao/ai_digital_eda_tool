@@ -83,22 +83,37 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     let report_json_path = existing_path(&ctx.project_dir.join("report").join("report.json"));
     let detail_log_path = existing_path(&ctx.project_dir.join("logs").join("detail.log"));
     let conversation_path = existing_path(&ctx.project_dir.join("history").join("conversation.jsonl"));
-    let apr_report_path = existing_path(&ctx.project_dir.join("apr").join("apr_report.txt"));
-    let apr_layout_path = existing_path(&ctx.project_dir.join("exchange").join("apr_layout.tsv"));
-    let apr_grid_path = existing_path(&ctx.project_dir.join("exchange").join("apr_grid.tsv"));
-    let apr_netlist_path = existing_path(&ctx.project_dir.join("apr").join("apr_netlist.v"));
-    let apr_final_def_path = existing_path(&ctx.project_dir.join("apr").join("final.def"));
-    let apr_floorplan_def_path = existing_path(&ctx.project_dir.join("apr").join("floorplan.def"));
-    let apr_gds_path = existing_path(&ctx.project_dir.join("apr").join("final.gds"));
-    let apr_detail_route_path = existing_path(&ctx.project_dir.join("apr").join("detail_route.tsv"));
-    let apr_timing_report_path = existing_path(&ctx.project_dir.join("apr").join("timing_report.txt"));
-    let apr_power_report_path = existing_path(&ctx.project_dir.join("apr").join("power_report.txt"));
-    let apr_area_report_path = existing_path(&ctx.project_dir.join("apr").join("area_report.txt"));
-    let apr_drc_report_path = existing_path(&ctx.project_dir.join("apr").join("drc_report.txt"));
-    let apr_lvs_report_path = existing_path(&ctx.project_dir.join("apr").join("lvs_report.txt"));
-    let apr_dft_report_path = existing_path(&ctx.project_dir.join("apr").join("dft_report.txt"));
-    let apr_report_json_path = existing_path(&ctx.project_dir.join("apr").join("apr_report.json"));
-    let apr_prediction_path = existing_path(&ctx.project_dir.join("apr").join("llm_prediction.txt"));
+    // A failed APR run writes a BLOCKED status but intentionally leaves old
+    // artifacts on disk for post-mortem inspection.  Do not expose those
+    // stale files to the GUI as if they were the current physical result.
+    let apr_status_path = ctx.project_dir.join("apr").join("run_status.json");
+    let apr_completed = fs::read_to_string(&apr_status_path).ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.get("status").and_then(Value::as_str).map(|status| status == "COMPLETED"))
+        .unwrap_or(false);
+    let apr_file = |path: PathBuf| if apr_completed { existing_path(&path) } else { None };
+    let apr_report_path = apr_file(ctx.project_dir.join("apr").join("apr_report.txt"));
+    let apr_layout_path = apr_file(ctx.project_dir.join("exchange").join("apr_layout.tsv"));
+    let apr_grid_path = apr_file(ctx.project_dir.join("exchange").join("apr_grid.tsv"));
+    let apr_netlist_path = apr_file(ctx.project_dir.join("apr").join("apr_netlist.v"));
+    let apr_final_def_path = apr_file(ctx.project_dir.join("apr").join("final.def"));
+    let apr_floorplan_def_path = apr_file(ctx.project_dir.join("apr").join("floorplan.def"));
+    let apr_gds_path = apr_file(ctx.project_dir.join("apr").join("final.gds"));
+    let apr_detail_route_path = apr_file(ctx.project_dir.join("apr").join("detail_route.tsv"));
+    let apr_timing_report_path = apr_file(ctx.project_dir.join("apr").join("timing_report.txt"));
+    let apr_power_report_path = apr_file(ctx.project_dir.join("apr").join("power_report.txt"));
+    let apr_area_report_path = apr_file(ctx.project_dir.join("apr").join("area_report.txt"));
+    let apr_drc_report_path = apr_file(ctx.project_dir.join("apr").join("drc_report.txt"));
+    let apr_lvs_report_path = apr_file(ctx.project_dir.join("apr").join("lvs_report.txt"));
+    let apr_dft_report_path = apr_file(ctx.project_dir.join("apr").join("dft_report.txt"));
+    let apr_report_json_path = apr_file(ctx.project_dir.join("apr").join("apr_report.json"));
+    let apr_prediction_path = apr_file(ctx.project_dir.join("apr").join("llm_prediction.txt"));
+    let layout_report_path = existing_path(&ctx.project_dir.join("layout").join("layout_report.txt"));
+    let layout_report_json_path = existing_path(&ctx.project_dir.join("layout").join("layout_report.json"));
+    let layout_drc_report_path = existing_path(&ctx.project_dir.join("layout").join("drc_report.txt"));
+    let layout_lvs_report_path = existing_path(&ctx.project_dir.join("layout").join("lvs_report.txt"));
+    let layout_geometry_path = existing_path(&ctx.project_dir.join("exchange").join("layout_geometry.tsv"));
+    let layout_report_json = layout_report_json_path.as_ref().and_then(|path| fs::read_to_string(path).ok()).and_then(|text| serde_json::from_str::<Value>(&text).ok());
     let apr_report_json = apr_report_json_path.as_ref()
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
@@ -291,6 +306,17 @@ pub fn write_state(ctx: &GuiSyncContext) -> Result<GuiStateFiles, String> {
     set_string(&mut state, "apr_dft_report_path", &path_string(&apr_dft_report_path));
     set_string(&mut state, "apr_report_json_path", &path_string(&apr_report_json_path));
     set_string(&mut state, "apr_prediction_path", &path_string(&apr_prediction_path));
+    set_string(&mut state, "layout_report_path", &path_string(&layout_report_path));
+    set_string(&mut state, "layout_report_json_path", &path_string(&layout_report_json_path));
+    set_string(&mut state, "layout_drc_report_path", &path_string(&layout_drc_report_path));
+    set_string(&mut state, "layout_lvs_report_path", &path_string(&layout_lvs_report_path));
+    set_string(&mut state, "layout_geometry_path", &path_string(&layout_geometry_path));
+    set_string(&mut state, "layout_drc_status", layout_report_json.as_ref().and_then(|v| v.get("drc_status")).and_then(|v| v.as_str()).unwrap_or("NOT_RUN"));
+    set_string(&mut state, "layout_lvs_status", layout_report_json.as_ref().and_then(|v| v.get("lvs_status")).and_then(|v| v.as_str()).unwrap_or("NOT_RUN"));
+    for key in ["die_width_um", "die_height_um", "drc_errors", "lvs_errors"] {
+        let value = layout_report_json.as_ref().and_then(|v| v.get(key)).map(|v| if let Some(f) = v.as_f64() { format!("{f:.6}") } else { v.to_string() }).unwrap_or_default();
+        set_string(&mut state, &format!("layout_{key}"), &value);
+    }
     set_string(&mut state, "apr_signoff_status", apr_report_json.as_ref().and_then(|v| v.get("signoff_ready")).map(|v| if v.as_bool().unwrap_or(false) { "READY" } else { "BLOCKED" }).unwrap_or("NOT_RUN"));
     set_string(&mut state, "apr_drc_status", apr_report_json.as_ref().and_then(|v| v.get("drc_status")).and_then(|v| v.as_str()).unwrap_or("NOT_RUN"));
     set_string(&mut state, "apr_lvs_status", apr_report_json.as_ref().and_then(|v| v.get("lvs_status")).and_then(|v| v.as_str()).unwrap_or("NOT_RUN"));

@@ -14,6 +14,7 @@ mod data_api;
 mod engine;
 mod gui;
 mod gui_exchange;
+mod layout;
 mod llm;
 mod project;
 mod repl;

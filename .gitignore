@@ -4,6 +4,7 @@
 /libs/ics*
 /libs/sky*
 /lef/
+/gds/
 
 config.yaml
 gui_debug.log

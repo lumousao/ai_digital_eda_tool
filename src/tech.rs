@@ -110,6 +110,11 @@ pub struct TechnologyCoverage {
     pub lef_files: usize,
     pub lef_macros: usize,
     pub routing_layers: usize,
+    /// Project-owned reference GDS folder.  This mirrors `libs/<tech>` and
+    /// `lef/<tech>` so layout import never needs to reach into an external
+    /// PDK directory at run time.
+    pub gds_directory: String,
+    pub gds_files: usize,
     pub synthesis_ready: bool,
     pub power_signoff_ready: bool,
     pub apr_ready: bool,
@@ -134,6 +139,7 @@ impl TechnologyCoverage {
         out.push_str(&format!("NLDM-ready corners: {}/{}\n", self.nldm_corners, self.liberty_corners));
         out.push_str(&format!("LEF directory: {}\n", self.lef_directory));
         out.push_str(&format!("LEF files/macros/routing layers: {}/{}/{}\n", self.lef_files, self.lef_macros, self.routing_layers));
+        out.push_str(&format!("GDS directory/files: {}/{}\n", self.gds_directory, self.gds_files));
         out.push_str(&format!("Synthesis eligibility: {}\n", if self.synthesis_ready { "READY" } else { "BLOCKED" }));
         out.push_str(&format!("Power signoff eligibility: {}\n", if self.power_signoff_ready { "READY" } else { "BLOCKED" }));
         out.push_str(&format!("APR eligibility: {}\n", if self.apr_ready { "READY" } else { "BLOCKED" }));
@@ -516,6 +522,9 @@ impl CornerDatabase {
         let lef_root = self.lib_dir.parent().unwrap_or(&self.lib_dir)
             .join("lef").join(&group.process_name);
         let (lef_files, lef_macros, routing_layers) = Self::scan_lef_directory(&lef_root);
+        let gds_root = self.lib_dir.parent().unwrap_or(&self.lib_dir)
+            .join("gds").join(&group.process_name);
+        let gds_files = Self::scan_gds_directory(&gds_root);
         // A standard-cell library can implement the primitive basis through
         // complex gates (AOI/OAI) rather than explicit INV/OR/XOR names.
         // Treat family-name recognition as evidence, not as the final mapping
@@ -549,6 +558,7 @@ impl CornerDatabase {
         if lef_macros > 0 && routing_layers < 2 {
             findings.push(format!("LEF library has only {} routing layer(s); APR requires at least two", routing_layers));
         }
+        if gds_files == 0 { findings.push(format!("No project-owned reference GDS files found under {}", gds_root.display())); }
         if findings.is_empty() { findings.push("Technology source coverage is suitable for native synthesis, APR, and multi-corner signoff".to_string()); }
 
         Some(TechnologyCoverage {
@@ -563,6 +573,8 @@ impl CornerDatabase {
             lef_files,
             lef_macros,
             routing_layers,
+            gds_directory: gds_root.to_string_lossy().to_string(),
+            gds_files,
             synthesis_ready,
             power_signoff_ready,
             apr_ready,
@@ -620,6 +632,18 @@ impl CornerDatabase {
             }
         }
         (files.len(), macros.len(), routing_layers.len())
+    }
+
+    fn scan_gds_directory(directory: &Path) -> usize {
+        fn collect(root: &Path, files: &mut usize) {
+            let Ok(entries) = fs::read_dir(root) else { return; };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() { collect(&path, files); }
+                else if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("gds") || ext.eq_ignore_ascii_case("gdsii")) { *files += 1; }
+            }
+        }
+        let mut files = 0usize; collect(directory, &mut files); files
     }
 
     fn is_cell_declaration(value: &str) -> bool {

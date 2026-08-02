@@ -10,6 +10,7 @@ use colored::Colorize;
 #[allow(unused_imports)]
 use crate::agent::{Agent, ThinkingMode};
 use crate::apr::{self, AprConfig};
+use crate::layout;
 use crate::data_api::{DataApi, FlowSnapshotBuilder, FlowDecision, FlowAction};
 use crate::gui_exchange::{self, GuiSyncContext, GuiTechnologyCorner};
 use crate::engine::{self, Design, LintResult, SynthStats, TimingReport};
@@ -1027,12 +1028,13 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/synth", "             - Synthesize current RTL"),
     ("/sim", "               - Run simulation on current RTL"),
     ("/formal", "            - Run formal verification"),
-    ("/full", "              - Run complete local flow (sim + synth + STA/power + APR + 3-stage formal)"),
+    ("/full", "              - Run complete local flow (sim + synth + STA/power + APR + 3-stage formal + layout)"),
     ("/stats", "             - Show synthesis statistics"),
     ("/area", "              - Show area report"),
     ("/timing", "            - Run timing analysis"),
     ("/power", "             - Show power report"),
     ("/apr", "               - Run/configure native floorplan, P&R, OCV and IR analysis"),
+    ("/layout", "            - Import/view native GDS and run geometry DRC/LVS"),
     ("/flow run", "          - Run LLM-driven full flow"),
     ("/flow status", "       - Show flow progress"),
     ("/flow decide", "       - Manually trigger LLM flow decision"),
@@ -2277,6 +2279,7 @@ impl Repl {
             "/timing" => self.cmd_timing(args),
             "/power" => self.cmd_power(),
             "/apr" | "/physical" => self.cmd_apr(args),
+            "/layout" | "/gds" => self.cmd_layout(args),
             "/export" => self.cmd_export(args),
             "/api" => self.cmd_api(args),
             "/project" => self.cmd_project(args),
@@ -4937,6 +4940,32 @@ impl Repl {
                     }
                 }
 
+                // === Step 11: Native layout import and physical verification ===
+                // Layout is deliberately after the final formal gate: it uses
+                // the accepted APR netlist/GDS pair and cannot be skipped by
+                // the full flow.
+                steps.step("Running native layout import, geometry DRC and APR-layout LVS");
+                steps.substep("GDSII stream parse -> layer geometry -> layout DRC -> netlist/exchange LVS");
+                self.cmd_layout("run");
+                let layout_report = project_dir.join("layout").join("layout_report.json");
+                let layout_drc = project_dir.join("layout").join("drc_report.txt");
+                let layout_lvs = project_dir.join("layout").join("lvs_report.txt");
+                if !layout_report.is_file() || !layout_drc.is_file() || !layout_lvs.is_file() {
+                    steps.step_fail("Layout did not produce required GDS/DRC/LVS artifacts");
+                    self.gui_set_error("Layout did not produce required GDS/DRC/LVS artifacts");
+                    return;
+                }
+                let layout_ok = fs::read_to_string(&layout_report).ok()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                    .map(|report| report.get("drc_status").and_then(|v| v.as_str()) == Some("PASS") && report.get("lvs_status").and_then(|v| v.as_str()) == Some("PASS"))
+                    .unwrap_or(false);
+                if !layout_ok {
+                    steps.step_fail("Layout DRC/LVS did not pass; flow stopped before final reporting");
+                    self.gui_set_error("Layout DRC/LVS did not pass");
+                    return;
+                }
+                steps.step_ok("Native layout GDS import, geometry DRC and APR-layout LVS completed");
+
                 // === Power report + Design quality (after formal) ===
                 // Log power analysis start
                 if let Some(ref mut logger) = self.detail_logger {
@@ -6147,11 +6176,23 @@ impl Repl {
                     }
                     Err(_) => oprintln!("  {} No detail.log yet. Run /apr first.", "⚠".yellow()),
                 }
+                let iterations_path = apr_dir.join("optimization_iterations.tsv");
+                match fs::read_to_string(&iterations_path) {
+                    Ok(table) => {
+                        let rows = table.lines().skip(1).collect::<Vec<_>>();
+                        oprintln!("  APR SBox iterations ({} attempts)", rows.len());
+                        for row in rows.iter().rev().take(24).rev() { oprintln!("  {}", row); }
+                    }
+                    Err(_) => oprintln!("  {} No APR SBox iterations yet.", "⚠".yellow()),
+                }
+                if let Ok(status) = fs::read_to_string(apr_dir.join("run_status.json")) {
+                    oprintln!("  APR run state: {}", status.trim());
+                }
                 return;
             }
             if args == "files" {
                 oprintln!("\n  {}", "APR output artifacts".bright_cyan().bold());
-                for name in ["apr_netlist.v", "floorplan.def", "final.def", "final.gds", "detail_route.tsv", "native_parasitics.spef", "timing_report.txt", "power_report.txt", "area_report.txt", "drc_report.txt", "lvs_report.txt", "dft_report.txt", "ir_drop.tsv", "congestion.tsv", "power_hotspots.tsv"] {
+                for name in ["apr_netlist.v", "floorplan.def", "final.def", "final.gds", "detail_route.tsv", "native_parasitics.spef", "timing_report.txt", "power_report.txt", "area_report.txt", "drc_report.txt", "lvs_report.txt", "dft_report.txt", "ir_drop.tsv", "congestion.tsv", "power_hotspots.tsv", "optimization_iterations.tsv"] {
                     let path = apr_dir.join(name);
                     match fs::metadata(&path) { Ok(meta) => oprintln!("    {} {:>10} bytes", name.green(), meta.len()), Err(_) => oprintln!("    {} {}", name.red(), "MISSING".red()) }
                 }
@@ -6257,7 +6298,21 @@ impl Repl {
                 oprintln!("    Outputs: netlist={} DEF={} GDS={} detail-route={}", result.apr_netlist_path, result.final_def_path, result.gds_path, result.detail_route_path);
                 oprintln!("    Analysis: timing={} power={} area={} grid-points={} critical-routes={}", result.timing_report_path, result.power_report_path, result.area_report_path, result.ir_grid.len(), result.critical_routes.len());
                 oprintln!("    Signoff checks: DRC={} LVS={} DFT={}", result.drc_status, result.lvs_status, result.dft_status);
+                for item in &result.optimization_iterations {
+                    oprintln!("    SBox attempt {:>2}: scale={:.2} phase={:.2} status={} core={:.2}x{:.2} util={:.2}% wire={:.2}um reason={}",
+                        item.attempt, item.sbox_scale, item.repair_phase, item.status,
+                        item.core_width_um, item.core_height_um, item.utilization * 100.0,
+                        item.wire_length_um, item.reason);
+                }
                 if let Some(ref mut logger) = self.detail_logger {
+                    for item in &result.optimization_iterations {
+                        logger.log("APR_DEBUG", "SBOX_ITERATION", &format!(
+                            "attempt={} scale={:.6} repair_phase={:.6} status={} core={:.6}x{:.6} utilization={:.9} wire_um={:.6} drc={} reason={}",
+                            item.attempt, item.sbox_scale, item.repair_phase, item.status,
+                            item.core_width_um, item.core_height_um, item.utilization,
+                            item.wire_length_um, item.drc_status, item.reason,
+                        ));
+                    }
                     for (stage, detail) in [
                         ("FLOORPLAN", format!("core={:.3}x{:.3} die={:.3}x{:.3}", result.core_width_um, result.core_height_um, result.die_width_um, result.die_height_um)),
                         ("PLACEMENT", format!("cells={} overlaps={} utilization={:.4}", result.cells.len(), result.placement_overlaps, result.utilization)),
@@ -6272,11 +6327,103 @@ impl Repl {
                 self.gui_set_step("apr", status, &format!("{} cells, {:.3} mV IR, OCV setup {:.3} ns", result.cells.len(), result.ir_drop_mv, result.ocv_late_slack_ns));
             }
             Err(error) => {
-                let marker = serde_json::json!({"status": "BLOCKED", "error": error});
-                let _ = fs::write(project_dir.join("apr").join("run_status.json"), format!("{}\n", marker));
+                let status_path = project_dir.join("apr").join("run_status.json");
+                // apr::run persists the complete iteration snapshot. Keep it
+                // intact so the CLI/GUI can inspect every failed SBox rather
+                // than replacing it with a one-line error marker.
+                if fs::read_to_string(&status_path).ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                    .and_then(|value| value.get("attempt_count").cloned()).is_none()
+                {
+                    let marker = serde_json::json!({"status": "BLOCKED", "error": error});
+                    let _ = fs::write(status_path, format!("{}\n", marker));
+                }
                 self.stop_status("Native APR blocked", false);
                 self.gui_set_step("apr", "blocked", &error);
+                if let Ok(table) = fs::read_to_string(project_dir.join("apr").join("optimization_iterations.tsv")) {
+                    for row in table.lines().skip(1) {
+                        oprintln!("    SBox {}", row);
+                        if let Some(ref mut logger) = self.detail_logger {
+                            logger.log("APR_DEBUG", "SBOX_ITERATION", row);
+                        }
+                    }
+                }
+                if let Some(ref mut logger) = self.detail_logger {
+                    logger.log("APR_DEBUG", "BLOCKED", &error);
+                }
                 oprintln!("  {} {}", "✗".red(), error);
+            }
+        }
+    }
+
+    /// Native post-APR layout command.  The command intentionally keeps
+    /// import, GDS inspection, geometry DRC and APR-to-layout LVS together:
+    /// they are mandatory parts of one layout stage rather than user-toggle
+    /// workflow steps.
+    fn cmd_layout(&mut self, args: &str) {
+        let args = args.trim();
+        let Some(project_dir) = self.current_project.clone() else {
+            oprintln!("  {} No project loaded. Use /project open first.", "✗".red());
+            return;
+        };
+        if args == "status" || args == "report" {
+            let path = project_dir.join("layout").join("layout_report.txt");
+            match fs::read_to_string(path) {
+                Ok(report) => self.print_section("Native Layout report", &report, 0),
+                Err(_) => oprintln!("  {} No layout result. Run /layout run after APR.", "⚠".yellow()),
+            }
+            return;
+        }
+        if args == "files" {
+            for relative in ["layout/final_layout.gds", "layout/layout_report.json", "layout/layout_report.txt", "layout/drc_report.txt", "layout/lvs_report.txt", "exchange/layout_geometry.tsv"] {
+                let path = project_dir.join(relative);
+                oprintln!("  {:<34} {}", relative, if path.is_file() { "present".green() } else { "missing".red() });
+            }
+            return;
+        }
+        let reference_cell = args.strip_prefix("reference ").map(str::trim).filter(|v| !v.is_empty());
+        let override_path = args.strip_prefix("run ").map(str::trim).filter(|v| !v.is_empty()).map(PathBuf::from);
+        if !args.is_empty() && args != "run" && reference_cell.is_none() && override_path.is_none() {
+            oprintln!("  {} Usage: /layout [run [path/to/layout.gds]|reference <cell>|status|report|files]", "✗".red());
+            return;
+        }
+        let reference_path = if let Some(cell) = reference_cell {
+            if cell.contains('/') || cell.contains('\\') || cell.contains("..") {
+                oprintln!("  {} Reference cell name must not contain a path.", "✗".red());
+                return;
+            }
+            let Some(coverage) = self.corner_db.active_coverage() else {
+                oprintln!("  {} No active technology coverage.", "✗".red()); return;
+            };
+            let root = PathBuf::from(coverage.gds_directory);
+            let path = root.join(format!("{cell}.gds"));
+            if !path.is_file() {
+                oprintln!("  {} No project GDS for {} under {}", "✗".red(), cell, root.display());
+                return;
+            }
+            Some(path)
+        } else { None };
+        let selected = reference_path.as_deref().or(override_path.as_deref());
+        self.gui_set_step("layout", "running", "Native GDS import, geometry DRC and APR-layout LVS");
+        self.start_status("Running native layout import and physical verification");
+        match layout::run(&project_dir, selected) {
+            Ok(result) => {
+                let passed = result.drc_status == "PASS" && matches!(result.lvs_status.as_str(), "PASS" | "NOT_APPLICABLE");
+                let signoff_ready = result.drc_status == "PASS" && result.lvs_status == "PASS";
+                self.stop_status("Native layout completed", passed);
+                oprintln!("  {} Layout imported: {} shapes across {} layers", if passed { "✓".green() } else { "⚠".yellow() }, result.shapes.len(), result.layer_shape_counts.len());
+                oprintln!("    Die {:.3} x {:.3} um | DRC {} ({} errors) | LVS {} ({} errors)", result.die_width_um, result.die_height_um, result.drc_status, result.drc_errors, result.lvs_status, result.lvs_errors);
+                oprintln!("    Outputs: {} {} {}", result.report_path, result.drc_report_path, result.lvs_report_path);
+                if let Some(ref mut logger) = self.detail_logger {
+                    logger.log("LAYOUT_DEBUG", "IMPORT", &format!("source={} shapes={} structures={} layers={}", result.source_gds, result.shapes.len(), result.structures.len(), result.layer_shape_counts.len()));
+                    logger.log("LAYOUT_DEBUG", "DRC", &format!("status={} errors={}", result.drc_status, result.drc_errors));
+                    logger.log("LAYOUT_DEBUG", "LVS", &format!("status={} errors={}", result.lvs_status, result.lvs_errors));
+                }
+                self.gui_set_step("layout", if signoff_ready { "passed" } else if passed { "warning" } else { "blocked" }, &format!("{} shapes, DRC {}, LVS {}", result.shapes.len(), result.drc_status, result.lvs_status));
+            }
+            Err(error) => {
+                self.stop_status("Native layout blocked", false);
+                self.gui_set_step("layout", "blocked", &error);
+                oprintln!("  {} Native layout blocked: {}", "✗".red(), error);
             }
         }
     }

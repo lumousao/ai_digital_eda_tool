@@ -270,6 +270,7 @@ proc load_gui_state_file {path} {
     update_power_page
     update_area_page
     update_apr_page
+    update_layout_page
     update_summary_page
     load_exchange_file [gui_state_text exchange_rtl_path] .toparea.right.pages.rtl.hpane.rtl.code
     load_exchange_file [gui_state_text tb_path] .toparea.right.pages.rtl.hpane.tb.tb
@@ -284,6 +285,7 @@ proc load_gui_state_file {path} {
     load_exchange_file [gui_state_text exchange_area_path] .toparea.right.pages.area.main.report.out
     load_exchange_file [gui_state_text exchange_power_path] .toparea.right.pages.power.main.report.out
     load_exchange_file [gui_state_text apr_report_path] .toparea.right.pages.apr.main.report.split.details.out
+    load_exchange_file [gui_state_text layout_report_path] .toparea.right.pages.layout.main.report.out
     load_exchange_file [gui_state_text exchange_summary_path] .toparea.right.pages.summary.out
     if {[gui_state_text gate_path] ne ""} {
         load_gate_from_project
@@ -3950,14 +3952,139 @@ proc update_summary_page {} {
     render_hierarchy_treemap
 }
 
+# ===================== Native Layout Viewer =====================
+# Kept independent from APR's logical-route renderer: this canvas consumes
+# the post-APR GDS geometry exchange directly and uses its live viewport on
+# every Configure event, like a compact layout-editor view.
+set ::layout_rows {}
+set ::layout_show_boundary 1
+set ::layout_show_paths 1
+set ::layout_show_shapes 1
+set ::layout_auto_fit 1
+set ::layout_view_initialized 0
+set ::layout_scale 1.0
+set ::layout_ox 0.0
+set ::layout_oy 0.0
+set ::layout_pan_x 0
+set ::layout_pan_y 0
+set ::layout_loaded_path ""
+proc layout_layer_color {layer} {
+    set colors {#8be9fd #50fa7b #ffb86c #bd93f9 #ff79c6 #f1fa8c #66d9ef #a6e22e #fd971f #ae81ff #e6db74 #f92672}
+    return [lindex $colors [expr {abs($layer) % [llength $colors]}]]
+}
+proc load_layout_geometry {} {
+    set path [gui_state_text layout_geometry_path]
+    if {$path eq $::layout_loaded_path && [llength $::layout_rows] > 0} { return }
+    set ::layout_rows {}
+    if {$path eq "" || ![file exists $path]} { return }
+    if {[catch {set fp [open $path r]}]} { return }
+    gets $fp
+    while {[gets $fp line] >= 0} {
+        set f [split $line "\t"]
+        if {[llength $f] >= 8} { lappend ::layout_rows $f }
+    }
+    close $fp
+    set ::layout_loaded_path $path
+    set ::layout_auto_fit 1
+    set ::layout_view_initialized 0
+}
+proc layout_zoom_fit {} {
+    set ::layout_auto_fit 1
+    set ::layout_view_initialized 0
+    render_layout_geometry
+}
+proc layout_pan_mark {x y} { set ::layout_pan_x $x; set ::layout_pan_y $y }
+proc layout_pan_drag {x y} {
+    set ::layout_auto_fit 0
+    set ::layout_ox [expr {$::layout_ox + $x - $::layout_pan_x}]
+    set ::layout_oy [expr {$::layout_oy + $y - $::layout_pan_y}]
+    set ::layout_pan_x $x; set ::layout_pan_y $y
+    render_layout_geometry
+}
+proc layout_zoom_at {factor x y} {
+    if {!$::layout_view_initialized} { render_layout_geometry }
+    set ::layout_auto_fit 0
+    set new_scale [expr {max(0.000001, min(5000.0, $::layout_scale * $factor))}]
+    set actual [expr {$new_scale / $::layout_scale}]
+    set ::layout_ox [expr {$x - ($x - $::layout_ox) * $actual}]
+    set ::layout_oy [expr {$y - ($y - $::layout_oy) * $actual}]
+    set ::layout_scale $new_scale
+    render_layout_geometry
+}
+proc layout_zoom_in {} { layout_zoom_at 1.25 [expr {[winfo width .toparea.right.pages.layout.main.viewer.canvas]/2}] [expr {[winfo height .toparea.right.pages.layout.main.viewer.canvas]/2}] }
+proc layout_zoom_out {} { layout_zoom_at 0.80 [expr {[winfo width .toparea.right.pages.layout.main.viewer.canvas]/2}] [expr {[winfo height .toparea.right.pages.layout.main.viewer.canvas]/2}] }
+proc render_layout_geometry {} {
+    set c .toparea.right.pages.layout.main.viewer.canvas
+    if {![winfo exists $c]} { return }
+    $c delete all
+    set width [winfo width $c]; set height [winfo height $c]
+    if {$width < 40 || $height < 40} { return }
+    if {[llength $::layout_rows] == 0} {
+        canvas_message $c "Layout unavailable" "Run /layout after APR to import the native GDS geometry."
+        return
+    }
+    set minx 1e99; set miny 1e99; set maxx -1e99; set maxy -1e99
+    foreach row $::layout_rows {
+        foreach {kind layer datatype wire x1 y1 x2 y2} $row break
+        if {$x1 < $minx} {set minx $x1}; if {$y1 < $miny} {set miny $y1}
+        if {$x2 > $maxx} {set maxx $x2}; if {$y2 > $maxy} {set maxy $y2}
+    }
+    set dx [expr {max(1e-6,$maxx-$minx)}]; set dy [expr {max(1e-6,$maxy-$miny)}]
+    if {$::layout_auto_fit || !$::layout_view_initialized} {
+        set ::layout_scale [expr {min(($width-34.0)/$dx,($height-34.0)/$dy)}]
+        set ::layout_ox [expr {($width-$dx*$::layout_scale)/2.0-$minx*$::layout_scale}]
+        set ::layout_oy [expr {($height-$dy*$::layout_scale)/2.0+$maxy*$::layout_scale}]
+        set ::layout_view_initialized 1
+    }
+    set scale $::layout_scale
+    set ox $::layout_ox
+    set oy $::layout_oy
+    foreach row $::layout_rows {
+        foreach {kind layer datatype wire x1 y1 x2 y2} $row break
+        if {$kind eq "boundary" && !$::layout_show_boundary} {continue}
+        if {$kind eq "path" && !$::layout_show_paths} {continue}
+        if {$kind ne "boundary" && $kind ne "path" && !$::layout_show_shapes} {continue}
+        set xx1 [expr {$ox+$x1*$scale}]; set yy1 [expr {$oy-$y1*$scale}]
+        set xx2 [expr {$ox+$x2*$scale}]; set yy2 [expr {$oy-$y2*$scale}]
+        set color [layout_layer_color $layer]
+        if {$kind eq "path"} {
+            set stroke [expr {max(1.0, min(8.0, $wire*$scale))}]
+            # PATH extents include half-width.  The optional centerline
+            # endpoints are emitted by native layout exchange and avoid
+            # turning a vertical/horizontal GDS PATH into a diagonal line.
+            if {[llength $row] >= 12 && [string is double -strict [lindex $row 8]] && [string is double -strict [lindex $row 9]] && [string is double -strict [lindex $row 10]] && [string is double -strict [lindex $row 11]]} {
+                set px1 [expr {$ox + [lindex $row 8] * $scale}]
+                set py1 [expr {$oy - [lindex $row 9] * $scale}]
+                set px2 [expr {$ox + [lindex $row 10] * $scale}]
+                set py2 [expr {$oy - [lindex $row 11] * $scale}]
+                $c create line $px1 $py1 $px2 $py2 -fill $color -width $stroke -capstyle round -tags [list layout_layer_$layer]
+            } else {
+                $c create line $xx1 $yy1 $xx2 $yy2 -fill $color -width $stroke -capstyle round -tags [list layout_layer_$layer]
+            }
+        } else {
+            set outline [expr {$layer == 0 ? "#64748b" : $color}]
+            $c create rectangle $xx1 $yy1 $xx2 $yy2 -outline $outline -width 1 -tags [list layout_layer_$layer]
+        }
+    }
+    $c create text 8 8 -anchor nw -fill $::C_DIM -font {Helvetica 8} -text "GDS geometry  |  [llength $::layout_rows] shapes  |  [format %.2f $dx] × [format %.2f $dy] µm  |  [format %.0f%% [expr {$scale * 100.0}]]"
+}
+proc update_layout_page {} {
+    if {![winfo exists .toparea.right.pages.layout]} { return }
+    load_layout_geometry
+    set drc [gui_state_get layout_drc_status NOT_RUN]; set lvs [gui_state_get layout_lvs_status NOT_RUN]
+    .toparea.right.pages.layout.status configure -text "Native Layout  |  Geometry DRC: $drc  |  LVS: $lvs  |  Die [gui_state_get layout_die_width_um 0] × [gui_state_get layout_die_height_um 0] µm"
+    load_exchange_file [gui_state_text layout_report_path] .toparea.right.pages.layout.main.report.out
+    render_layout_geometry
+}
+
 # ===================== Page Switching =====================
 proc set_page {page} {
     set ::current_page $page
-    foreach p {config rtl sim synth timing power area apr formal summary} {
+    foreach p {config rtl sim synth timing power area apr formal layout summary} {
         if {[winfo exists .toparea.right.pages.$p]} { pack forget .toparea.right.pages.$p }
     }
     if {[winfo exists .toparea.right.pages.$page]} { pack .toparea.right.pages.$page -fill both -expand 1 }
-    foreach p {config rtl sim synth timing power area apr formal summary} {
+    foreach p {config rtl sim synth timing power area apr formal layout summary} {
         if {[winfo exists .toparea.left.$p]} { .toparea.left.$p configure -bg $::C_PANEL -fg $::C_DIM }
     }
     if {[winfo exists .toparea.left.$page]} { .toparea.left.$page configure -bg $::C_ACCENT -fg $::C_HIGHLIGHT }
@@ -3973,6 +4100,8 @@ proc set_page {page} {
         # A canvas can be unmapped when the exchange state arrives. Re-read
         # physical artifacts on every APR entry, then render after geometry.
         after idle {update_apr_page; set_apr_view $::apr_view}
+    } elseif {$page eq "layout"} {
+        after idle update_layout_page
     } elseif {$page eq "timing"} {
         after idle render_timing_path_graph
     } elseif {$page eq "formal"} {
@@ -4019,6 +4148,7 @@ proc gui_run_autodump {} {
         {area    .toparea.right.pages.area.main.chart.canvas            render_area_chart         area_canvas}
         {summary .toparea.right.pages.summary.hpane.hier.canvas         render_hierarchy_treemap hierarchy_canvas}
         {apr     .toparea.right.pages.apr.main.layout.viewer.canvas     render_apr_layout        apr_layout}
+        {layout  .toparea.right.pages.layout.main.viewer.canvas         render_layout_geometry   layout_geometry}
     } {
         lassign $spec page canvas renderer stem
         catch {set_page $page}
@@ -4218,6 +4348,11 @@ menu .menubar.apr -tearoff 0 -bg $::C_PANEL -fg $::C_TEXT -activebackground $::C
 .menubar.apr add command -label "Zoom In" -command {set_page apr; apr_zoom_in}
 .menubar.apr add command -label "Zoom Out" -command {set_page apr; apr_zoom_out}
 .menubar.apr add command -label "Fit Die to View" -command {set_page apr; apr_zoom_fit}
+menu .menubar.layout -tearoff 0 -bg $::C_PANEL -fg $::C_TEXT -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT
+.menubar add cascade -label "Layout" -menu .menubar.layout
+.menubar.layout add command -label "Run Native Layout DRC/LVS" -command {gui_run_stage "/layout run" "Native layout verification"}
+.menubar.layout add command -label "Layout Geometry View" -command {set_page layout; update_layout_page}
+.menubar.layout add command -label "DRC Report" -command {gui_run_stage "/layout status" "Layout DRC/LVS report"}
 menu .menubar.optimization -tearoff 0 -bg $::C_PANEL -fg $::C_TEXT -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT
 .menubar add cascade -label "Optimization" -menu .menubar.optimization -underline 0
 menu .menubar.optimization.synthesis -tearoff 0 -bg $::C_PANEL -fg $::C_TEXT -activebackground $::C_ACCENT -activeforeground $::C_HIGHLIGHT
@@ -4239,7 +4374,7 @@ frame .toparea.left -width 180 -bg $::C_PANEL -bd 0 -highlightthickness 0
 pack .toparea.left -side left -fill y -anchor nw
 label .toparea.left.title -text "  Flow Steps" -fg $::C_HIGHLIGHT -bg $::C_PANEL -font {Helvetica 11 bold}
 pack .toparea.left.title -fill x -pady {10 6}
-set ::steps {config "⚙ Config" rtl "📄 RTL" sim "▶ Simulation" synth "⚙ Synthesis + Analysis" apr "▦ APR" formal "✓ Formal" summary "📊 Summary"}
+set ::steps {config "⚙ Config" rtl "📄 RTL" sim "▶ Simulation" synth "⚙ Synthesis + Analysis" apr "▦ APR" formal "✓ Formal" layout "◈ Layout" summary "📊 Summary"}
 foreach {key label} $::steps {
     set step_command [list set_page $key]
     if {$key eq "synth"} { set step_command [list set_synth_view synth] }
@@ -4724,6 +4859,54 @@ pack $p.actions.note -side left -padx 8 -pady 5
 pack $p.actions.run -side right -padx 6 -pady 3
 pack $p.actions.refresh -side right -padx 2 -pady 3
 after idle {set_apr_view layout}
+pack forget $p
+
+# --- Page: Layout (native GDS editor view) ---
+set p [frame .toparea.right.pages.layout -bg $::C_BG]
+label $p.status -text "Native Layout | Geometry DRC: NOT_RUN | LVS: NOT_RUN" -fg $::C_DIM -bg $::C_PANEL -font {Helvetica 9} -anchor w
+pack $p.status -fill x -padx 8 -pady {2 4}
+frame $p.toolbar -bg $::C_PANEL
+pack $p.toolbar -fill x -padx 6
+foreach {key label} {layout_show_boundary "Boundary" layout_show_paths "Metal paths" layout_show_shapes "Polygons"} {
+    checkbutton $p.toolbar.$key -text $label -variable ::$key -command render_layout_geometry -bg $::C_PANEL -fg $::C_TEXT -activebackground $::C_PANEL -activeforeground $::C_HIGHLIGHT -selectcolor $::C_INPUT_BG -font {Helvetica 8}
+    pack $p.toolbar.$key -side left -padx 4 -pady 2
+}
+button $p.toolbar.fit -text "Fit" -command layout_zoom_fit -bg $::C_PANEL -fg $::C_TEXT -relief flat -padx 8
+button $p.toolbar.minus -text "−" -command layout_zoom_out -bg $::C_PANEL -fg $::C_TEXT -relief flat -padx 8
+button $p.toolbar.plus -text "+" -command layout_zoom_in -bg $::C_PANEL -fg $::C_TEXT -relief flat -padx 8
+button $p.toolbar.drc -text "DRC" -command {gui_run_stage "/layout status" "Layout DRC/LVS report"} -bg $::C_PANEL -fg $::C_TEXT -relief flat -padx 8
+button $p.toolbar.run -text "Run Layout" -command {gui_run_stage "/layout run" "Native layout verification"} -bg $::C_ACCENT -fg $::C_HIGHLIGHT -relief flat -padx 10
+pack $p.toolbar.run $p.toolbar.drc $p.toolbar.plus $p.toolbar.minus $p.toolbar.fit -side right -padx 3 -pady 2
+frame $p.main -bg $::C_BG
+pack $p.main -fill both -expand 1 -padx 6 -pady 4
+frame $p.main.viewer -bg #111827 -bd 1 -highlightbackground $::C_BORDER -highlightthickness 1
+frame $p.main.report -bg $::C_INPUT_BG -bd 1 -highlightbackground $::C_BORDER -highlightthickness 1
+grid $p.main.viewer -row 0 -column 0 -sticky news -padx {0 3}
+grid $p.main.report -row 0 -column 1 -sticky news -padx {3 0}
+grid rowconfigure $p.main 0 -weight 1
+grid columnconfigure $p.main 0 -weight 7 -minsize 420
+grid columnconfigure $p.main 1 -weight 3 -minsize 280
+label $p.main.viewer.title -text "  Layout Editor — GDS geometry / layer colors" -fg $::C_HIGHLIGHT -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
+pack $p.main.viewer.title -fill x
+canvas $p.main.viewer.canvas -bg #111827 -highlightthickness 0
+bind $p.main.viewer.canvas <Configure> {after idle render_layout_geometry}
+bind $p.main.viewer.canvas <ButtonPress-1> {layout_pan_mark %x %y}
+bind $p.main.viewer.canvas <B1-Motion> {layout_pan_drag %x %y}
+bind $p.main.viewer.canvas <MouseWheel> {if {%D > 0} {layout_zoom_at 1.18 %x %y} else {layout_zoom_at 0.85 %x %y}}
+bind $p.main.viewer.canvas <Button-4> {layout_zoom_at 1.18 %x %y}
+bind $p.main.viewer.canvas <Button-5> {layout_zoom_at 0.85 %x %y}
+pack $p.main.viewer.canvas -fill both -expand 1
+label $p.main.report.title -text "  Layout DRC / LVS / hierarchy" -fg $::C_HIGHLIGHT -bg $::C_PANEL -anchor w -font {Helvetica 9 bold}
+pack $p.main.report.title -fill x
+text $p.main.report.out -bg $::C_INPUT_BG -fg $::C_TEXT -relief flat -font {Courier 9} -wrap word -state disabled
+scrollbar $p.main.report.scroll -command [list $p.main.report.out yview] -bg $::C_PANEL -troughcolor $::C_BG
+$p.main.report.out configure -yscrollcommand [list $p.main.report.scroll set]
+pack $p.main.report.scroll -side right -fill y
+pack $p.main.report.out -fill both -expand 1 -padx 2 -pady 2
+frame $p.actions -bg $::C_PANEL
+pack $p.actions -fill x -padx 6 -pady {0 5}
+label $p.actions.note -text "Native GDSII import, geometry audit and APR-to-layout LVS. Reference-cell GDS is displayed with LVS marked N/A unless a matching top netlist is supplied." -bg $::C_PANEL -fg $::C_DIM -font {Helvetica 8} -anchor w
+pack $p.actions.note -side left -padx 8 -pady 5
 pack forget $p
 
 # --- Page: Formal ---
